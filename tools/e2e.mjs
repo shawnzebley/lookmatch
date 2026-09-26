@@ -30,7 +30,7 @@ await page.setInputFiles('#pickPhotos', files);
 await page.waitForFunction((n) => window.__lm.S.photos.filter((p) => p.status === 'done').length === n, files.length, { timeout: 180000 });
 console.log(`batch of ${files.length} matched in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
 await page.screenshot({ path: `${shots}/04_batch.png` });
-const timings = await page.evaluate(() => window.__lm.S.photos.map((p) => `${p.name}: ${Math.round(p.timings.total)} ms`));
+const timings = await page.evaluate(() => window.__lm.S.photos.map((p) => `${p.name}: ${Math.round(p.timings.total)} ms · ${p.scene ? p.scene.label + ' EV ' + p.scene.ev : 'no exif'} · skin from ${p.before.skin.source} (${p.before.skin.faces} faces) · warnings: ${p.loss.issues.map((i) => i.text).join(', ') || 'none'}`));
 console.log(timings.join('\n'));
 
 // detail

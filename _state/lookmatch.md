@@ -18,9 +18,8 @@ DECIDED
 OPEN
 - Not yet tested on Shawn's actual iPhone: speed of 50 × 24 MP batch, createImageBitmap on 24 MP in Safari, share-sheet save flow, Drive sign-in round trip (Google accepts the redirect; full login not exercised).
 - Unknown whether OAuth consent screen has shawnzebley@gmail.com as test user and Drive API enabled (Shawn said he'd do it; not verified).
-- Known misses on the 11-photo test: t06 zone color 10.6, t08 tone 3.7, t02 zone 4.0, t10 skin hue already 65° pre-edit.
+- Known misses (run 2): tone t02 4.1, t07 4.5; zone t02 4.2, t03 4.0, t06 6.6; t10 skin hue 65° pre-edit. Faces missed: t09, t10, t11.
 - iPhone photos are Display P3; canvas converts to sRGB, so wide-gamut colors get clamped. Not addressed.
-- Skin detection is a color window, not face detection (MediaPipe skipped).
 - Later-version items not built: clarity/local contrast, grain, vignette, RAW.
 
 CONSTRAINTS
@@ -39,5 +38,6 @@ NEXT ACTION — Wait for Shawn's report from his iPhone: open https://shawnzeble
 OUT OF SCOPE — native iOS app, Mac-only tooling, storing slider values in presets, publishing Shawn's photos anywhere public.
 
 ## Log
+- 2026-09-26: MediaPipe face outlines for skin guard (tiled retry for small faces; 8/11 test photos), exifr scene EV drives brightness (dark scenes damped via `lift`), face-brightness guard in tone stage, reversed-curve block, high-ISO shadow-slope cap, HSL ignores near-black/near-grey noise, new app warnings (Faces dulled, Reversed tones, Blotchy color), FLIP harness (tools/flip_eval.py). Run 2: tone 9/11, cast 11/11, zone 8/11, clip 11/11, skin 10/11, no app warnings on any auto edit.
 - 2026-09-26: pinned photo while editing; blown/crushed/lost-detail warnings with slider blame and clipping overlay.
 - 2026-09-26: engine + app built, 11-photo test run, deployed to GitHub Pages, OAuth redirect fixed.

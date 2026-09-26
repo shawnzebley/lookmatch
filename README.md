@@ -13,9 +13,18 @@ Every incoming photo is measured and solved on its own.
 - `web/` — the iPhone web app (static files; `npm run build` copies the engine in)
 - `tools/` — `measure.mjs` (print stats), `match.mjs` (before/after table), `e2e.mjs` (headless browser test)
 
+## Checks built in
+- Face outlines (MediaPipe Face Landmarker, in the worker) drive the skin guard; skin-colored areas are the fallback.
+- Camera settings (exifr) give scene EV, so dark scenes stay dark and underexposed daylight may brighten.
+- `engine/loss.js`: blown, crushed, clipped color, lost detail, banding, reversed tones, blotchy color, dulled faces — with slider blame.
+
 ## Test scripts
 ```
 npm i
 node tools/measure.mjs photo.jpg
 node tools/match.mjs ref.jpg a.jpg b.jpg --out out [--strength 0.8] [--full]
+tools/with-server.sh node tools/faces.mjs testdata/in/*   # cache face outlines for match.mjs
+tools/flip_all.sh out                                     # NVIDIA FLIP: faces vs scene change (pip install flip-evaluator)
+node tools/artifacts.mjs ref.jpg photo.jpg                # good vs deliberately bad edits through the loss checks
+tools/with-server.sh node tools/e2e.mjs scratch/e2e       # headless browser test of the app
 ```

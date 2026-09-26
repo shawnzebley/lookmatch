@@ -272,7 +272,7 @@ function solvePhoto(p, { priority = false } = {}) {
   if (!pr) return Promise.resolve();
   p.status = 'solving'; p.presetId = pr.id; rerenderMatchSoon();
   return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100 }, { priority }).then((r) => {
-    Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, loss: r.loss, timings: r.timings, guardScale: r.guardScale, status: 'done' });
+    Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, status: 'done' });
     rerenderMatchSoon();
     return r;
   }).catch((e) => { p.status = 'error'; p.error = e.message; rerenderMatchSoon(); });
@@ -296,7 +296,10 @@ function numbersTable(p) {
   const cls = (bv, av) => (av < bv - 0.05 ? 'good' : av > bv + 0.3 ? 'bad' : '');
   const row = (label, bv, av, rv, better = true) => `<tr><td>${label}</td><td>${bv}</td><td class="${better ? cls(+bv, +av) : ''}">${av}</td><td>${rv}</td></tr>`;
   const newClip = (Math.max(0, a.tone.clipHi - b.tone.clipHi) * 100).toFixed(2) + ' / ' + (Math.max(0, a.tone.clipLo - b.tone.clipLo) * 100).toFixed(2);
-  return `<table class="nums"><tr><th></th><th>Before</th><th>After</th><th>Ref / target</th></tr>
+  const sc = p.scene;
+  const sceneLine = `<p class="muted small" style="margin:0 0 8px">${sc ? `Scene: <b>${esc(sc.label)}</b> · EV ${sc.ev.toFixed(1)} · ISO ${sc.iso} · ${esc(sc.shutter)} · f/${sc.aperture}${sc.flash ? ' · flash' : ''}` : 'No camera settings in this file; brightness judged from the image.'}
+    <br>Skin guard: ${b.skin.source === 'faces' ? `${b.skin.faces} face${b.skin.faces === 1 ? '' : 's'} found` : 'no faces found, using skin-colored areas'}</p>`;
+  return `${sceneLine}<table class="nums"><tr><th></th><th>Before</th><th>After</th><th>Ref / target</th></tr>
     ${row('Median L*', f1(b.tone.pct[50]), f1(a.tone.pct[50]), `${f1(r?.tone.pct[50])} / ${f1(T.tone.pct[50])}`, false)}
     ${row('Black / white (p1 / p99)', `${f1(b.tone.pct[1])} / ${f1(b.tone.pct[99])}`, `${f1(a.tone.pct[1])} / ${f1(a.tone.pct[99])}`, `${f1(T.tone.pct[1])} / ${f1(T.tone.pct[99])}`, false)}
     ${row('Tone curve error (L*)', f1(toneErr(b)), f1(toneErr(a)), '0')}

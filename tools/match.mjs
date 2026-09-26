@@ -4,10 +4,11 @@
 import fs from 'fs';
 import path from 'path';
 import sharp from 'sharp';
-import { loadPreview, loadFull } from './load.mjs';
+import { loadPreview, loadFull, readScene, readFaces } from './load.mjs';
 import { prepare, measure, PCTS } from '../engine/measure.js';
 import { solve } from '../engine/solver.js';
-import { renderImage, SLIDERS } from '../engine/pipeline.js';
+import { renderImage, SLIDERS, processPixelSet as pps } from '../engine/pipeline.js';
+import { lossReport } from '../engine/loss.js';
 
 const args = process.argv.slice(2);
 const opt = (k, d) => { const i = args.indexOf(k); if (i < 0) return d; const v = args[i + 1]; args.splice(i, 2); return v; };
@@ -18,7 +19,7 @@ const full = flag('--full');
 const [refPath, ...photos] = args;
 fs.mkdirSync(outDir, { recursive: true });
 
-const ref = measure(prepare(await loadPreview(refPath)));
+const ref = measure(prepare(await loadPreview(refPath), { faces: readFaces(refPath) }));
 const f1 = (v) => v.toFixed(1), f2 = (v) => v.toFixed(2);
 const errTone = (s, T) => PCTS.reduce((a, p) => a + Math.abs(s.tone.pct[p] - T.tone.pct[p]), 0) / PCTS.length;
 const errWB = (s, T) => Math.hypot(s.wb.a - T.wb.a, s.wb.b - T.wb.b);
@@ -28,17 +29,23 @@ const errBand = (s, T) => { const ks = Object.keys(T.bands); if (!ks.length) ret
 const rows = [];
 for (const f of photos) {
   const img = await loadPreview(f);
-  const ps = prepare(img);
+  const ps = prepare(img, { faces: readFaces(f) });
   const o = measure(ps);
-  const res = solve(ps, o, ref, { strength });
+  const scene = await readScene(f);
+  const res = solve(ps, o, ref, { strength, scene });
   const { processPixelSet } = await import('../engine/pipeline.js');
   const a = measure(ps, processPixelSet(ps, res.params));
   const T = res.targets;
   const name = path.basename(f).replace(/\.[^.]+$/, '');
-  rows.push({ name, o, a, T, params: res.params, ms: res.timings.total, guard: res.guardScale });
+  rows.push({ name, o, a, T, params: res.params, ms: res.timings.total, guard: res.guardScale, scene });
   // before | after preview
   const big = await loadPreview(f, 900);
   const after = renderImage(big, res.params);
+  // full-size-ish pair + faces for tools/flip_eval.py
+  await sharp(Buffer.from(big.data), { raw: { width: big.width, height: big.height, channels: big.channels } }).png().toFile(`${outDir}/${name}_orig.png`);
+  await sharp(Buffer.from(after.data), { raw: { width: big.width, height: big.height, channels: big.channels } }).png().toFile(`${outDir}/${name}_edit.png`);
+  fs.writeFileSync(`${outDir}/${name}_faces.json`, JSON.stringify(readFaces(f) || []));
+  const loss = lossReport(ps, pps(ps, res.params), res.params);
   const b1 = await sharp(Buffer.from(big.data), { raw: { width: big.width, height: big.height, channels: big.channels } }).png().toBuffer();
   const b2 = await sharp(Buffer.from(after.data), { raw: { width: big.width, height: big.height, channels: big.channels } }).png().toBuffer();
   await sharp({ create: { width: big.width * 2 + 8, height: big.height, channels: 3, background: '#fff' } })
@@ -50,7 +57,7 @@ for (const f of photos) {
     await sharp(Buffer.from(R.data), { raw: { width: F.width, height: F.height, channels: F.channels } }).jpeg({ quality: 92 }).toFile(`${outDir}/${name}_matched.jpg`);
     console.error(`${name}: full-res ${F.width}x${F.height} render ${(performance.now() - t).toFixed(0)} ms`);
   }
-  fs.writeFileSync(`${outDir}/${name}.json`, JSON.stringify({ params: res.params, before: o, after: a, targets: T, timings: res.timings }, null, 1));
+  fs.writeFileSync(`${outDir}/${name}.json`, JSON.stringify({ params: res.params, before: o, after: a, targets: T, timings: res.timings, scene, loss }, null, 1));
 }
 
 const hdr = ['photo', 'median L* b>a (ref)', 'tone err b>a', 'p1 / p99 after', 'neutral cast err b>a', 'zone color err b>a', 'band chroma err b>a', 'mean chroma b>a (ref)', 'new clip hi/lo %', 'skin hue b>a', 'skin spread b>a', 'lit skin hue/chroma b>a', 'solve ms'];
@@ -67,9 +74,9 @@ for (const r of rows) {
     `${f1(errBand(o, T))} > ${f1(errBand(a, T))}`,
     `${f1(o.color.meanChroma)} > ${f1(a.color.meanChroma)} (${f1(ref.color.meanChroma)})`,
     `${f2(Math.max(0, a.tone.clipHi - o.tone.clipHi) * 100)} / ${f2(Math.max(0, a.tone.clipLo - o.tone.clipLo) * 100)}`,
-    o.skin.frac > 0.005 ? `${f1(o.skin.hue)} > ${f1(a.skin.hue)}` : 'n/a',
-    o.skin.frac > 0.005 ? `${f1(o.skin.hueSpread)} > ${f1(a.skin.hueSpread)}` : 'n/a',
-    o.skin.frac > 0.005 ? `${f1(o.skin.litHue)}/${f1(o.skin.litChroma)} > ${f1(a.skin.litHue)}/${f1(a.skin.litChroma)}` : 'n/a',
+    (o.skin.source === 'faces' || o.skin.frac > 0.005) ? `${f1(o.skin.hue)} > ${f1(a.skin.hue)}` : 'n/a',
+    (o.skin.source === 'faces' || o.skin.frac > 0.005) ? `${f1(o.skin.hueSpread)} > ${f1(a.skin.hueSpread)}` : 'n/a',
+    (o.skin.source === 'faces' || o.skin.frac > 0.005) ? `${f1(o.skin.litHue)}/${f1(o.skin.litChroma)} > ${f1(a.skin.litHue)}/${f1(a.skin.litChroma)}` : 'n/a',
     r.ms.toFixed(0) + (r.guard < 1 ? ` (guard ${Math.round(r.guard * 100)}%)` : ''),
   ].join(' | '));
 }

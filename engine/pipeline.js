@@ -109,6 +109,20 @@ export function toneMaxSlope(p) {
   return mx;
 }
 
+// How far the curve runs backwards (brighter input -> darker output), in L* units. 0 = monotonic.
+// A reversing curve paints dark halos around bright edges, so the solver forbids it and the app warns.
+export function toneReversal(p) {
+  const fl = fadeLevels(p);
+  let prev = toneMapL(0, p, fl), peak = prev, worst = 0;
+  for (let i = 1; i <= 100; i++) {
+    const v = toneMapL(i, p, fl);
+    peak = Math.max(peak, v);
+    worst = Math.max(worst, peak - v);
+    prev = v;
+  }
+  return worst;
+}
+
 export { gradeWeights };
 
 // ---- compile params into a per-pixel processor -------------------------------------------
@@ -163,7 +177,9 @@ export function compile(p) {
     if (anyHsl && C > 0.5) {
       const h = rgbHue(linearToSrgb(r), linearToSrgb(g), linearToSrgb(b));
       bandWeights(h, bw);
-      const col = C / (C + 8);
+      // how much a pixel has a real color: near-black and near-grey pixels only have noise for a hue,
+      // and pushing them by band would turn sensor noise into blotches
+      const col = (C / (C + 8)) * smoothstep(2, 6, C) * smoothstep(3, 12, L);
       let dh = 0, ds = 0, dl = 0;
       for (let k = 0; k < 8; k++) { const w = bw[k]; if (w) { dh += w * hueS[k]; ds += w * satS[k]; dl += w * lumS[k]; } }
       dh *= col;

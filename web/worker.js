@@ -6,6 +6,9 @@ import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
 import { exifSegment, xmpSegment, insertSegments, isJpeg } from './engine/jpegmeta.js';
 import encodeJpeg from './vendor/jpeg-encoder.js';
+import { parse as parseExif } from './vendor/exifr-lite.mjs';
+import { detectFaces } from './faces.js';
+import { sceneFromExif } from './engine/scene.js';
 
 const SOLVE_SIDE = 512;
 const cache = new Map(); // id -> { file, ps, o, display: {w,h,data}, lastUse }
@@ -53,13 +56,25 @@ function touch(id) {
   return e;
 }
 
+// Faces are found on the full image (faces.js scales it, and tiles it if nothing is found);
+// outlines are in 0..1 coordinates, so they apply to the 512 px measurement preview directly.
+async function analyze(e, bmp) {
+  if (e.faces === undefined) {
+    try { e.faces = await detectFaces(bmp); } catch (err) { e.faces = null; }
+  }
+  if (e.scene === undefined) {
+    try { e.scene = sceneFromExif(await parseExif(e.file, { ifd0: true, exif: true, gps: false, interop: false })); } catch (err) { e.scene = null; }
+  }
+  e.ps = prepare(scaledData(bmp, SOLVE_SIDE), { faces: e.faces });
+}
+
 async function ensurePrepared(id) {
   const e = cache.get(id);
   if (!e) throw new Error('photo not loaded');
   if (!e.ps) {
     const bmp = await bitmap(e.file);
     e.fullW = bmp.width; e.fullH = bmp.height;
-    e.ps = prepare(scaledData(bmp, SOLVE_SIDE));
+    await analyze(e, bmp);
     bmp.close();
   }
   touch(id);
@@ -106,8 +121,10 @@ function paintClipping(orig, out) {
 const handlers = {
   async measureRef({ file }) {
     const bmp = await bitmap(file);
-    const ps = prepare(scaledData(bmp, SOLVE_SIDE));
-    const stats = measure(ps);
+    const e = { file };
+    await analyze(e, bmp);
+    const stats = measure(e.ps);
+    stats.scene = e.scene;
     const thumb = await toJpegBlob(scaledData(bmp, 480), 0.85);
     bmp.close();
     return { stats, thumb };
@@ -116,23 +133,23 @@ const handlers = {
   async load({ id, file }) {
     cache.set(id, { file, ps: null, lastUse: performance.now() });
     const bmp = await bitmap(file);
-    const ps = prepare(scaledData(bmp, SOLVE_SIDE));
-    const thumb = await toJpegBlob(scaledData(bmp, 320), 0.8);
     const e = cache.get(id);
-    e.ps = ps; e.fullW = bmp.width; e.fullH = bmp.height;
+    await analyze(e, bmp);
+    const thumb = await toJpegBlob(scaledData(bmp, 320), 0.8);
+    e.fullW = bmp.width; e.fullH = bmp.height;
     bmp.close();
     touch(id);
-    return { stats: measure(ps), thumb, width: e.fullW, height: e.fullH };
+    return { stats: measure(e.ps), thumb, width: e.fullW, height: e.fullH, scene: e.scene, faces: e.faces ? e.faces.length : null };
   },
 
   async solve({ id, refStats, strength }) {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
-    const res = solve(e.ps, o, refStats, { strength });
+    const res = solve(e.ps, o, refStats, { strength, scene: e.scene });
     const cur = processPixelSet(e.ps, res.params);
     const after = measure(e.ps, cur);
     const loss = lossReport(e.ps, cur, res.params);
-    return { params: res.params, targets: res.targets, before: o, after, loss, timings: res.timings, guardScale: res.guardScale };
+    return { params: res.params, targets: res.targets, before: o, after, loss, scene: e.scene, timings: res.timings, guardScale: res.guardScale };
   },
 
   async measureParams({ id, params, auto = null }) {
