@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="LookMatch">
+<meta name="theme-color" content="#111214">
+<title>LookMatch</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" href="icon-180.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <h1 id="title">Presets</h1>
+  <div class="top-actions" id="topActions"></div>
+</header>
+
+<main>
+  <section id="view-presets" class="view"></section>
+  <section id="view-match" class="view" hidden></section>
+  <section id="view-settings" class="view" hidden></section>
+</main>
+
+<div id="detail" class="detail" hidden></div>
+<div id="sheet" class="sheet" hidden></div>
+<div id="toast" class="toast" hidden></div>
+
+<nav class="tabs">
+  <button data-tab="presets" class="on"><span class="ic">◐</span>Presets</button>
+  <button data-tab="match"><span class="ic">▦</span>Match</button>
+  <button data-tab="settings"><span class="ic">⚙</span>Settings</button>
+</nav>
+
+<input type="file" id="pickRef" accept="image/*" hidden>
+<input type="file" id="pickPhotos" accept="image/*" multiple hidden>
+<script type="module" src="app.js"></script>
+</body>
+</html>

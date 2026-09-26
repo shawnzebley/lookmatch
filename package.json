@@ -1,0 +1,25 @@
+{
+  "name": "lookmatch",
+  "version": "1.0.0",
+  "description": "Copy the look of one photo onto others: per-photo measured, solved edits.",
+  "scripts": {
+    "build": "sh tools/build-web.sh",
+    "measure": "node tools/measure.mjs",
+    "match": "node tools/match.mjs",
+    "e2e": "node tools/e2e.mjs scratch/e2e",
+    "serve": "cd web && python3 -m http.server 8765"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@jsquash/jpeg": "^1.6.0",
+    "heic-decode": "^2.1.0",
+    "jpeg-js": "^0.4.4",
+    "sharp": "^0.35.4"
+  },
+  "type": "module",
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}
