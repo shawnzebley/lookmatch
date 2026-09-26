@@ -12,6 +12,8 @@ DECIDED
 - Brightness pull 0.5 toward ref median, reduced for low-key photos (night stays dark).
 - Lightroom export: `_lightroom.jpg` = original + embedded crs XMP; `_lookmatch.xmp` = develop preset; modes "sliders" (default) or "curve".
 - RAW: later.
+- Editor: photo + view toggles + loss bar pinned at top (40vh stage), sliders scroll under it; hold on photo in After mode shows Before.
+- Loss check (engine/loss.js): blown ≥0.3% warn / ≥1.5% bad, crushed 0.5/2, clipped color 1/4, lost detail (flattened L* gradient) 2/6, banding curve slope 2.6/3.4. Culprits = sliders changed from the auto match, reverted one at a time. Clipping overlay: red blown, blue crushed, amber clipped color, dim = already in original; turns on automatically the first time an edit goes 'bad'.
 
 OPEN
 - Not yet tested on Shawn's actual iPhone: speed of 50 × 24 MP batch, createImageBitmap on 24 MP in Safari, share-sheet save flow, Drive sign-in round trip (Google accepts the redirect; full login not exercised).
@@ -37,4 +39,5 @@ NEXT ACTION — Wait for Shawn's report from his iPhone: open https://shawnzeble
 OUT OF SCOPE — native iOS app, Mac-only tooling, storing slider values in presets, publishing Shawn's photos anywhere public.
 
 ## Log
+- 2026-09-26: pinned photo while editing; blown/crushed/lost-detail warnings with slider blame and clipping overlay.
 - 2026-09-26: engine + app built, 11-photo test run, deployed to GitHub Pages, OAuth redirect fixed.
