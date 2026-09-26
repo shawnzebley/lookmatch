@@ -9,6 +9,7 @@ Every incoming photo is measured and solved on its own.
   - `measure.js` — stats for any image (preview-size); fixed pixel masks so edited images compare like with like
   - `pipeline.js` — Lightroom-style sliders as deterministic global ops, compiled to a 33³ LUT
   - `solver.js` — staged bounded Levenberg–Marquardt: tone → white balance → color → touch-up, with clipping, banding and skin guards
+  - `transfer.js` — color transfer (histogram match + Monge-Kantorovich), baked to a LUT. Test-only for now: lost to the solver on every look in tools/compare.mjs
   - `xmp.js`, `jpegmeta.js` — Lightroom settings (embedded XMP and .xmp preset), EXIF carry-over
 - `web/` — the iPhone web app (static files; `npm run build` copies the engine in)
 - `tools/` — `measure.mjs` (print stats), `match.mjs` (before/after table), `e2e.mjs` (headless browser test)
@@ -27,4 +28,6 @@ tools/with-server.sh node tools/faces.mjs testdata/in/*   # cache face outlines 
 tools/flip_all.sh out                                     # NVIDIA FLIP: faces vs scene change (pip install flip-evaluator)
 node tools/artifacts.mjs ref.jpg photo.jpg                # good vs deliberately bad edits through the loss checks
 tools/with-server.sh node tools/e2e.mjs scratch/e2e       # headless browser test of the app
+node tools/compare.mjs testdata/kodak --similar --out scratch/cmp   # ground-truth test: solver vs color transfer
+python3 tools/compare_score.py scratch/cmp                          # CIEDE2000 vs the right answer (pip install color-matcher scikit-image)
 ```

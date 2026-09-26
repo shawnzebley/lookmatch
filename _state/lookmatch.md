@@ -38,6 +38,7 @@ NEXT ACTION — Wait for Shawn's report from his iPhone: open https://shawnzeble
 OUT OF SCOPE — native iOS app, Mac-only tooling, storing slider values in presets, publishing Shawn's photos anywhere public.
 
 ## Log
+- 2026-09-26: tried color transfer (engine/transfer.js, HM-MKL-HM from Pitié/Hahne math; matches Python color-matcher within 0.5 ΔE00). Ground-truth test tools/compare.mjs (6 looks × 12 same-scene Kodak pairs): mean ΔE00 vs right answer — untouched 6.7, solver 7.4, hm-mkl-hm 11.1, mkl 9.5; solver won 59/72; transfer blotchy on 52/72. Not wired into the app. Solver itself is worse than untouched on warm_film/teal_orange/bleach_bypass (pulls reference content colors into the edit) — next thing to fix.
 - 2026-09-26: MediaPipe face outlines for skin guard (tiled retry for small faces; 8/11 test photos), exifr scene EV drives brightness (dark scenes damped via `lift`), face-brightness guard in tone stage, reversed-curve block, high-ISO shadow-slope cap, HSL ignores near-black/near-grey noise, new app warnings (Faces dulled, Reversed tones, Blotchy color), FLIP harness (tools/flip_eval.py). Run 2: tone 9/11, cast 11/11, zone 8/11, clip 11/11, skin 10/11, no app warnings on any auto edit.
 - 2026-09-26: pinned photo while editing; blown/crushed/lost-detail warnings with slider blame and clipping overlay.
 - 2026-09-26: engine + app built, 11-photo test run, deployed to GitHub Pages, OAuth redirect fixed.
