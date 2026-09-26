@@ -244,7 +244,7 @@ function renderMatch() {
   for (const p of S.photos) {
     const busy = ['loading', 'solving', 'exporting'].includes(p.status);
     const t = h(`<button class="tile" data-id="${p.id}">${p.thumbURL ? `<img src="${p.thumbURL}" alt="">` : ''}
-      ${busy ? '<div class="spin"></div>' : ''}<span class="st ${p.status === 'done' || p.status === 'exported' ? 'done' : p.status === 'error' ? 'err' : ''}">${statusLabel(p)}</span></button>`);
+      ${busy ? '<div class="spin"></div>' : ''}${p.loss && p.loss.worst !== 'ok' && !busy ? `<span class="wbadge ${p.loss.worst}" title="${esc(p.loss.issues.map((i) => i.text).join(', '))}">!</span>` : ''}<span class="st ${p.status === 'done' || p.status === 'exported' ? 'done' : p.status === 'error' ? 'err' : ''}">${statusLabel(p)}</span></button>`);
     t.onclick = () => { if (p.params) openDetail(p); else if (p.status === 'error') toast(p.error || 'Failed'); };
     grid.append(t);
   }
@@ -272,7 +272,7 @@ function solvePhoto(p, { priority = false } = {}) {
   if (!pr) return Promise.resolve();
   p.status = 'solving'; p.presetId = pr.id; rerenderMatchSoon();
   return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100 }, { priority }).then((r) => {
-    Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, timings: r.timings, guardScale: r.guardScale, status: 'done' });
+    Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, loss: r.loss, timings: r.timings, guardScale: r.guardScale, status: 'done' });
     rerenderMatchSoon();
     return r;
   }).catch((e) => { p.status = 'error'; p.error = e.message; rerenderMatchSoon(); });
@@ -326,21 +326,25 @@ function openDetail(p) {
   const el = $('#detail');
   el.hidden = false;
   document.body.style.overflow = 'hidden';
-  el.innerHTML = `<div class="dhead"><button class="ghost" id="dBack">‹ Back</button><div class="nm">${esc(p.name)}</div><button class="primary" id="dExport">Export</button></div>
-    <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
-      ${pr ? `<img class="refthumb" src="${pr.thumb}" alt="reference"><span class="reflbl">ref</span>` : ''}</div>
+  el.innerHTML = `<div class="dtop">
+      <div class="dhead"><button class="ghost" id="dBack">‹ Back</button><div class="nm">${esc(p.name)}</div><button class="primary" id="dExport">Export</button></div>
+      <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
+        ${pr ? `<img class="refthumb" src="${pr.thumb}" alt="reference"><span class="reflbl">ref</span>` : ''}</div>
+      <div class="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
+        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><div class="grow"></div><button id="reMatch">Re-match</button></div>
+      <div class="lossbar" id="loss"></div>
+    </div>
     <div class="dbody">
-      <div class="bar" style="margin-top:10px"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
-        <div class="grow"></div><button id="reMatch">Re-match</button></div>
+      <div class="card" id="sliders">${sliderGroups(p)}</div>
       <div class="card"><h3>Match strength</h3><div class="strength"><input type="range" id="str" min="0" max="100" step="1" value="${p.strength}"><output id="strOut">${p.strength}%</output></div>
         <p class="muted small" style="margin:6px 0 0">Changing strength re-solves this photo. Preset default: ${pr?.strength ?? 100}%.</p></div>
       <div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div>
-      <div class="card" id="sliders">${sliderGroups(p)}</div>
     </div>`;
-  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false };
+  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false };
   $('#dBack').onclick = closeDetail;
   $('#dExport').onclick = () => exportPhotos([p]);
   $('#mode').onclick = (e) => { const m = e.target.dataset.m; if (!m) return; D.mode = m; [...$('#mode').children].forEach((b) => b.classList.toggle('on', b.dataset.m === m)); draw(); };
+  $('#clipBtn').onclick = () => setOverlay(!D.overlay);
   $('#reMatch').onclick = async () => {
     $('#reMatch').disabled = true; $('#reMatch').textContent = 'Matching…';
     await solvePhoto(p, { priority: true });
@@ -356,7 +360,69 @@ function openDetail(p) {
   };
   bindSliders();
   bindStage();
+  renderLoss();
   requestPreview(true);
+  scheduleMeasure(0);
+}
+
+function setOverlay(on) {
+  D.overlay = on;
+  const b = $('#clipBtn');
+  b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on));
+  renderLoss();
+  requestPreview(false);
+}
+
+const SL_LABEL = Object.fromEntries(SLIDERS.map((s) => [s.key, s.label]));
+function fmtVal(k, v) { return k === 'exposure' ? `${v > 0 ? '+' : ''}${(+v).toFixed(2)}` : `${v > 0 ? '+' : ''}${Math.round(v)}`; }
+
+function renderLoss() {
+  if (!D) return;
+  const box = $('#loss');
+  const L = D.p.loss;
+  document.querySelectorAll('#sliders .sl.culprit').forEach((r) => r.classList.remove('culprit'));
+  if (!L) { box.innerHTML = ''; return; }
+  const legend = D.overlay ? `<div class="legend"><span><i style="background:#ff1e1e"></i>blown</span><span><i style="background:#286eff"></i>crushed</span><span><i style="background:#ffb900"></i>clipped color</span><span class="muted">dim = already in original</span></div>` : '';
+  if (!L.issues.length) {
+    box.className = 'lossbar ok';
+    box.innerHTML = `<div class="lrow"><span>Nothing blown, crushed or flattened by this edit.</span></div>${legend}`;
+    return;
+  }
+  box.className = `lossbar ${L.worst}`;
+  const chips = L.issues.map((i) => `<span class="lchip ${i.level}">${esc(i.text)}</span>`).join('');
+  const cul = (L.culprits || []).map((c) => `<button class="lnk" data-k="${c.key}">${esc(SL_LABEL[c.key] || c.key)} ${fmtVal(c.key, c.value)}</button>`).join(', ');
+  box.innerHTML = `<div class="lrow">${chips}</div>${cul ? `<div class="lrow small">Mostly from ${cul}</div>` : ''}${D.overlay ? legend : '<div class="lrow small"><button class="lnk" id="showClip">Show it on the photo</button></div>'}`;
+  for (const c of L.culprits || []) document.querySelector(`#sliders .sl[data-k="${c.key}"]`)?.classList.add('culprit');
+  box.querySelectorAll('button.lnk[data-k]').forEach((b) => (b.onclick = () => jumpToSlider(b.dataset.k)));
+  if ($('#showClip')) $('#showClip').onclick = () => setOverlay(true);
+}
+
+function jumpToSlider(k) {
+  const row = document.querySelector(`#sliders .sl[data-k="${k}"]`);
+  if (!row) return;
+  row.closest('details').open = true;
+  const top = $('.dtop').getBoundingClientRect().height;
+  const det = $('#detail');
+  det.scrollTo({ top: det.scrollTop + row.getBoundingClientRect().top - top - 12, behavior: 'smooth' });
+  row.classList.remove('flash'); void row.offsetWidth; row.classList.add('flash');
+}
+
+let measureT;
+function scheduleMeasure(delay = 350) {
+  clearTimeout(measureT);
+  measureT = setTimeout(async () => {
+    if (!D) return;
+    const p = D.p;
+    const r = await pool.call(p.worker, 'measureParams', { id: p.id, params: { ...p.params }, auto: p.solved || null }, { priority: true });
+    if (!D || D.p !== p) return;
+    p.after = r.after; p.loss = r.loss;
+    $('#nums').innerHTML = numbersTable(p);
+    const wasBad = D.lastWorst === 'bad';
+    D.lastWorst = r.loss.worst;
+    renderLoss();
+    // first time an edit goes badly wrong, show where on the photo
+    if (r.loss.worst === 'bad' && !wasBad && !D.overlay && D.userEdited) setOverlay(true);
+  }, delay);
 }
 
 function refreshDetail() {
@@ -366,11 +432,12 @@ function refreshDetail() {
   $('#sliders').innerHTML = sliderGroups(D.p);
   [...document.querySelectorAll('#sliders details')].forEach((d, i) => (d.open = open[i]));
   bindSliders();
+  renderLoss();
   requestPreview(false);
+  scheduleMeasure(0);
 }
 
 function bindSliders() {
-  let measureT;
   document.querySelectorAll('#sliders .sl').forEach((row) => {
     const k = row.dataset.k;
     const [range, num] = row.querySelectorAll('input');
@@ -378,15 +445,12 @@ function bindSliders() {
       const s = SLIDERS.find((x) => x.key === k);
       v = Math.max(s.ui[0], Math.min(s.ui[1], +v || 0));
       D.p.params[k] = v;
+      D.userEdited = true;
       if (from !== range) range.value = v;
       if (from !== num) num.value = s.step ? v.toFixed(2) : Math.round(v);
       row.classList.toggle('changed', Math.abs(v) > 1e-9);
       requestPreview(false);
-      clearTimeout(measureT);
-      measureT = setTimeout(async () => {
-        const r = await pool.call(D.p.worker, 'measureParams', { id: D.p.id, params: D.p.params }, { priority: true });
-        D.p.after = r.after; $('#nums').innerHTML = numbersTable(D.p);
-      }, 350);
+      scheduleMeasure();
     };
     range.oninput = () => set(range.value, range);
     num.onchange = () => set(num.value, num);
@@ -401,14 +465,15 @@ async function requestPreview(withOriginal) {
   const p = D.p;
   const side = Math.min(1600, Math.round(Math.max(window.innerWidth, 400) * Math.min(2, devicePixelRatio || 1)));
   try {
-    const r = await pool.call(p.worker, 'preview', { id: p.id, params: p.params, side, withOriginal: withOriginal || !D.orig }, { priority: true });
+    const r = await pool.call(p.worker, 'preview', { id: p.id, params: { ...p.params }, side, overlay: D.overlay, withOriginal: withOriginal || !D.orig }, { priority: true });
     if (!D || D.p !== p) return;
     if (r.original) D.orig = r.original;
     D.edit = r.edited;
     draw();
   } catch (e) { toast(e.message); }
+  if (!D) return;
   D.busy = false;
-  if (D && D.again) { D.again = false; requestPreview(false); }
+  if (D.again) { D.again = false; requestPreview(false); }
 }
 
 function draw() {
@@ -417,7 +482,7 @@ function draw() {
   const { width: w, height: hgt } = D.edit;
   if (cv.width !== w || cv.height !== hgt) { cv.width = w; cv.height = hgt; }
   const x = cv.getContext('2d');
-  const m = D.mode;
+  const m = D.holding ? 'before' : D.mode;
   if (m === 'after' || !D.orig) x.drawImage(D.edit, 0, 0);
   else if (m === 'before') x.drawImage(D.orig, 0, 0);
   else {
@@ -427,23 +492,28 @@ function draw() {
     x.fillStyle = 'rgba(255,255,255,.9)'; x.fillRect(sx - 1, 0, 2, hgt);
   }
   $('#lblL').hidden = m === 'after'; $('#lblR').hidden = m === 'before';
-  $('#lblL').textContent = m === 'split' ? 'Before' : 'Before';
+  $('#lblR').textContent = D.mode === 'after' && !D.holding ? 'After · hold for before' : 'After';
 }
 
 function bindStage() {
-  const st = $('#stage');
+  const cv = $('#cv');
   let dragging = false;
-  const pos = (e) => { const r = st.getBoundingClientRect(); return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)); };
-  st.addEventListener('pointerdown', (e) => {
-    if (D.mode !== 'split') return;
-    dragging = true; st.setPointerCapture(e.pointerId); D.split = pos(e); draw();
+  const pos = (e) => { const r = cv.getBoundingClientRect(); return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)); };
+  cv.addEventListener('pointerdown', (e) => {
+    cv.setPointerCapture(e.pointerId);
+    if (D.mode === 'split') { dragging = true; D.split = pos(e); }
+    else if (D.mode === 'after') D.holding = true;
+    draw();
   });
-  st.addEventListener('pointermove', (e) => { if (dragging) { D.split = pos(e); draw(); } });
-  st.addEventListener('pointerup', () => (dragging = false));
-  st.addEventListener('pointercancel', () => (dragging = false));
+  cv.addEventListener('pointermove', (e) => { if (dragging) { D.split = pos(e); draw(); } });
+  const up = () => { dragging = false; if (D && D.holding) { D.holding = false; draw(); } };
+  cv.addEventListener('pointerup', up);
+  cv.addEventListener('pointercancel', up);
+  cv.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
 function closeDetail() {
+  clearTimeout(measureT);
   $('#detail').hidden = true; $('#detail').innerHTML = '';
   document.body.style.overflow = '';
   D = null;

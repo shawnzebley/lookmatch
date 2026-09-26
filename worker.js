@@ -1,7 +1,8 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
 import { prepare, measure } from './engine/measure.js';
 import { solve } from './engine/solver.js';
-import { buildLUT, applyLUT, processPixelSet } from './engine/pipeline.js';
+import { buildLUT, applyLUT, processPixelSet, SLIDERS } from './engine/pipeline.js';
+import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
 import { exifSegment, xmpSegment, insertSegments, isJpeg } from './engine/jpegmeta.js';
 import encodeJpeg from './vendor/jpeg-encoder.js';
@@ -83,6 +84,25 @@ function renderInto(src, params) {
   return { width: src.width, height: src.height, data: out };
 }
 
+// Clipping overlay, same classes as engine/loss.js. Bright = caused by the edit, dim = already in the original.
+function clipClass(r, g, b) {
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+  if (mx >= 254 && 0.299 * r + 0.587 * g + 0.114 * b >= 228) return 1; // blown
+  if (mx <= 2) return 2;                                                 // crushed
+  if (mx >= 254 || mn <= 1) return 3;                                    // clipped color
+  return 0;
+}
+const PAINT = { 1: [[255, 30, 30], [150, 70, 70]], 2: [[40, 110, 255], [50, 60, 120]], 3: [[255, 185, 0], [140, 115, 50]] };
+function paintClipping(orig, out) {
+  for (let i = 0; i < out.length; i += 4) {
+    const c = clipClass(out[i], out[i + 1], out[i + 2]);
+    if (!c) continue;
+    const was = clipClass(orig[i], orig[i + 1], orig[i + 2]) === c;
+    const [r, g, b] = PAINT[c][was ? 1 : 0];
+    out[i] = r; out[i + 1] = g; out[i + 2] = b;
+  }
+}
+
 const handlers = {
   async measureRef({ file }) {
     const bmp = await bitmap(file);
@@ -109,18 +129,33 @@ const handlers = {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
     const res = solve(e.ps, o, refStats, { strength });
-    const after = measure(e.ps, processPixelSet(e.ps, res.params));
-    return { params: res.params, targets: res.targets, before: o, after, timings: res.timings, guardScale: res.guardScale };
+    const cur = processPixelSet(e.ps, res.params);
+    const after = measure(e.ps, cur);
+    const loss = lossReport(e.ps, cur, res.params);
+    return { params: res.params, targets: res.targets, before: o, after, loss, timings: res.timings, guardScale: res.guardScale };
   },
 
-  async measureParams({ id, params }) {
+  async measureParams({ id, params, auto = null }) {
     const e = await ensurePrepared(id);
-    return { after: measure(e.ps, processPixelSet(e.ps, params)) };
+    const cur = processPixelSet(e.ps, params);
+    const loss = lossReport(e.ps, cur, params);
+    if (loss.issues.length) {
+      // rank the sliders responsible on a 15k-pixel sample (fast enough to run on every slider release)
+      if (!e.sample) {
+        const idx = []; const step = Math.max(1, Math.floor(e.ps.n / 15000));
+        for (let i = 0; i < e.ps.n; i += step) idx.push(i);
+        e.sample = Int32Array.from(idx);
+      }
+      const scratch = { L: new Float32Array(e.ps.n), A: new Float32Array(e.ps.n), B: new Float32Array(e.ps.n), lr: new Float32Array(e.ps.n), lg: new Float32Array(e.ps.n), lb: new Float32Array(e.ps.n) };
+      loss.culprits = culprits(e.ps, params, (q, idx, c) => processPixelSet(e.ps, q, idx, c), e.sample, scratch, SLIDERS.map((s) => s.key), auto);
+    }
+    return { after: measure(e.ps, cur), loss };
   },
 
-  async preview({ id, params, side = 1400, withOriginal = false }) {
+  async preview({ id, params, side = 1400, withOriginal = false, overlay = false }) {
     const e = await ensureDisplay(id, side);
     const out = renderInto(e.display, params);
+    if (overlay) paintClipping(e.display.data, out.data);
     const edited = await createImageBitmap(new ImageData(out.data, out.width, out.height));
     let original = null;
     if (withOriginal) original = await createImageBitmap(new ImageData(new Uint8ClampedArray(e.display.data), e.display.width, e.display.height));
