@@ -24,7 +24,7 @@ function toast(msg, ms = 3200) {
 const SETTINGS_KEY = 'lm_settings';
 const S = {
   presets: [],
-  settings: { clientId: '', quality: 92, lightroom: true, lrMode: 'sliders', dest: 'drive', ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') },
+  settings: { clientId: '243038152226-jfgss8uq68lb72bi9j5jqgkdlg475kj8.apps.googleusercontent.com', quality: 92, lightroom: true, lrMode: 'sliders', dest: 'drive', ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') },
   presetId: localStorage.getItem('lm_preset') || null,
   photos: [],
   tab: 'presets',
