@@ -63,7 +63,30 @@ function quantile(arr, p) {
  * img: { width, height, data: Uint8Array|Uint8ClampedArray, channels: 3|4 }
  * returns PixelSet with original linear/Lab arrays and fixed masks.
  */
-export function prepare(img) {
+// Fill polygons (0..1 coords) into a mask at w x h (even-odd scanline).
+export function polygonMask(polys, w, h) {
+  const m = new Uint8Array(w * h);
+  for (const poly of polys || []) {
+    const pts = poly.map(([x, y]) => [x * w, y * h]);
+    let y0 = Math.max(0, Math.floor(Math.min(...pts.map((p) => p[1]))));
+    const y1 = Math.min(h - 1, Math.ceil(Math.max(...pts.map((p) => p[1]))));
+    for (let y = y0; y <= y1; y++) {
+      const yc = y + 0.5, xs = [];
+      for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+        const [xi, yi] = pts[i], [xj, yj] = pts[j];
+        if ((yi > yc) !== (yj > yc)) xs.push(xi + ((yc - yi) / (yj - yi)) * (xj - xi));
+      }
+      xs.sort((a, b) => a - b);
+      for (let k = 0; k + 1 < xs.length; k += 2) {
+        const a = Math.max(0, Math.ceil(xs[k] - 0.5)), b = Math.min(w - 1, Math.floor(xs[k + 1] - 0.5));
+        for (let x = a; x <= b; x++) m[y * w + x] = 1;
+      }
+    }
+  }
+  return m;
+}
+
+export function prepare(img, opts = {}) {
   const { width, height, data } = img;
   const ch = img.channels || 4;
   const n = width * height;
@@ -142,11 +165,25 @@ export function prepare(img) {
   const lowSat = new Uint8Array(n);
   for (let i = 0; i < n; i++) if (C[i] <= c60) lowSat[i] = 1;
 
-  // skin-like pixels (hue/chroma/lightness window). In the browser, face boxes narrow this further.
+  // skin: inside detected face outlines (MediaPipe) when available, else a hue/chroma/lightness window.
+  // Inside a face the color test is loose (any lighting cast), and only drops hair, eyes, beard shadow and specular.
   const skin = new Uint8Array(n);
-  for (let i = 0; i < n; i++) {
-    const h = Math.atan2(B[i], A[i]) * 180 / Math.PI;
-    if (h > 20 && h < 75 && C[i] > 8 && C[i] < 50 && L[i] > 25 && L[i] < 92 && lr[i] > lg[i] && lg[i] > lb[i]) skin[i] = 1;
+  let skinSource = 'color';
+  const faceMask = opts.faces && opts.faces.length ? polygonMask(opts.faces, width, height) : null;
+  if (faceMask) {
+    let cnt = 0;
+    for (let i = 0; i < n; i++) {
+      if (!faceMask[i]) continue;
+      const h = Math.atan2(B[i], A[i]) * 180 / Math.PI;
+      if (h > -10 && h < 100 && C[i] > 3 && L[i] > 22 && L[i] < 97) { skin[i] = 1; cnt++; }
+    }
+    if (cnt >= 30) skinSource = 'faces'; else skin.fill(0);
+  }
+  if (skinSource === 'color') {
+    for (let i = 0; i < n; i++) {
+      const h = Math.atan2(B[i], A[i]) * 180 / Math.PI;
+      if (h > 20 && h < 75 && C[i] > 8 && C[i] < 50 && L[i] > 25 && L[i] < 92 && lr[i] > lg[i] && lg[i] > lb[i]) skin[i] = 1;
+    }
   }
 
   // bright half of skin (lit side of faces) gets its own guard
@@ -157,7 +194,7 @@ export function prepare(img) {
   return {
     width, height, n, lr, lg, lb, L, A, B, hue,
     masks: { zone, zw, zoneTint, neutral, bw, lowSat, skin },
-    wbConfidence, neutralThreshold: thr,
+    wbConfidence, neutralThreshold: thr, skinSource, faceCount: faceMask ? opts.faces.length : 0,
   };
 }
 
@@ -249,7 +286,7 @@ export function measure(ps, cur, idx) {
   const color = { meanChroma: sumC / N, lowChroma: lowN ? lowC / lowN : 0 };
   const sh = sn ? Math.atan2(sb / sn, sa / sn) * 180 / Math.PI : 0;
   let sv = 0; for (const h of skinH) { let d = h - sh; d = ((d + 180) % 360 + 360) % 360 - 180; sv += d * d; }
-  const skin = { frac: sn / N, hue: sh, chroma: sn ? sc / sn : 0, hueSpread: sn ? Math.sqrt(sv / sn) : 0,
+  const skin = { source: ps.skinSource, faces: ps.faceCount, frac: sn / N, hue: sh, chroma: sn ? sc / sn : 0, hueSpread: sn ? Math.sqrt(sv / sn) : 0,
     litHue: hn ? Math.atan2(hb / hn, ha / hn) * 180 / Math.PI : 0, litChroma: hn ? hc / hn : 0 };
 
   return { tone, curve, wb, zones, bands, color, skin };

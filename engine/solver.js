@@ -2,8 +2,9 @@
 // Staged bounded Levenberg-Marquardt: tone -> white balance -> color -> tone/WB touch-up.
 
 import { PCTS, BANDS, measure } from './measure.js';
-import { SLIDERS, SLIDER_BY_KEY, defaultParams, toneMapL, toneRaw, toneMaxSlope, fadeLevels, processPixelSet, clampParams } from './pipeline.js';
+import { SLIDERS, SLIDER_BY_KEY, defaultParams, toneMapL, toneRaw, toneMaxSlope, toneReversal, fadeLevels, processPixelSet, clampParams } from './pipeline.js';
 import { wheelHueToAB, abToWheelHue, wrapDeg } from './color.js';
+import { brightenFactor } from './scene.js';
 
 // ---------------- generic bounded LM (projected), finite-difference Jacobian --------------------
 function solveLinear(A, b) {
@@ -78,20 +79,29 @@ export function lm(fn, x0, lo, hi, { iters = 25, h = null, lambda0 = 1e-2 } = {}
 // ---------------- targets ----------------------------------------------------------------------
 const hinge = (v, lo, hi) => (v < lo ? lo - v : v > hi ? v - hi : 0);
 
-export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5 } = {}) {
+export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5, scene = null } = {}) {
   const s = Math.min(1, Math.max(0, strength));
   const o50 = o.tone.pct[50], r50 = ref.tone.pct[50];
   // weight relative look over absolute brightness: only part of the way to the reference's median,
   // and even less when the photo is a low-key / night frame being pulled up.
   let pull = brightnessPull;
-  if (o50 < r50) pull *= Math.min(1, Math.max(0.15, (o50 - 8) / 25));
+  let lift = 1; // how much of any brightening move to keep (dark scenes stay dark all through the range)
+  if (o50 < r50) {
+    const byImage = Math.min(1, Math.max(0.15, (o50 - 8) / 25));
+    const byScene = brightenFactor(scene);
+    // camera settings, when present, decide whether "dark" means a dark scene or an underexposed bright one
+    const f = byScene == null ? byImage : byScene;
+    pull *= f;
+    lift = Math.max(0.25, f);
+  }
   const anchor = o50 + pull * (r50 - o50);
   const below = anchor / Math.max(1, r50), above = (100 - anchor) / Math.max(1, 100 - r50);
   const pct = {};
   for (const p of PCTS) {
     const d = ref.tone.pct[p] - r50;
-    const full = anchor + d * (d < 0 ? below : above);
-    pct[p] = o.tone.pct[p] + s * (Math.min(100, Math.max(0, full)) - o.tone.pct[p]);
+    const full = Math.min(100, Math.max(0, anchor + d * (d < 0 ? below : above)));
+    const move = full - o.tone.pct[p];
+    pct[p] = o.tone.pct[p] + s * move * (move > 0 ? lift : 1);
   }
   const wbConf = Math.min(1, o.wb.confidence / 0.4) * Math.min(1, ref.wb.confidence / 0.4);
   const sw = s * wbConf;
@@ -124,7 +134,7 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5 } = 
     hi: Math.max(o.tone.clipHi, ref.tone.clipHi) + 0.001,
     lo: Math.max(o.tone.clipLo, ref.tone.clipLo) + 0.001,
   };
-  const skin = { hue: o.skin.hue, chroma: o.skin.chroma, spread: o.skin.hueSpread, litHue: o.skin.litHue, litChroma: o.skin.litChroma, active: o.skin.frac > 0.005 };
+  const skin = { hue: o.skin.hue, chroma: o.skin.chroma, spread: o.skin.hueSpread, litHue: o.skin.litHue, litChroma: o.skin.litChroma, active: o.skin.source === 'faces' ? o.skin.frac > 0.0004 : o.skin.frac > 0.005 };
   return { tone: { pct }, wb, zones, bands, color, clip, skin, strength: s, anchor };
 }
 
@@ -147,9 +157,10 @@ function sampleIdx(n, count, pred, seed = 7) {
 }
 
 function skinResiduals(st, t) {
-  if (!t.skin.active || st.skin.frac < 0.002) return [0, 0, 0, 0, 0, 0];
+  if (!t.skin.active || st.skin.frac < 0.0003) return [0, 0, 0, 0, 0, 0];
   return [
-    hinge(st.skin.hue, 35, 64) / 1.5,                      // believable skin hue window (Lab hue angle)
+    // believable skin hue window (Lab hue angle); a photo already outside it (colored stage light) may not get worse
+    hinge(st.skin.hue, Math.min(35, t.skin.hue - 2), Math.max(64, t.skin.hue + 2)) / 1.5,
     hinge(wrapDeg(st.skin.hue - t.skin.hue), -6, 6) / 1.5, // don't swing skin more than ~6 degrees
     hinge(st.skin.chroma / Math.max(1, t.skin.chroma), 0.68, 1.4) * 15,
     Math.max(0, st.skin.hueSpread - t.skin.spread - 2) / 1,  // blotchy skin = hue spread grows
@@ -175,6 +186,20 @@ export function solve(ps, o, ref, opts = {}) {
 
   // ---- stage A: tone (quantile mapping is exact for a monotonic luminance curve)
   let toneBias = Object.fromEntries(PCTS.map((p) => [p, 0]));
+  // Noise: stretching the darkest tones of a high-ISO frame turns sensor noise into blotches.
+  const iso = opts.scene?.iso || 0;
+  const noisy = iso >= 3200 || (!iso && o.tone.pct[50] < 12);
+  const darkSlopeCap = !noisy ? Infinity : iso >= 8000 ? 1.35 : 1.6;
+  const darkSlope = (p, fl) => { let mx = 0, prev = toneMapL(0, p, fl); for (let L = 2; L <= 30; L += 2) { const v = toneMapL(L, p, fl); mx = Math.max(mx, (v - prev) / 2); prev = v; } return mx; };
+  // faces: keep their brightness. Copying rolled-off highlights must not drag a face that happens to be
+  // the brightest thing in a dark frame down to mid-grey (it reads as grey, lifeless skin).
+  const litSkin = [], allSkin = [];
+  for (let i = 0; i < ps.n; i += 3) { if (ps.masks.skin[i] === 2) litSkin.push(ps.L[i]); if (ps.masks.skin[i]) allSkin.push(ps.L[i]); }
+  const mean = (a) => a.reduce((x, y) => x + y, 0) / Math.max(1, a.length);
+  const litSkin0 = mean(litSkin), allSkin0 = mean(allSkin);
+  const brightSkin = litSkin.slice().sort((a, b) => a - b).slice(Math.floor(litSkin.length * 0.8));
+  const brightSkin0 = mean(brightSkin);
+  const faceWeight = ps.skinSource === 'faces' ? 1 : 0.5;
   let clipBias = { hi: 0, lo: 0 };
   // risk set: bright pixels whose channels can hit the gamut edge; run through the full pipeline in the tone stage
   const riskAll = [];
@@ -203,6 +228,14 @@ export function solve(ps, o, ref, opts = {}) {
       const hiC = useRisk ? Math.max(hiL, riskClip(p)) : hiL + clipBias.hi;
       r.push(Math.max(0, hiC - T.clip.hi) * 3000, Math.max(0, loC + clipBias.lo - T.clip.lo) * 3000);
       r.push(Math.max(0, toneMaxSlope(p) - 2.2) * 6);
+      r.push(toneReversal(p) * 8);
+      r.push(Number.isFinite(darkSlopeCap) ? Math.max(0, darkSlope(p, fl) - darkSlopeCap) * 12 : 0);
+      if (litSkin.length > 20) {
+        const lit1 = litSkin.reduce((a, L) => a + toneMapL(L, p, fl), 0) / litSkin.length + toneBias[50] * 0;
+        const all1 = allSkin.reduce((a, L) => a + toneMapL(L, p, fl), 0) / allSkin.length;
+        const br1 = brightSkin.reduce((a, L) => a + toneMapL(L, p, fl), 0) / Math.max(1, brightSkin.length);
+        r.push(faceWeight * hinge(lit1 - litSkin0, -4, 14) / 1.2, faceWeight * hinge(all1 - allSkin0, -5, 14) / 1.2, faceWeight * hinge(br1 - brightSkin0, -6, 14) / 1.2);
+      } else r.push(0, 0, 0);
       r.push(Math.max(0, nearWhite(p) - origNearWhite - 0.004) * 600);
       TONE_KEYS.forEach((k, i) => { const c = capRange(k); r.push(1.8 * reg * x[i] / (c[1] - c[0])); });
       return r;
@@ -334,7 +367,7 @@ export function solve(ps, o, ref, opts = {}) {
   const clipOf = (p) => { processPixelSet(ps, p, guardIdx, cur); const st = measure(ps, cur, guardIdx); return st.tone; };
   const scaled = (k) => { const q = { ...params }; for (const sl of SLIDERS) if (!sl.hue && sl.key !== 'temp' && sl.key !== 'tint') q[sl.key] = params[sl.key] * k; return q; };
   let guardK = 1;
-  const over = (c) => c.clipHi > T.clip.hi - 0.0004 || c.clipLo > T.clip.lo - 0.0004;
+  const over = (c) => c.clipHi > T.clip.hi - 0.0006 || c.clipLo > T.clip.lo - 0.0006;
   const BRIGHT = (k, v) => (k === 'exposure' || k === 'highlights' || k === 'whites' || k === 'contrast' || k.startsWith('lum_')) && v > 0
     || (k === 'blacks' || k === 'shadows') && v < 0;
   const scaledBright = (k2) => { const q = { ...params }; for (const sl of SLIDERS) if (BRIGHT(sl.key, params[sl.key])) q[sl.key] = params[sl.key] * k2; return q; };
