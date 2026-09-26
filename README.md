@@ -30,4 +30,6 @@ node tools/artifacts.mjs ref.jpg photo.jpg                # good vs deliberately
 tools/with-server.sh node tools/e2e.mjs scratch/e2e       # headless browser test of the app
 node tools/compare.mjs testdata/kodak --similar --out scratch/cmp   # ground-truth test: solver vs color transfer
 python3 tools/compare_score.py scratch/cmp                          # CIEDE2000 vs the right answer (pip install color-matcher scikit-image)
+python3 tools/run_models.py scratch/cmp --np-repo ../Neural-Preset --np-ckpt W/np_ckpt --dp-repo ../deep_preset --dp-ckpt W/dp_wppl.pth.tar  # outside models (PyTorch, CPU)
+python3 tools/fit_color_map.py scratch/cmp deeppreset && node tools/loss_png.mjs scratch/cmp neuralpreset deeppreset deeppreset-map
 ```
