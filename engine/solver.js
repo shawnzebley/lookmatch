@@ -2,7 +2,7 @@
 // Staged bounded Levenberg-Marquardt: tone -> white balance -> color -> tone/WB touch-up.
 
 import { PCTS, BANDS, measure } from './measure.js';
-import { SLIDERS, SLIDER_BY_KEY, defaultParams, toneMapL, toneRaw, toneMaxSlope, toneReversal, fadeLevels, processPixelSet, clampParams } from './pipeline.js';
+import { SLIDERS, SLIDER_BY_KEY, defaultParams, toneMapL, toneRaw, exposeX, toneMaxSlope, toneReversal, fadeLevels, processPixelSet, clampParams } from './pipeline.js';
 import { wheelHueToAB, abToWheelHue, wrapDeg } from './color.js';
 import { brightenFactor } from './scene.js';
 
@@ -101,8 +101,17 @@ export const END_ABS = { 1: 1, 5: 0.5, 95: 0.5, 99: 1 };
 export const CHROMA_CAP = 2.2;
 // How much duller a colour gets when the reference doesn't have it at all.
 export const ABSENT_BAND_DULL = 0.2;
+// Brightening target shape: 1 = what Exposure alone would do to this photo's tones, 0 = linear stretch.
+export const OWN_MODEL = 1;
+export const OWN_EV_CAP = 1.5;
+// Tone-stage cost per slider direction (x the base regularization). Exposure is the plain way to
+// brighten; Shadows up, Contrast down, Whites down and faded blacks flatten a photo, so they cost more.
+export const TONE_REG = {
+  exposure: [0.5, 0.5], contrast: [2, 1], highlights: [1, 1], shadows: [1, 2.5],
+  whites: [1.5, 1], blacks: [1, 1.5], fadeBlacks: [1, 2], fadeWhites: [1, 1],
+};
 
-export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNESS_PULL, scene = null, toneShape = TONE_SHAPE, zoneMove = ZONE_MOVE, bandMove = BAND_MOVE, endAbs = END_ABS, chromaCap = CHROMA_CAP } = {}) {
+export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNESS_PULL, scene = null, toneShape = TONE_SHAPE, zoneMove = ZONE_MOVE, bandMove = BAND_MOVE, endAbs = END_ABS, chromaCap = CHROMA_CAP, ownModel = OWN_MODEL } = {}) {
   const s = Math.min(1, Math.max(0, strength));
   const o50 = o.tone.pct[50], r50 = ref.tone.pct[50];
   // weight relative look over absolute brightness: only part of the way to the reference's median,
@@ -118,6 +127,16 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNE
     lift = Math.max(0.6, Math.sqrt(f));
   }
   const anchor = o50 + pull * (r50 - o50);
+  // Brightening: the exposure that moves this photo's median to the new median (up to the solver's cap).
+  // The photo's own shape is then what that exposure does to every tone, not a linear stretch around the
+  // median (a linear stretch doubles the darks and squeezes the highs, and only Shadows + negative
+  // Contrast can make that: the flat, lifted-black look on a dark gym wall).
+  let ev = 0;
+  if (anchor > o50 + 0.5 && ownModel > 0) {
+    let lo = 0, hi = OWN_EV_CAP;
+    for (let it = 0; it < 30; it++) { const m = (lo + hi) / 2; if (100 * exposeX(o50, { exposure: m }) < anchor) lo = m; else hi = m; }
+    ev = lo;
+  }
   const below = anchor / Math.max(1, r50), above = (100 - anchor) / Math.max(1, 100 - r50);
   const pct = {};
   for (const p of PCTS) {
@@ -128,7 +147,8 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNE
     if (ea) full += ea * ((p < 50 ? Math.min(ref.tone.pct[p], anchor - 2) : Math.max(ref.tone.pct[p], anchor + 2)) - full);
     // this photo's own shape, moved to the new median
     const dO = o.tone.pct[p] - o50;
-    const own = Math.min(100, Math.max(0, anchor + dO * (dO < 0 ? anchor / Math.max(1, o50) : (100 - anchor) / Math.max(1, 100 - o50))));
+    let own = Math.min(100, Math.max(0, anchor + dO * (dO < 0 ? anchor / Math.max(1, o50) : (100 - anchor) / Math.max(1, 100 - o50))));
+    if (ev > 0) own = ownModel * 100 * exposeX(o.tone.pct[p], { exposure: ev }) + (1 - ownModel) * own;
     const w = toneShape[p] ?? 1;
     const move = own + w * (full - own) - o.tone.pct[p];
     pct[p] = o.tone.pct[p] + s * move * (move > 0 ? lift : 1);
@@ -217,6 +237,7 @@ export function solve(ps, o, ref, opts = {}) {
   const T = computeTargets(o, ref, opts);
   const params = defaultParams();
   const reg = opts.regularization ?? 1;
+  const toneReg = opts.toneReg ?? TONE_REG;
 
   // sorted luminance sample for fast tone-stage clipping estimates
   const lumSample = sampleIdx(ps.n, 3000, null, 11);
@@ -275,7 +296,7 @@ export function solve(ps, o, ref, opts = {}) {
         r.push(faceWeight * hinge(lit1 - litSkin0, -4, 14) / 1.2, faceWeight * hinge(all1 - allSkin0, -5, 14) / 1.2, faceWeight * hinge(br1 - brightSkin0, -6, 14) / 1.2);
       } else r.push(0, 0, 0);
       r.push(Math.max(0, nearWhite(p) - origNearWhite - 0.004) * 600);
-      TONE_KEYS.forEach((k, i) => { const c = capRange(k); r.push(1.8 * reg * x[i] / (c[1] - c[0])); });
+      TONE_KEYS.forEach((k, i) => { const c = capRange(k), w = toneReg[k] || [1, 1]; r.push(1.8 * reg * w[x[i] < 0 ? 0 : 1] * x[i] / (c[1] - c[0])); });
       return r;
     };
     const res = lm(fn, TONE_KEYS.map((k) => params[k]), lo, hi, { iters: 40 });
