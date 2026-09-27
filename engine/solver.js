@@ -436,7 +436,8 @@ export function solvePreset(ps, o, presetParams, opts = {}) {
   // target median: pull halfway toward a normal exposure, less for low-key scenes so night stays night
   const med0 = o.tone.pct[50];
   const lowKey = med0 < 25 || (opts.scene?.ev != null && opts.scene.ev < 7);
-  const medT = med0 + (46 - med0) * (lowKey ? 0.2 : 0.5);
+  const pull = opts.pull ?? 0.5; // photographer looks pass a gentler pull: their finish does the tone work
+  const medT = med0 + (46 - med0) * (lowKey ? Math.min(0.2, pull) : pull);
   const wbW = neutralIdx.length > 200 ? 1 : 0.4;
   const fn = (x) => {
     const p = { ...defaultParams(), exposure: x[0], temp: x[1], tint: x[2] };
