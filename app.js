@@ -321,7 +321,7 @@ function solvePhoto(p, { priority = false } = {}) {
   const pr = currentPreset();
   if (!pr) return Promise.resolve();
   p.status = 'solving'; p.presetId = pr.id; rerenderMatchSoon();
-  return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100, lrParams: pr.lr ? pr.lrParams : null, finish: pr.finish || 'off' }, { priority }).then((r) => {
+  return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100, lrParams: pr.lr ? pr.lrParams : null, finish: p.finish || pr.finish || 'off' }, { priority }).then((r) => {
     Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, status: 'done' });
     rerenderMatchSoon();
     return r;
@@ -388,6 +388,9 @@ function openDetail(p) {
       <div class="lossbar" id="loss"></div>
     </div>
     <div class="dbody">
+      <div class="card"><h3>Finishing touch</h3><div class="fin" id="fin">${finishButtons(p, pr)}</div>
+        <p class="muted small" id="finNote" style="margin:6px 0 0">${finishNote(p, pr)}</p>
+        <div class="row" style="margin-top:8px"><button id="finAll">Use on all photos</button></div></div>
       <div class="card" id="sliders">${sliderGroups(p)}</div>
       <div class="card"><h3>Match strength</h3><div class="strength"><input type="range" id="str" min="0" max="100" step="1" value="${p.strength}"><output id="strOut">${p.strength}%</output></div>
         <p class="muted small" style="margin:6px 0 0">Changing strength re-solves this photo. Preset default: ${pr?.strength ?? 100}%.</p></div>
@@ -411,11 +414,35 @@ function openDetail(p) {
     await solvePhoto(p, { priority: true });
     refreshDetail(); $('#reMatch').disabled = false;
   };
+  $('#fin').onclick = async (e) => {
+    const k = e.target.closest('button')?.dataset.f;
+    if (!k || D?.p !== p) return;
+    p.finish = k;
+    $('#fin').innerHTML = finishButtons(p, pr); $('#finNote').textContent = 'Applying…';
+    await solvePhoto(p, { priority: true });
+    refreshDetail();
+  };
+  $('#finAll').onclick = () => {
+    const k = p.finish || pr?.finish || 'off';
+    for (const ph of S.photos) if (ph !== p) { ph.finish = k; if (ph.status === 'done' || ph.status === 'exported') ph.status = 'ready'; }
+    runQueue();
+    toast(`${FINISH_PROFILES[k].name} on all photos`);
+  };
   bindSliders();
   bindStage();
   renderLoss();
   requestPreview(true);
   scheduleMeasure(0);
+}
+
+function finishButtons(p, pr) {
+  const cur = p.finish || pr?.finish || 'off';
+  return Object.entries(FINISH_PROFILES).map(([k, f]) => `<button data-f="${k}" class="${k === cur ? 'on' : ''}">${esc(f.name)}</button>`).join('');
+}
+function finishNote(p, pr) {
+  const f = FINISH_PROFILES[p.finish || pr?.finish || 'off'];
+  if (!f || !f.source) return 'Adds the black point, highlight roll-off, color, vignette and grain measured from a photographer\'s published work.';
+  return `Measured from ${f.n} published images on ${f.source}. Tone ends are matched; color moves a third of the way so your scene stays yours.`;
 }
 
 function setOverlay(on) {
@@ -481,6 +508,8 @@ function scheduleMeasure(delay = 350) {
 function refreshDetail() {
   if (!D) return;
   $('#nums').innerHTML = numbersTable(D.p);
+  const prD = S.presets.find((q) => q.id === D.p.presetId) || currentPreset();
+  if ($('#fin')) { $('#fin').innerHTML = finishButtons(D.p, prD); $('#finNote').textContent = finishNote(D.p, prD); }
   const open = [...document.querySelectorAll('#sliders details')].map((d) => d.open);
   $('#sliders').innerHTML = sliderGroups(D.p);
   [...document.querySelectorAll('#sliders details')].forEach((d, i) => (d.open = open[i]));

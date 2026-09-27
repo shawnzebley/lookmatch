@@ -136,3 +136,7 @@ td.good { color: var(--good); } td.bad { color: var(--bad); }
 .settings .check input { width: 20px; height: 20px; }
 code { background: var(--panel2); padding: 1px 5px; border-radius: 5px; font-size: 12.5px; word-break: break-all; }
 ol.steps { padding-left: 20px; margin: 6px 0; } ol.steps li { margin-bottom: 6px; }
+/* finishing-touch picker */
+.fin { display: flex; flex-wrap: wrap; gap: 6px; }
+.fin button { padding: 7px 11px; font-size: 13px; }
+.fin button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }

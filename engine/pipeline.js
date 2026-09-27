@@ -50,6 +50,11 @@ SLIDERS.push({ key: 'calShadowTint', label: 'Shadow tint', group: 'Calibration',
 // global and live in the LUT; vignette and grain depend on pixel position and run after it (applyFinish).
 SLIDERS.push({ key: 'finishBlacks', label: 'Deepen blacks', group: 'Finish', ui: [0, 100], cap: [0, 100] });
 SLIDERS.push({ key: 'finishRolloff', label: 'Roll off highlights', group: 'Finish', ui: [0, 100], cap: [0, 100] });
+SLIDERS.push({ key: 'finishShA', label: 'Shadow tint green↔magenta', group: 'Finish', ui: [-15, 15], cap: [-15, 15], step: 0.5 });
+SLIDERS.push({ key: 'finishShB', label: 'Shadow tint blue↔yellow', group: 'Finish', ui: [-15, 15], cap: [-15, 15], step: 0.5 });
+SLIDERS.push({ key: 'finishHiA', label: 'Highlight tint green↔magenta', group: 'Finish', ui: [-15, 15], cap: [-15, 15], step: 0.5 });
+SLIDERS.push({ key: 'finishHiB', label: 'Highlight tint blue↔yellow', group: 'Finish', ui: [-15, 15], cap: [-15, 15], step: 0.5 });
+SLIDERS.push({ key: 'finishSat', label: 'Color intensity', group: 'Finish', ui: [-60, 60], cap: [-60, 60] });
 SLIDERS.push({ key: 'vignette', label: 'Vignette', group: 'Finish', ui: [-100, 100], cap: [-100, 100], lr: 'PostCropVignetteAmount' });
 SLIDERS.push({ key: 'grain', label: 'Grain', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainAmount' });
 SLIDERS.push({ key: 'grainSize', label: 'Grain size', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainSize' });
@@ -245,6 +250,9 @@ export function compile(p) {
     return L;
   };
   const anyFinishL = fB > 0 || top < 100;
+  const fSh = [p.finishShA || 0, p.finishShB || 0], fHi = [p.finishHiA || 0, p.finishHiB || 0];
+  const anyFinishTint = fSh[0] || fSh[1] || fHi[0] || fHi[1];
+  const fSat = 1 + (p.finishSat || 0) / 100;
 
   const sat = 1 + p.saturation / 100;
   const vib = p.vibrance / 100;
@@ -322,6 +330,14 @@ export function compile(p) {
       A *= f; B *= f;
     }
 
+    if (anyFinishTint) {
+      // Lab offsets in L* bands that match how the profiles were measured (shadows < 30, highlights >= 70)
+      const ws = 1 - smoothstep(20, 40, L), wh = smoothstep(60, 80, L);
+      const edge = Math.min(1, L / 6) * Math.min(1, (100 - L) / 6);
+      A += (ws * fSh[0] + wh * fHi[0]) * edge;
+      B += (ws * fSh[1] + wh * fHi[1]) * edge;
+    }
+    if (fSat !== 1) { const f = Math.max(0, fSat); A *= f; B *= f; }
     if (anyFinishL) {
       const L2 = finishL(L);
       if (L > 0.5) { const k = L2 / L; A *= Math.min(1, 0.5 + 0.5 * k); B *= Math.min(1, 0.5 + 0.5 * k); }
