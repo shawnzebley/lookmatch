@@ -89,27 +89,43 @@ export const TONE_SHAPE = { 1: 1, 5: 0.5, 10: 0.2, 25: 0, 50: 1, 75: 0, 90: 0.2,
 export const ZONE_MOVE = 0.5;
 export const BAND_MOVE = 0.5;
 
-export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5, scene = null, toneShape = TONE_SHAPE, zoneMove = ZONE_MOVE, bandMove = BAND_MOVE } = {}) {
+// How far toward the reference's brightness, and how much of that survives when the photo is darker.
+// 2026-09-27: the old 0.5 pull x a dark-photo factor down to 0.15 x the same factor again on every
+// brightening move left a dim photo matched to a high-key reference (Pepsi) within 2 L* of where it
+// started. A reference's brightness is a large part of its look, so most of it is now kept.
+export const BRIGHTNESS_PULL = 0.75;
+// The reference's black and white points are copied as absolute values, not stretched around the new
+// median: a reference whose whites stop at 88 L* should put this photo's whites near 88, not at 74.
+export const END_ABS = { 1: 1, 5: 0.5, 95: 0.5, 99: 1 };
+// Most the overall colourfulness may be multiplied by (was 1.5: a 4x more colourful reference got 1.5x).
+export const CHROMA_CAP = 2.2;
+// How much duller a colour gets when the reference doesn't have it at all.
+export const ABSENT_BAND_DULL = 0.2;
+
+export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNESS_PULL, scene = null, toneShape = TONE_SHAPE, zoneMove = ZONE_MOVE, bandMove = BAND_MOVE, endAbs = END_ABS, chromaCap = CHROMA_CAP } = {}) {
   const s = Math.min(1, Math.max(0, strength));
   const o50 = o.tone.pct[50], r50 = ref.tone.pct[50];
   // weight relative look over absolute brightness: only part of the way to the reference's median,
-  // and even less when the photo is a low-key / night frame being pulled up.
+  // and less when the photo is a low-key / night frame being pulled up.
   let pull = brightnessPull;
-  let lift = 1; // how much of any brightening move to keep (dark scenes stay dark all through the range)
+  let lift = 1; // how much of any brightening move to keep (dark scenes stay darker all through the range)
   if (o50 < r50) {
-    const byImage = Math.min(1, Math.max(0.15, (o50 - 8) / 25));
+    const byImage = Math.min(1, Math.max(0.45, (o50 - 4) / 20));
     const byScene = brightenFactor(scene);
     // camera settings, when present, decide whether "dark" means a dark scene or an underexposed bright one
     const f = byScene == null ? byImage : byScene;
     pull *= f;
-    lift = Math.max(0.25, f);
+    lift = Math.max(0.6, Math.sqrt(f));
   }
   const anchor = o50 + pull * (r50 - o50);
   const below = anchor / Math.max(1, r50), above = (100 - anchor) / Math.max(1, 100 - r50);
   const pct = {};
   for (const p of PCTS) {
     const d = ref.tone.pct[p] - r50;
-    const full = Math.min(100, Math.max(0, anchor + d * (d < 0 ? below : above)));
+    let full = Math.min(100, Math.max(0, anchor + d * (d < 0 ? below : above)));
+    // black / white point as the reference has them, but never across the new median
+    const ea = endAbs[p] || 0;
+    if (ea) full += ea * ((p < 50 ? Math.min(ref.tone.pct[p], anchor - 2) : Math.max(ref.tone.pct[p], anchor + 2)) - full);
     // this photo's own shape, moved to the new median
     const dO = o.tone.pct[p] - o50;
     const own = Math.min(100, Math.max(0, anchor + dO * (dO < 0 ? anchor / Math.max(1, o50) : (100 - anchor) / Math.max(1, 100 - o50))));
@@ -130,6 +146,13 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5, sce
   const bands = {};
   for (const b of BANDS) {
     const ob = o.bands[b], rb = ref.bands[b];
+    // a colour this photo has and the reference doesn't: hold it, a little duller, so the overall
+    // colourfulness target is met in the reference's colours (a teal floor stayed teal and got
+    // louder under a warm, teal-free reference)
+    if (ob.weight >= 0.008 && rb.weight < 0.008) {
+      bands[b] = { hue: ob.hue, chroma: ob.chroma * (1 - ABSENT_BAND_DULL * s), lumRel: ob.lumRel, weight: Math.sqrt(Math.min(1, ob.weight / 0.05)) };
+      continue;
+    }
     if (ob.weight < 0.008 || rb.weight < 0.008) continue;
     const dh = Math.max(-25, Math.min(25, wrapDeg(rb.hue - ob.hue)));
     const ratio = Math.max(0.5, Math.min(1.6, rb.chroma / Math.max(1, ob.chroma)));
@@ -140,7 +163,7 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5, sce
       weight: Math.sqrt(Math.min(1, Math.min(ob.weight, rb.weight) / 0.05)),
     };
   }
-  const cr = (a, b) => Math.max(0.55, Math.min(1.5, b / Math.max(0.5, a)));
+  const cr = (a, b) => Math.max(0.55, Math.min(chromaCap, b / Math.max(0.5, a)));
   const color = {
     meanChroma: o.color.meanChroma * Math.pow(cr(o.color.meanChroma, ref.color.meanChroma), s),
     lowChroma: o.color.lowChroma * Math.pow(cr(o.color.lowChroma, ref.color.lowChroma), s),
