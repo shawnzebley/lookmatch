@@ -1,4 +1,4 @@
-import { SLIDERS, defaultParams, compile } from './engine/pipeline.js';
+import { SLIDERS, defaultParams, compile, LOCAL_SLIDERS, REGIONS } from './engine/pipeline.js';
 import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
 import { FINISH_PROFILES } from './engine/finish.js';
 import { srgbToLinear, linearToSrgb } from './engine/color.js';
@@ -9,7 +9,7 @@ import { isIdentityGeom, maxRect, towardValid, fitAfterTurn, validRect } from '.
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-27c';
+const APP_VERSION = '2026-09-27d';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -336,6 +336,8 @@ function describePhotographer(key) {
   bits.push(s.chroma < 12 ? 'muted colour' : s.chroma > 16 ? 'rich colour' : 'natural colour');
   if (tone(s.sh)) bits.push(`${tone(s.sh)} shadows`);
   if (tone(s.hi) && tone(s.hi) !== tone(s.sh)) bits.push(`${tone(s.hi)} highlights`);
+  if (s.sep != null && s.sep >= 4) bits.push('subject lit above the background');
+  if (s.logC != null && s.logC >= 0.25) bits.push('colourful subject, quieter background');
   if ((f.vignette || 0) <= -25) bits.push('vignette');
   return { text: bits.join(' · '), s };
 }
@@ -477,7 +479,7 @@ async function addPhotos(files) {
     const p = { id: uid(), file, name: file.name || 'photo.jpg', status: 'loading', strength: pr ? pr.strength : 100, worker: pool.assign() };
     S.photos.push(p);
     pool.call(p.worker, 'load', { id: p.id, file }).then((r) => {
-      p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted;
+      p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask;
       p.status = 'ready'; rerenderMatchSoon(); runQueue();
     }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('add photo: read', e, file); rerenderMatchSoon(); });
   }
@@ -488,18 +490,32 @@ function solveArgs(p) {
   const look = lookOf(p);
   if (!look) return null;
   const finishStrength = (p.finishStrength ?? 100) / 100;
-  if (look.kind === 'photographer') return { refStats: null, lrParams: {}, strength: 1, finish: look.key, finishStrength, pull: 0.25 };
+  const split = p.split !== false;
+  if (look.kind === 'photographer') return { refStats: null, lrParams: {}, strength: 1, finish: look.key, finishStrength, pull: 0.25, split };
   const pr = presetById(look.id);
-  return { refStats: pr.stats, lrParams: pr.lr ? pr.lrParams : null, strength: p.strength / 100, finish: p.finish || pr.finish || 'off', finishStrength };
+  return { refStats: pr.stats, lrParams: pr.lr ? pr.lrParams : null, strength: p.strength / 100, finish: p.finish || pr.finish || 'off', finishStrength, split };
+}
+
+// References saved before subject/background existed: measure the split once from the saved thumbnail.
+const upgrading = new Map();
+function ensurePresetRegions(pr) {
+  if (!pr || pr.lr || !pr.stats || pr.stats.regions !== undefined || !pr.thumb) return Promise.resolve();
+  if (!upgrading.has(pr.id)) {
+    upgrading.set(pr.id, (async () => {
+      try { const r = await pool.call(0, 'measureRef', { file: await dataURLToBlob(pr.thumb) }, { priority: true }); pr.stats.regions = r.stats.regions || null; }
+      catch (e) { pr.stats.regions = null; }
+      try { await db.putPreset(pr); } catch (e) { /* stays in memory */ }
+    })());
+  }
+  return upgrading.get(pr.id);
 }
 
 function solvePhoto(p, { priority = false } = {}) {
-  const args = solveArgs(p);
-  if (!args) return Promise.resolve();
+  if (!solveArgs(p)) return Promise.resolve();
   const look = lookOf(p);
   p.status = 'solving'; p.solvedLook = look; rerenderMatchSoon();
-  return pool.call(p.worker, 'solve', { id: p.id, ...args }, { priority }).then((r) => {
-    Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, style: r.style, status: 'done' });
+  return ensurePresetRegions(presetOf(p)).then(() => pool.call(p.worker, 'solve', { id: p.id, ...solveArgs(p) }, { priority })).then((r) => {
+    Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, style: r.style, regions: r.regions, mask: r.mask || p.mask, status: 'done' });
     rerenderMatchSoon();
     // one photo in, style picked: go straight to the editor
     if (S.autoOpen && S.photos.length === 1 && !D && S.tab === 'match') { S.autoOpen = false; openDetail(p); }
@@ -529,7 +545,7 @@ function numbersTable(p) {
       ${row2('Black / white (p1 / p99)', `${f1(b.tone.pct[1])} / ${f1(b.tone.pct[99])}`, `${f1(a.tone.pct[1])} / ${f1(a.tone.pct[99])}`, st ? `${f1(st.target.p1)} / ${f1(st.target.p99)}` : '')}
       ${row2('Mean chroma', f1(b.color.meanChroma), f1(a.color.meanChroma), st ? f1(st.target.chroma) : '')}
       ${row2('Skin hue° (lit side)', b.skin.frac > 0.005 ? `${f1(b.skin.hue)} (${f1(b.skin.litHue)})` : 'n/a', a.skin.frac > 0.005 ? `${f1(a.skin.hue)} (${f1(a.skin.litHue)})` : 'n/a', '35–64')}
-      ${row2('New clipping hi / lo %', '–', newClip2, '≤ 0.10')}</table>`;
+      ${row2('New clipping hi / lo %', '–', newClip2, '≤ 0.10')}${regionRows(p)}</table>`;
   }
   const toneErr = (s) => PCTS.reduce((acc, q) => acc + Math.abs(s.tone.pct[q] - T.tone.pct[q]), 0) / PCTS.length;
   const wbErr = (s) => Math.hypot(s.wb.a - T.wb.a, s.wb.b - T.wb.b);
@@ -549,7 +565,7 @@ function numbersTable(p) {
     ${row('Zone color error (Lab)', f1(zoneErr(b)), f1(zoneErr(a)), '0')}
     ${row('Mean chroma', f1(b.color.meanChroma), f1(a.color.meanChroma), `${f1(r?.color.meanChroma)} / ${f1(T.color.meanChroma)}`, false)}
     ${row('Skin hue° (lit side)', b.skin.frac > 0.005 ? `${f1(b.skin.hue)} (${f1(b.skin.litHue)})` : 'n/a', a.skin.frac > 0.005 ? `${f1(a.skin.hue)} (${f1(a.skin.litHue)})` : 'n/a', '35–64', false)}
-    ${row('New clipping hi / lo %', '–', newClip, '≤ 0.10', false)}
+    ${row('New clipping hi / lo %', '–', newClip, '≤ 0.10', false)}${regionRows(p)}
   </table>${p.guardScale < 0.99 ? `<p class="muted small">Edit scaled to ${Math.round(p.guardScale * 100)}% to avoid clipping.</p>` : ''}`;
 }
 
@@ -562,6 +578,7 @@ function sliderRow(s, v) {
 
 // colour grading lives on the wheels card; everything else stays in the slider groups
 function sliderGroups(p) {
+  if (D && D.region !== 'all') return localGroups(p, D.region);
   const groups = {};
   for (const s of SLIDERS) if (s.group !== 'Color grading') (groups[s.group] ||= []).push(s);
   return Object.entries(groups).map(([g, list], gi) => `<details class="group" ${gi < 1 ? 'open' : ''}><summary>${g}</summary>
@@ -576,10 +593,136 @@ const satToR = (s) => Math.sqrt(Math.max(0, Math.min(100, s)) / 100);
 const rToSat = (r) => Math.min(100, 100 * r * r);
 
 function gradeCard(p) {
+  const local = D && D.region !== 'all';
   return `<div class="wheels">${WHEELS.map(([z, label]) => `<div class="wh" data-z="${z}" data-keys="${z}Hue ${z}Sat">
       <div class="wheel"><canvas></canvas></div><div class="wl">${label}</div><div class="wv muted small"></div></div>`).join('')}</div>
-    ${sliderRow(SLIDER_BY.gradeBalance, p.params.gradeBalance)}
-    <p class="muted small" style="margin:4px 0 0">Drag a dot to grade. Double-tap a wheel to clear it.${p.style && p.style.wheels ? ' The faint dot is where the match left it; the line is what the finishing touch added.' : ''}</p>`;
+    ${local ? `<p class="muted small" style="margin:4px 0 0">Added on top of the whole-photo grade, ${D.region === 'subject' ? 'on the subject only' : 'on the background only'}. Double-tap a wheel to clear it.</p>`
+    : `${sliderRow(SLIDER_BY.gradeBalance, p.params.gradeBalance)}
+    <p class="muted small" style="margin:4px 0 0">Drag a dot to grade. Double-tap a wheel to clear it.${p.style && p.style.wheels ? ' The faint dot is where the match left it; the line is what the finishing touch added.' : ''}</p>`}`;
+}
+
+// ---------------------------------------------------------------- subject / background
+// Values the sliders and wheels show: the whole photo's, or the region's local amounts.
+const localOf = (p, r) => (p.params.local && p.params.local[r]) || {};
+const editVals = () => (D.region === 'all' ? D.p.params : localOf(D.p, D.region));
+function setVal(k, v) {
+  const P = D.p.params;
+  if (D.region === 'all') { P[k] = v; return; }
+  const loc = { subject: {}, background: {}, ...(P.local || {}) };
+  loc[D.region] = { ...loc[D.region], [k]: v };
+  P.local = loc;
+}
+
+function localGroups(p, r) {
+  const loc = localOf(p, r), groups = {};
+  for (const s of LOCAL_SLIDERS) (groups[s.group] ||= []).push(s);
+  return `<p class="muted small" style="margin:0 0 6px">${r === 'subject' ? 'Subject only' : 'Background only'}: added on top of the whole-photo sliders.</p>`
+    + Object.entries(groups).map(([g, list]) => `<details class="group" open><summary>${g}</summary>${list.map((s) => sliderRow(s, loc[s.key] || 0)).join('')}</details>`).join('');
+}
+
+const signed = (v, d = 0) => `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v).toFixed(d)}`;
+function regionRows(p) {
+  const g = p.regions;
+  if (!g) return '';
+  return `<tr><td>Subject vs background L*</td><td>${signed(g.before.sep, 1)}</td><td>${signed(g.after.sep, 1)}</td><td>${signed(g.theirs.sep, 1)}</td></tr>
+    <tr><td>Subject / background color</td><td>${g.before.chroma.toFixed(2)}×</td><td>${g.after.chroma.toFixed(2)}×</td><td>${g.theirs.chroma.toFixed(2)}×</td></tr>`;
+}
+
+// what the style did to the subject against the background, in words
+function regionNote(p) {
+  const g = p.regions;
+  if (!g) return '';
+  const li = [], b = g.before, a = g.after;
+  const d = a.sep - b.sep;
+  if (Math.abs(d) >= 1) li.push(`Subject ${d > 0 ? 'lifted' : 'lowered'} against the background: ${signed(b.sep, 1)} → ${signed(a.sep, 1)} L*`);
+  const warm = (a.dB - b.dB) + 0.3 * (a.dA - b.dA);
+  if (Math.abs(warm) >= 1) li.push(`Subject ${warm > 0 ? 'warmer' : 'cooler'} than the background`);
+  if (Math.abs(a.chroma - b.chroma) >= 0.05) li.push(`Subject color ${a.chroma > b.chroma ? 'stronger' : 'weaker'} than the background: ${b.chroma.toFixed(2)}× → ${a.chroma.toFixed(2)}×`);
+  if (!li.length) li.push('Subject and background already sit the way the style does');
+  const L = g.local, part = (r) => LOCAL_SLIDERS.filter((s) => L[r][s.key]).map((s) => `${s.label.toLowerCase()} ${s.key === 'exposure' ? signed(L[r][s.key], 2) : signed(L[r][s.key])}`).join(', ');
+  const moves = REGIONS.map((r) => (part(r) ? `${r === 'subject' ? 'Subject' : 'Background'}: ${part(r)}` : '')).filter(Boolean).join(' · ');
+  const f = g.from || {};
+  const basis = f.kind === 'photographer' ? `From the ${f.k} of ${f.n} published ${esc(f.name)} photos with a person in them that are closest to this one.` : 'From the reference photo\'s own subject and background.';
+  return `<div class="style"><ul>${li.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>${moves ? `<p class="muted small">${esc(moves)}</p>` : ''}<p class="muted small">${basis}</p></div>`;
+}
+
+function regionCard(p) {
+  const M = p.mask, R = D.region;
+  const tabs = [['all', 'Whole photo'], ['subject', 'Subject'], ['background', 'Background']];
+  const seg = `<div class="seg wide3" id="rSeg">${tabs.map(([k, l]) => `<button data-r="${k}" class="${R === k ? 'on' : ''}">${l}</button>`).join('')}</div>`;
+  if (!M) return `<h3>Subject and background</h3>${seg}<p class="muted small">Finding the subject…</p>`;
+  const found = M.frac >= 0.0005, taps = M.picks ? `${M.picks} tap${M.picks > 1 ? 's' : ''}` : '';
+  const status = D.pick ? `Tap the photo on what to ${D.pick === 'add' ? 'add to' : 'take out of'} the subject. Tap ${D.pick === 'add' ? '+ Add' : '− Remove'} again when done.`
+    : found ? `Subject is ${Math.max(1, Math.round(M.frac * 100))}% of the photo (${[M.people && M.useAuto ? 'people found automatically' : '', taps].filter(Boolean).join(', ')}).`
+    : !M.ok ? "The people finder didn't load. Tap + Add, then the subject."
+    : M.people ? 'People turned off. Tap + Add, then the subject.' : 'No people found. Tap + Add, then the subject.';
+  return `<h3>Subject and background</h3>${seg}
+    <div class="mtools"><button id="mAdd" class="${D.pick === 'add' ? 'on' : ''}">+ Add</button><button id="mRem" class="${D.pick === 'remove' ? 'on' : ''}" ${found ? '' : 'disabled'}>− Remove</button><button id="mUndo" ${M.picks ? '' : 'disabled'}>Undo</button><div class="grow"></div><button id="mShow" class="${D.showMask ? 'on' : ''}" ${found ? '' : 'disabled'}>Show</button></div>
+    <p class="muted small" style="margin:6px 0 0">${status}</p>
+    ${M.people ? `<label class="chk"><input type="checkbox" id="mAuto" ${M.useAuto ? 'checked' : ''}> People count as the subject</label>` : ''}
+    <label class="chk"><input type="checkbox" id="mSplit" ${p.split !== false ? 'checked' : ''}> Style sets the subject apart from the background</label>
+    ${p.split !== false ? regionNote(p) : ''}`;
+}
+
+function renderRegionCard() {
+  if (!D) return;
+  const p = D.p, box = $('#regionCard');
+  box.innerHTML = regionCard(p);
+  $('#rSeg', box).onclick = (e) => {
+    const r = e.target.dataset.r;
+    if (!r || r === D.region) return;
+    D.region = r;
+    renderRegionCard();
+    rebuildControls();
+    // show where the region is for a moment
+    if (r !== 'all' && !D.showMask) { D.flash = true; clearTimeout(D.flashT); D.flashT = setTimeout(() => { if (D) { D.flash = false; requestPreview(false); } }, 1300); }
+    requestPreview(false);
+  };
+  const M = p.mask;
+  if (!M) return;
+  const pick = (mode) => { D.pick = D.pick === mode ? null : mode; renderRegionCard(); requestPreview(false); };
+  $('#mAdd', box).onclick = () => pick('add');
+  $('#mRem', box).onclick = () => pick('remove');
+  $('#mUndo', box).onclick = () => maskOp({ op: 'undo' });
+  $('#mShow', box).onclick = () => { D.showMask = !D.showMask; renderRegionCard(); requestPreview(false); };
+  if ($('#mAuto', box)) $('#mAuto', box).onchange = (e) => maskOp({ op: 'auto', on: e.target.checked });
+  $('#mSplit', box).onchange = async (e) => {
+    p.split = e.target.checked;
+    renderRegionCard();
+    await solvePhoto(p, { priority: true });
+    if (D && D.p === p) { D.userEdited = false; refreshDetail(); }
+  };
+}
+
+async function maskOp(args) {
+  const p = D.p;
+  const busy = args.op === 'add' || args.op === 'remove';
+  if (busy) toast(args.op === 'add' ? 'Finding what you tapped…' : 'Taking it out…', 15000);
+  try {
+    const r = await pool.call(p.worker, 'mask', { id: p.id, ...args }, { priority: true });
+    if (busy) $('#toast').hidden = true;
+    p.mask = r.mask; p.before = r.before;
+    if (!D || D.p !== p) return;
+    renderRegionCard();
+    // a new subject changes what the style does, unless the sliders were already hand-tuned
+    if (lookOf(p) && p.split !== false && !D.userEdited) {
+      await solvePhoto(p, { priority: true });
+      if (D && D.p === p) { D.userEdited = false; refreshDetail(); }
+    } else { requestPreview(false); scheduleMeasure(0); }
+  } catch (e) { toast(e.message, 4500); logError('subject mask', e, p.file); }
+}
+
+// rebuild the slider and wheel cards for the region being edited
+function rebuildControls() {
+  const open = [...document.querySelectorAll('#sliders details')].map((d) => d.open);
+  $('#sliders').innerHTML = sliderGroups(D.p);
+  if (D.region === 'all') [...document.querySelectorAll('#sliders details')].forEach((d, i) => (d.open = open[i] ?? d.open));
+  $('#grade').innerHTML = gradeCard(D.p);
+  $('#gradeH').textContent = D.region === 'all' ? 'Color grading' : `Color grading · ${D.region === 'subject' ? 'Subject' : 'Background'}`;
+  $('#slidersCard').classList.toggle('local', D.region !== 'all');
+  bindSliders();
+  bindWheels();
+  renderLoss();
 }
 
 function drawWheel(el) {
@@ -591,8 +734,8 @@ function drawWheel(el) {
   x.strokeStyle = 'rgba(255,255,255,.18)'; x.lineWidth = dpr;
   for (const s of [10, 25, 50]) { x.beginPath(); x.arc(c, c, R * satToR(s), 0, 2 * Math.PI); x.stroke(); }
   const pt = (hue, sat) => { const r = R * satToR(sat), t = (hue * Math.PI) / 180; return [c + r * Math.cos(t), c - r * Math.sin(t)]; };
-  const hue = p.params[`${z}Hue`] || 0, sat = p.params[`${z}Sat`] || 0;
-  const w = p.style && p.style.wheels && p.style.wheels[z];
+  const V = editVals(), hue = V[`${z}Hue`] || 0, sat = V[`${z}Sat`] || 0;
+  const w = D.region === 'all' && p.style && p.style.wheels && p.style.wheels[z];
   if (w && w.move.amount >= 0.5) {
     const [fx, fy] = pt(w.from.hue, w.from.sat);
     const [tx, ty] = pt(w.to.hue, w.to.sat);
@@ -619,14 +762,14 @@ function bindWheels() {
       const dx = e.clientX - r.left - c, dy = -(e.clientY - r.top - c);
       const rr = Math.min(1, Math.hypot(dx, dy) / R);
       let h = (Math.atan2(dy, dx) * 180) / Math.PI; if (h < 0) h += 360;
-      D.p.params[`${z}Hue`] = Math.round(h);
-      D.p.params[`${z}Sat`] = rr < 0.06 ? 0 : Math.round(rToSat(rr) * 10) / 10;
+      setVal(`${z}Hue`, Math.round(h));
+      setVal(`${z}Sat`, rr < 0.06 ? 0 : Math.round(rToSat(rr) * 10) / 10);
       D.userEdited = true;
       drawWheel(el); requestPreview(false);
     };
     cv.addEventListener('pointerdown', (e) => {
       const now = Date.now();
-      if (now - lastTap < 300) { D.p.params[`${z}Sat`] = 0; D.userEdited = true; drawWheel(el); requestPreview(false); scheduleMeasure(); lastTap = 0; return; }
+      if (now - lastTap < 300) { setVal(`${z}Sat`, 0); D.userEdited = true; drawWheel(el); requestPreview(false); scheduleMeasure(); lastTap = 0; return; }
       lastTap = now;
       cv.setPointerCapture(e.pointerId); drag = true; setFrom(e);
     });
@@ -728,7 +871,7 @@ function renderStyleCard() {
     try { localStorage.setItem(LOOK_KEY, JSON.stringify(l)); } catch (e) { /* private mode */ }
     for (const ph of S.photos) {
       if (ph === p) { ph.look = null; continue; }
-      Object.assign(ph, { look: null, finish: p.finish, finishStrength: p.finishStrength, strength: p.strength });
+      Object.assign(ph, { look: null, finish: p.finish, finishStrength: p.finishStrength, strength: p.strength, split: p.split });
       if (['done', 'exported', 'ready'].includes(ph.status)) ph.status = 'ready';
     }
     runQueue();
@@ -761,11 +904,14 @@ function openDetail(p) {
     <div id="dspace"></div>
     <div class="dbody" id="dbody">
       <div class="card" id="styleCard"></div>
-      <div class="card"><h3>Color grading</h3><div id="grade">${gradeCard(p)}</div></div>
-      <div class="card" id="sliders">${sliderGroups(p)}</div>
+      <div class="card" id="regionCard"></div>
+      <div class="card"><h3 id="gradeH">Color grading</h3><div id="grade"></div></div>
+      <div class="card" id="slidersCard"><div id="sliders"></div></div>
       <div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div>
     </div>`;
-  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null };
+  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null, region: 'all', pick: null, showMask: false, flash: false };
+  $('#sliders').innerHTML = sliderGroups(p);
+  $('#grade').innerHTML = gradeCard(p);
   el.scrollTop = 0;
   $('#dBack').onclick = closeDetail;
   $('#dExport').onclick = () => exportPhotos([p]);
@@ -779,6 +925,7 @@ function openDetail(p) {
     refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Redo';
   };
   renderStyleCard();
+  renderRegionCard();
   bindCropBar();
   bindSliders();
   bindWheels();
@@ -824,8 +971,15 @@ function setOverlay(on) {
 }
 
 const SL_LABEL = Object.fromEntries(SLIDERS.map((s) => [s.key, s.label]));
-function fmtVal(k, v) { return k === 'exposure' ? `${v > 0 ? '+' : ''}${(+v).toFixed(2)}` : `${v > 0 ? '+' : ''}${Math.round(v)}`; }
-const controlFor = (k) => document.querySelector(`#sliders .sl[data-k="${k}"], #grade .sl[data-k="${k}"], #grade .wh[data-keys~="${k}"]`);
+for (const r of REGIONS) for (const s of LOCAL_SLIDERS) SL_LABEL[`${r}:${s.key}`] = `${r === 'subject' ? 'Subject' : 'Background'} ${s.label.toLowerCase()}`;
+function fmtVal(k, v) { k = k.split(':').pop(); return k === 'exposure' ? `${v > 0 ? '+' : ''}${(+v).toFixed(2)}` : `${v > 0 ? '+' : ''}${Math.round(v)}`; }
+// region keys ('subject:exposure') live on that region's tab
+const controlFor = (k) => {
+  const j = k.indexOf(':');
+  if (j >= 0) return D && D.region === k.slice(0, j) ? document.querySelector(`#sliders .sl[data-k="${k.slice(j + 1)}"]`) : null;
+  if (D && D.region !== 'all') return null;
+  return document.querySelector(`#sliders .sl[data-k="${k}"], #grade .sl[data-k="${k}"], #grade .wh[data-keys~="${k}"]`);
+};
 
 function renderLoss() {
   if (!D) return;
@@ -849,6 +1003,8 @@ function renderLoss() {
 }
 
 function jumpToSlider(k) {
+  const want = k.includes(':') ? k.split(':')[0] : 'all';
+  if (D.region !== want) { D.region = want; renderRegionCard(); rebuildControls(); requestPreview(false); }
   const row = controlFor(k);
   if (!row) return;
   const det = $('#detail');
@@ -880,13 +1036,8 @@ function refreshDetail() {
   if (!D) return;
   $('#nums').innerHTML = numbersTable(D.p);
   renderStyleCard();
-  const open = [...document.querySelectorAll('#sliders details')].map((d) => d.open);
-  $('#sliders').innerHTML = sliderGroups(D.p);
-  [...document.querySelectorAll('#sliders details')].forEach((d, i) => (d.open = open[i]));
-  $('#grade').innerHTML = gradeCard(D.p);
-  bindSliders();
-  bindWheels();
-  renderLoss();
+  renderRegionCard();
+  rebuildControls();
   requestPreview(false);
   scheduleMeasure(0);
 }
@@ -895,10 +1046,11 @@ function bindSliders() {
   document.querySelectorAll('#sliders .sl, #grade .sl').forEach((row) => {
     const k = row.dataset.k;
     const [range, num] = row.querySelectorAll('input');
+    const local = D.region !== 'all' && !!row.closest('#sliders');
     const set = (v, from) => {
-      const s = SLIDERS.find((x) => x.key === k);
+      const s = (local ? LOCAL_SLIDERS : SLIDERS).find((x) => x.key === k);
       v = Math.max(s.ui[0], Math.min(s.ui[1], +v || 0));
-      D.p.params[k] = v;
+      if (local) setVal(k, v); else D.p.params[k] = v;
       D.userEdited = true;
       if (from !== range) range.value = v;
       if (from !== num) num.value = s.step ? v.toFixed(2) : Math.round(v);
@@ -921,7 +1073,8 @@ async function requestPreview(withOriginal) {
   D.busy = true;
   const p = D.p;
   try {
-    const r = await pool.call(p.worker, 'preview', { id: p.id, params: { ...p.params }, side: previewSide(), overlay: D.overlay, withOriginal: withOriginal || !D.orig }, { priority: true });
+    const showMask = D.pick ? 'subject' : D.region !== 'all' && (D.showMask || D.flash) ? D.region : D.showMask ? 'subject' : null;
+    const r = await pool.call(p.worker, 'preview', { id: p.id, params: { ...p.params }, side: previewSide(), overlay: D.overlay, withOriginal: withOriginal || !D.orig, showMask }, { priority: true });
     if (!D || D.p !== p) return;
     if (r.original) D.orig = r.original;
     D.edit = r.edited;
@@ -961,6 +1114,12 @@ function bindStage() {
   cv.addEventListener('pointerdown', (e) => {
     cv.setPointerCapture(e.pointerId);
     if (D.crop) return cropDown(e);
+    if (D.pick) {
+      const r = cv.getBoundingClientRect();
+      const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+      if (x >= 0 && y >= 0 && x <= 1 && y <= 1) maskOp({ op: D.pick, x, y });
+      return;
+    }
     if (D.mode === 'split') { dragging = true; D.split = pos(e); }
     else if (D.mode === 'after') D.holding = true;
     draw();

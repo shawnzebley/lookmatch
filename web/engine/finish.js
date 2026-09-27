@@ -22,6 +22,7 @@ export const FINISH_PROFILES = {
     p1: 3.2, p99: 87.6, chroma: 11.2, sh: [3.5, 6.5], hi: [-2.9, 0.6], vignette: -30, grain: 15, grainSize: 20,
   },
   // www.lightwitch.com, 10 galleries (latest, portrait clients, couples, fashion, musicians, commercial, personal,
+  // (per-image rows in style-data.js re-measured 2026-09-27 from 833 images, with subject/background)
   // humanless, strange fusions, archive), 659 images, 2026-09-27: matte blacks (269/659 lift above L* 8), dim whites
   courtney: {
     name: 'Courtney Brooke', who: 'Courtney Brooke (Light Witch)', source: 'lightwitch.com', n: 659,

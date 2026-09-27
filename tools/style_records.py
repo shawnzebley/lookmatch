@@ -7,6 +7,31 @@ from PIL import Image
 sys.path.insert(0, 'tools')
 from measure_published import lab
 
+# subject vs background, same model and definitions as web/segment.js + engine/measure.js regionStats
+_seg = None
+def person(a):
+    global _seg
+    import mediapipe as mp
+    from mediapipe.tasks import python as mpt
+    from mediapipe.tasks.python import vision
+    if _seg is None:
+        _seg = vision.ImageSegmenter.create_from_options(vision.ImageSegmenterOptions(
+            base_options=mpt.BaseOptions(model_asset_path='web/models/selfie_multiclass_256x256.tflite'),
+            output_confidence_masks=True, output_category_mask=False))
+    r = _seg.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(a.astype(np.uint8))))
+    return 1 - r.confidence_masks[0].numpy_view()[..., 0]
+
+def regions(a, L, A, B, C):
+    m = person(a)
+    frac = float(m.mean())
+    s, b = m >= 191 / 255, m < 64 / 255
+    if not (0.03 <= frac <= 0.92 and s.sum() > 200 and b.sum() > 200): return [round(frac, 3), None, None, None, None]
+    def st(r):
+        med = max(np.median(C[r]), 4); t = r & (C <= med)
+        return np.median(L[r]), C[r].mean(), A[t].mean(), B[t].mean()
+    sL, sC, sA, sB = st(s); bL, bC, bA, bB = st(b)
+    return [round(frac, 3), sL - bL, sA - bA, sB - bB, float(np.log(max(1, sC) / max(1, bC)))]
+
 def records(folder):
     out, seen = [], set()
     for f in sorted(glob.glob(folder + '/*')):
@@ -35,12 +60,17 @@ def records(folder):
         yy, xx = np.mgrid[0:H, 0:W]; rr = np.hypot(xx / W - .5, yy / H - .5)
         bw = bool(C.mean() < 3)
         tg = [np.percentile(L, 1), np.percentile(L, 99), C.mean(), *band(L < 30), *band((L >= 30) & (L < 70)), *band(L >= 70),
-              L[rr < .2].mean() - L[rr > .6].mean(), 1 if bw else 0]
+              L[rr < .2].mean() - L[rr > .6].mean(), 1 if bw else 0, *regions(a, L, A, B, C)]
         out.append([None if v is None else round(float(v), 3 if abs(float(v)) < 1 else 1) for v in sig + tg])
     return out
 
 if __name__ == '__main__':
+    # photographers not named on the command line keep their existing rows
+    import re, os
     data = {}
+    if os.path.exists('engine/style-data.js'):
+        m = re.search(r'STYLE_DATA = (\{.*\});', open('engine/style-data.js').read(), re.S)
+        if m: data = json.loads(m.group(1))
     for arg in sys.argv[1:]:
         key, folder = arg.split('=')
         data[key] = {'rows': records(folder)}

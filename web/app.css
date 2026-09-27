@@ -225,3 +225,13 @@ button.small { padding: 6px 10px; font-size: 13px; }
 .card .sub { font-size: 12.5px; color: var(--muted); margin: 12px 0 6px; }
 .strength .slbl { width: 44px; flex: none; }
 .card .strength { margin-top: 10px; }
+/* subject / background */
+.seg.wide3 { display: grid; grid-template-columns: repeat(3, 1fr); }
+.seg.wide3 button { padding: 9px 4px; font-size: 13.5px; }
+.mtools { display: flex; gap: 6px; align-items: center; margin-top: 10px; }
+.mtools .grow { flex: 1; }
+.mtools button { padding: 7px 11px; font-size: 13px; }
+.mtools button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+label.chk { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-top: 8px; color: var(--muted); }
+label.chk input { width: 18px; height: 18px; margin: 0; flex: none; }
+#slidersCard.local { border-color: var(--accent); }

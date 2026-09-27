@@ -7,7 +7,11 @@
 //   flattened – places that had visible texture (L* gradient) and now have almost none
 //   banding   – tone curve steep enough to show steps in smooth skies/walls
 
-import { toneMaxSlope, toneReversal } from './pipeline.js';
+import { toneMaxSlope as slope1, toneReversal as rev1, hasLocal, regionParams } from './pipeline.js';
+
+// with subject / background amounts, the steepest (or most reversed) of the two regions' curves counts
+const toneMaxSlope = (p) => (hasLocal(p) ? Math.max(...Object.values(regionParams(p)).map(slope1)) : slope1(p));
+const toneReversal = (p) => (hasLocal(p) ? Math.max(...Object.values(regionParams(p)).map(rev1)) : rev1(p));
 
 const HI = 0.9955, LO = 0.0006; // linear values for 8-bit 254.5 and ~2
 
@@ -142,19 +146,28 @@ function score(c, slope, rev = 0) {
  * Which sliders are responsible: set each non-zero slider back to 0 (one at a time) and see how much the
  * damage drops. process(params, idx, cur) must run the pipeline on the subset. Returns up to 3 keys.
  */
+// Keys are slider keys, or 'subject:<key>' / 'background:<key>' for a region's local amount.
+const getK = (p, k) => { const j = k.indexOf(':'); return j < 0 ? p[k] || 0 : (p.local && p.local[k.slice(0, j)] && p.local[k.slice(0, j)][k.slice(j + 1)]) || 0; };
+function setK(p, k, v) {
+  const j = k.indexOf(':');
+  if (j < 0) return { ...p, [k]: v };
+  const r = k.slice(0, j);
+  return { ...p, local: { ...p.local, [r]: { ...(p.local && p.local[r]), [k.slice(j + 1)]: v } } };
+}
+
 export function culprits(ps, params, process, idx, cur, keys, auto = null) {
   const base = score(counts(ps, process(params, idx, cur), idx), toneMaxSlope(params), toneReversal(params));
   if (base < 1) return [];
   // Sliders the user moved away from the auto match are suspects first (revert to the auto value);
   // if the user changed nothing, every non-zero slider is a suspect (revert to 0).
-  let suspects = auto ? keys.filter((k) => !k.endsWith('Hue') && Math.abs((params[k] || 0) - (auto[k] || 0)) > 1e-6) : [];
-  const revertTo = (k) => (suspects.length ? auto[k] || 0 : 0);
-  if (!suspects.length) suspects = keys.filter((k) => params[k] && !k.endsWith('Hue'));
+  let suspects = auto ? keys.filter((k) => !k.endsWith('Hue') && Math.abs(getK(params, k) - getK(auto, k)) > 1e-6) : [];
+  const revertTo = (k) => (suspects.length ? getK(auto, k) : 0);
+  if (!suspects.length) suspects = keys.filter((k) => getK(params, k) && !k.endsWith('Hue'));
   const out = [];
   for (const k of suspects) {
-    const q = { ...params, [k]: revertTo(k) };
+    const q = setK(params, k, revertTo(k));
     const s = score(counts(ps, process(q, idx, cur), idx), toneMaxSlope(q), toneReversal(q));
-    out.push({ key: k, value: params[k], gain: base - s });
+    out.push({ key: k, value: getK(params, k), gain: base - s });
   }
   out.sort((a, b) => b.gain - a.gain);
   const strong = out.filter((c) => c.gain > 0.2 * base);

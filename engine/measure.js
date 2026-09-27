@@ -191,10 +191,63 @@ export function prepare(img, opts = {}) {
   const skinMed = quantile(sl, 50);
   for (let i = 0; i < n; i++) if (skin[i] && L[i] > skinMed) skin[i] = 2;
 
+  // subject / background (opts.subject: 0..255 per pixel from the subject mask). The lower-chroma half
+  // of each region is fixed here, from the original, like the zone tints: it shows the grade more than the content.
+  let subject = null, regionTint = null;
+  if (opts.subject && opts.subject.length === n) {
+    subject = opts.subject;
+    regionTint = new Uint8Array(n);
+    for (const [lo, hi, bit] of [[REGION_IN, 256, 1], [-1, REGION_OUT, 2]]) {
+      const cs = [];
+      for (let i = 0; i < n; i++) if (subject[i] >= lo && subject[i] < hi) cs.push(C[i]);
+      const med = quantile(cs, 50);
+      for (let i = 0; i < n; i++) if (subject[i] >= lo && subject[i] < hi && C[i] <= Math.max(med, 4)) regionTint[i] = bit;
+    }
+  }
+
   return {
-    width, height, n, lr, lg, lb, L, A, B, hue,
-    masks: { zone, zw, zoneTint, neutral, bw, lowSat, skin },
+    width, height, n, lr, lg, lb, L, A, B, hue, subject,
+    masks: { zone, zw, zoneTint, neutral, bw, lowSat, skin, regionTint },
     wbConfidence, neutralThreshold: thr, skinSource, faceCount: faceMask ? opts.faces.length : 0,
+  };
+}
+
+// A pixel counts as subject at mask >= REGION_IN and as background below REGION_OUT (the soft edge counts as neither).
+export const REGION_IN = 191, REGION_OUT = 64;
+// Enough of both to compare them?
+export const regionUsable = (r) => !!r && r.frac >= 0.03 && r.frac <= 0.92 && r.subject.n > 200 && r.background.n > 200;
+
+/**
+ * Subject vs background: median L*, mean chroma and tint (mean a*, b* of the lower-chroma half) of each,
+ * and the differences the style works with: sep = subject L* - background L*, dA / dB tint difference,
+ * logC = ln(subject chroma / background chroma). Null without a mask.
+ */
+export function regionStats(ps, cur, idx) {
+  if (!ps.subject) return null;
+  cur = cur || ps;
+  const m = ps.subject, tint = ps.masks.regionTint;
+  const N = idx ? idx.length : ps.n;
+  const R = [0, 1].map(() => ({ hist: new Float64Array(101), n: 0, l: 0, c: 0, ta: 0, tb: 0, tn: 0 }));
+  let on = 0;
+  for (let k = 0; k < N; k++) {
+    const i = idx ? idx[k] : k;
+    const v = m[i];
+    on += v;
+    const r = v >= REGION_IN ? R[0] : v < REGION_OUT ? R[1] : null;
+    if (!r) continue;
+    const L = cur.L[i], a = cur.A[i], b = cur.B[i];
+    r.hist[Math.max(0, Math.min(100, Math.round(L)))]++;
+    r.n++; r.l += L; r.c += Math.hypot(a, b);
+    if (tint[i]) { r.ta += a; r.tb += b; r.tn++; }
+  }
+  const out = [0, 1].map((j) => {
+    const r = R[j];
+    return { n: r.n, L50: r.n ? percentileFromHist(r.hist, r.n, 50, 1) : 0, mL: r.n ? r.l / r.n : 0, C: r.n ? r.c / r.n : 0, a: r.tn ? r.ta / r.tn : 0, b: r.tn ? r.tb / r.tn : 0 };
+  });
+  const [s, bg] = out;
+  return {
+    frac: on / 255 / N, subject: s, background: bg,
+    sep: s.L50 - bg.L50, dA: s.a - bg.a, dB: s.b - bg.b, logC: Math.log(Math.max(1, s.C) / Math.max(1, bg.C)),
   };
 }
 

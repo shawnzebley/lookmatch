@@ -13,6 +13,8 @@ Every incoming photo is measured and solved on its own.
   - `xmp.js`, `jpegmeta.js` — Lightroom settings (embedded XMP and .xmp preset, crop fields), EXIF carry-over
   - `geom.js` — crop + level: turned-frame crop rectangle, validity, largest-fit rectangle, auto level, Lightroom crop fields
   - `finish.js`, `style.js`, `style-data.js` — "if <photographer> edited this photo": nearest published scenes -> black point, roll-off, colour-wheel grade, intensity, vignette, grain
+  - `regions.js` — subject vs background: how much brighter, warmer and more colourful the subject sits than its background (a reference's own split, or a photographer's similar published photos), fitted with local exposure / temp / tint / saturation per region (`params.local`)
+- `web/segment.js`, `web/mp.js` — subject masks in the worker: MediaPipe Selfie Multiclass finds people, Magic Touch picks the object under a tap; guided-filter refined against the photo's edges
 - `web/` — the iPhone web app (static files; `npm run build` copies the engine in)
 - `tools/` — `measure.mjs` (print stats), `match.mjs` (before/after table), `e2e.mjs` (headless browser test)
 
@@ -31,6 +33,7 @@ npm i
 python3 tools/fetch_published.py cvatik mckinnon xenie borisov   # published portfolios -> scratch/pub (never committed)
 python3 tools/style_records.py cvatik=scratch/pub/cvatik ...     # per-image numbers -> engine/style-data.js
 tools/with-server.sh node tools/e2e_edit.mjs scratch/e2e_edit     # HEIF upload, photographer finish + wheels, shrink, crop, export
+tools/with-server.sh node tools/e2e_subject.mjs scratch/e2e_subject ref.jpg photo.jpg cvatik   # people mask, split fit, Subject tab, tap add/undo, export
 node tools/measure.mjs photo.jpg
 node tools/match.mjs ref.jpg a.jpg b.jpg --out out [--strength 0.8] [--full]
 tools/with-server.sh node tools/faces.mjs testdata/in/*   # cache face outlines for match.mjs

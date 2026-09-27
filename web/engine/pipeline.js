@@ -60,6 +60,64 @@ SLIDERS.push({ key: 'gradeBalance', label: 'Balance', group: 'Color grading', ui
 // skin hues get less push from these (Lightroom's vibrance does the same)
 export const SLIDER_BY_KEY = Object.fromEntries(SLIDERS.map((s) => [s.key, s]));
 
+// ---- subject / background ----------------------------------------------------------------
+// params.local = { subject: {...}, background: {...} }: amounts added on top of the whole-photo
+// sliders inside each region (like a Lightroom mask's local sliders). The colour wheels add in Lab.
+export const REGIONS = ['subject', 'background'];
+export const LOCAL_SLIDERS = [
+  { key: 'exposure', label: 'Exposure', group: 'Light', ui: [-2, 2], step: 0.01 },
+  { key: 'contrast', label: 'Contrast', group: 'Light', ui: [-100, 100] },
+  { key: 'highlights', label: 'Highlights', group: 'Light', ui: [-100, 100] },
+  { key: 'shadows', label: 'Shadows', group: 'Light', ui: [-100, 100] },
+  { key: 'whites', label: 'Whites', group: 'Light', ui: [-100, 100] },
+  { key: 'blacks', label: 'Blacks', group: 'Light', ui: [-100, 100] },
+  { key: 'temp', label: 'Temp', group: 'Color', ui: [-100, 100] },
+  { key: 'tint', label: 'Tint', group: 'Color', ui: [-100, 100] },
+  { key: 'saturation', label: 'Saturation', group: 'Color', ui: [-100, 100] },
+  { key: 'vibrance', label: 'Vibrance', group: 'Color', ui: [-100, 100] },
+];
+export const LOCAL_WHEEL_KEYS = ['shadowHue', 'shadowSat', 'midtoneHue', 'midtoneSat', 'highlightHue', 'highlightSat'];
+const ZONES3 = ['shadow', 'midtone', 'highlight'];
+
+function wheelAB(hue, sat) {
+  if (!sat) return [0, 0];
+  const [a, b] = wheelHueToAB(hue || 0);
+  return [a * sat, b * sat];
+}
+
+/** Does this region carry any change? */
+export function localActive(loc) {
+  if (!loc) return false;
+  for (const s of LOCAL_SLIDERS) if (loc[s.key]) return true;
+  return ZONES3.some((z) => loc[`${z}Sat`]);
+}
+/** Does the edit treat subject and background differently? */
+export function hasLocal(p) { return !!(p && p.local && (localActive(p.local.subject) || localActive(p.local.background))); }
+
+/** Whole-photo params with one region's local amounts added. */
+export function withLocal(p, loc) {
+  if (!localActive(loc)) return p;
+  const q = { ...p };
+  delete q.local;
+  for (const s of LOCAL_SLIDERS) {
+    const d = loc[s.key];
+    if (!d) continue;
+    const g = SLIDER_BY_KEY[s.key];
+    q[s.key] = Math.min(g.ui[1], Math.max(g.ui[0], (p[s.key] || 0) + d));
+  }
+  if (ZONES3.some((z) => loc[`${z}Sat`])) {
+    q._gradeAB = ZONES3.map((z, i) => {
+      const [a, b] = p._gradeAB ? p._gradeAB[i] : wheelAB(p[`${z}Hue`], p[`${z}Sat`]);
+      const [c, d] = wheelAB(loc[`${z}Hue`], loc[`${z}Sat`]);
+      return [a + c, b + d];
+    });
+  }
+  return q;
+}
+export function regionParams(p) {
+  return { subject: withLocal(p, p.local && p.local.subject), background: withLocal(p, p.local && p.local.background) };
+}
+
 export function defaultParams() {
   const p = {};
   for (const s of SLIDERS) p[s.key] = 0;
@@ -426,6 +484,59 @@ export function applyLUT(lut, src, dst, count, chIn = 4, chOut = 4, seed = 1) {
   }
 }
 
+/**
+ * Two LUTs mixed per pixel by mask (0..255 = background..subject). Pixels fully inside one region
+ * only look up that region's LUT, so the cost is close to a single LUT away from the mask edge.
+ */
+export function applyLUTMasked(lutS, lutB, mask, src, dst, count, chIn = 4, chOut = 4, seed = 1) {
+  const N = lutS.N, dS = lutS.data, dB = lutB.data;
+  const scale = (N - 1) / 255;
+  const idx = new Int32Array(256), frac = new Float32Array(256);
+  for (let v = 0; v < 256; v++) { const f = v * scale; let i = Math.floor(f); if (i >= N - 1) i = N - 2; idx[v] = i; frac[v] = f - i; }
+  const sR = 3, sG = 3 * N, sB = 3 * N * N, o3 = sR + sG + sB;
+  let rnd = seed >>> 0 || 1;
+  const vs = [0, 0, 0], vb = [0, 0, 0];
+  for (let k = 0, si = 0, di = 0; k < count; k++, si += chIn, di += chOut) {
+    const r8 = src[si], g8 = src[si + 1], b8 = src[si + 2];
+    const fr = frac[r8], fg = frac[g8], fb = frac[b8];
+    const base = idx[b8] * sB + idx[g8] * sG + idx[r8] * sR;
+    let o1, o2, w0, w1, w2, w3;
+    if (fr >= fg) {
+      if (fg >= fb) { o1 = sR; o2 = sR + sG; w0 = 1 - fr; w1 = fr - fg; w2 = fg - fb; w3 = fb; }
+      else if (fr >= fb) { o1 = sR; o2 = sR + sB; w0 = 1 - fr; w1 = fr - fb; w2 = fb - fg; w3 = fg; }
+      else { o1 = sB; o2 = sR + sB; w0 = 1 - fb; w1 = fb - fr; w2 = fr - fg; w3 = fg; }
+    } else {
+      if (fb >= fg) { o1 = sB; o2 = sG + sB; w0 = 1 - fb; w1 = fb - fg; w2 = fg - fr; w3 = fr; }
+      else if (fb >= fr) { o1 = sG; o2 = sG + sB; w0 = 1 - fg; w1 = fg - fb; w2 = fb - fr; w3 = fr; }
+      else { o1 = sG; o2 = sR + sG; w0 = 1 - fg; w1 = fg - fr; w2 = fr - fb; w3 = fb; }
+    }
+    const m = mask[k];
+    if (m > 0) for (let c = 0; c < 3; c++) vs[c] = w0 * dS[base + c] + w1 * dS[base + o1 + c] + w2 * dS[base + o2 + c] + w3 * dS[base + o3 + c];
+    if (m < 255) for (let c = 0; c < 3; c++) vb[c] = w0 * dB[base + c] + w1 * dB[base + o1 + c] + w2 * dB[base + o2 + c] + w3 * dB[base + o3 + c];
+    const t = m / 255;
+    rnd ^= rnd << 13; rnd ^= rnd >>> 17; rnd ^= rnd << 5;
+    const d = ((rnd >>> 0) / 4294967296 - 0.5);
+    for (let c = 0; c < 3; c++) {
+      const v = m === 255 ? vs[c] : m === 0 ? vb[c] : vb[c] + (vs[c] - vb[c]) * t;
+      const q = v * 255 + 0.5 + d * 0.9;
+      dst[di + c] = q < 0 ? 0 : q > 255 ? 255 : q | 0;
+    }
+    if (chOut === 4) dst[di + 3] = chIn === 4 ? src[si + 3] : 255;
+  }
+}
+
+/** One LUT, or two (subject, background) when the edit has local amounts and there is a mask. */
+export function buildLUTs(p, N = 33) {
+  if (!hasLocal(p)) return { lut: buildLUT(p, N) };
+  const r = regionParams(p);
+  return { subject: buildLUT(r.subject, N), background: buildLUT(r.background, N) };
+}
+export function applyLUTs(luts, mask, src, dst, count, chIn = 4, chOut = 4, seed = 1) {
+  if (luts.lut) return applyLUT(luts.lut, src, dst, count, chIn, chOut, seed);
+  if (!mask) return applyLUT(luts.background, src, dst, count, chIn, chOut, seed);
+  return applyLUTMasked(luts.subject, luts.background, mask, src, dst, count, chIn, chOut, seed);
+}
+
 // ---- finish pass (position-dependent) -------------------------------------------------------
 export function hasSpatialFinish(p) { return !!(p.vignette || p.grain); }
 
@@ -480,25 +591,50 @@ export function applyFinish(buf, width, rows, p, y0 = 0, fullW = width, fullH = 
 }
 
 // Convenience: render an 8-bit image object with params (used by tools and the preview).
-export function renderImage(img, p, N = 33) {
-  const lut = buildLUT(p, N);
+// mask: optional Uint8Array (0..255 subject) the size of img, used when params have local amounts
+export function renderImage(img, p, N = 33, mask = null) {
+  const luts = buildLUTs(p, N);
   const ch = img.channels || 4;
   const out = new Uint8Array(img.width * img.height * ch);
-  applyLUT(lut, img.data, out, img.width * img.height, ch, ch);
+  applyLUTs(luts, mask, img.data, out, img.width * img.height, ch, ch);
   if (hasSpatialFinish(p)) applyFinish(out, img.width, img.height, p, 0, img.width, img.height, 7, ch);
   return { width: img.width, height: img.height, channels: ch, data: out };
 }
 
 // Run the exact pipeline on a PixelSet (optionally a subset of indices) for measuring.
+// With local amounts and a subject mask (ps.subject), each pixel is a mix of the two regions' results.
 export function processPixelSet(ps, p, idx, cur) {
-  const proc = compile(p);
   const n = ps.n;
   cur = cur || { L: new Float32Array(n), A: new Float32Array(n), B: new Float32Array(n), lr: new Float32Array(n), lg: new Float32Array(n), lb: new Float32Array(n) };
   const res = new Float64Array(6);
   const N = idx ? idx.length : n;
+  const mask = ps.subject;
+  if (!mask || !hasLocal(p)) {
+    const proc = compile(hasLocal(p) ? withLocal(p, p.local.background) : p);
+    for (let k = 0; k < N; k++) {
+      const i = idx ? idx[k] : k;
+      proc(ps.lr[i], ps.lg[i], ps.lb[i], res);
+      cur.lr[i] = res[0]; cur.lg[i] = res[1]; cur.lb[i] = res[2];
+      cur.L[i] = res[3]; cur.A[i] = res[4]; cur.B[i] = res[5];
+    }
+    return cur;
+  }
+  const rp = regionParams(p);
+  const pS = compile(rp.subject), pB = compile(rp.background);
+  const r2 = new Float64Array(6), lab = [0, 0, 0];
   for (let k = 0; k < N; k++) {
     const i = idx ? idx[k] : k;
-    proc(ps.lr[i], ps.lg[i], ps.lb[i], res);
+    const m = mask[i];
+    if (m >= 255) pS(ps.lr[i], ps.lg[i], ps.lb[i], res);
+    else if (m <= 0) pB(ps.lr[i], ps.lg[i], ps.lb[i], res);
+    else {
+      pS(ps.lr[i], ps.lg[i], ps.lb[i], res);
+      pB(ps.lr[i], ps.lg[i], ps.lb[i], r2);
+      const t = m / 255;
+      res[0] = r2[0] + (res[0] - r2[0]) * t; res[1] = r2[1] + (res[1] - r2[1]) * t; res[2] = r2[2] + (res[2] - r2[2]) * t;
+      linToLab(res[0], res[1], res[2], lab);
+      res[3] = lab[0]; res[4] = lab[1]; res[5] = lab[2];
+    }
     cur.lr[i] = res[0]; cur.lg[i] = res[1]; cur.lb[i] = res[2];
     cur.L[i] = res[3]; cur.A[i] = res[4]; cur.B[i] = res[5];
   }

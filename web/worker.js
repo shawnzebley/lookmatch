@@ -1,15 +1,18 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
-import { prepare, measure } from './engine/measure.js';
+import { prepare, measure, regionStats, regionUsable } from './engine/measure.js';
 import { solve, solvePreset } from './engine/solver.js';
 import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
-import { buildLUT, applyLUT, applyFinish, hasSpatialFinish, processPixelSet, SLIDERS } from './engine/pipeline.js';
+import { fitRegions, REGION_MOVE } from './engine/regions.js';
+import { signature, nearestRegions } from './engine/style.js';
+import { buildLUTs, applyLUTs, applyFinish, hasSpatialFinish, hasLocal, processPixelSet, SLIDERS, LOCAL_SLIDERS, REGIONS } from './engine/pipeline.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
 import { exifSegment, xmpSegment, insertSegments, isJpeg, jpegOrientation } from './engine/jpegmeta.js';
-import { isIdentityGeom, geomKey, geomSize, drawTransform, mapPolys, lightroomCrop, autoLevel } from './engine/geom.js';
+import { isIdentityGeom, geomKey, geomSize, drawTransform, mapPolys, lightroomCrop, autoLevel, toSource } from './engine/geom.js';
 import encodeJpeg from './vendor/jpeg-encoder.js';
 import { parse as parseExif } from './vendor/exifr-lite.mjs';
 import { detectFaces } from './faces.js';
+import { personMask, tapMask, maskCanvasSize } from './segment.js';
 import { sceneFromExif } from './engine/scene.js';
 
 const SOLVE_SIDE = 512;
@@ -124,8 +127,84 @@ function touch(id) {
   if (e) e.lastUse = performance.now();
   // keep at most 3 prepared photos per worker; stats/params live in the main thread
   const entries = [...cache.entries()].filter(([, v]) => v.ps).sort((a, b) => b[1].lastUse - a[1].lastUse);
-  for (const [, v] of entries.slice(3)) { v.ps = null; v.display = null; v.gdisplay = null; v.sample = null; }
+  for (const [, v] of entries.slice(3)) { v.ps = null; v.display = null; v.gdisplay = null; v.sample = null; if (v.mask) v.mask.canvas = null; }
   return e;
+}
+
+// ---------------------------------------------------------------- subject mask
+// e.mask = { w, h, person (0..255 people found by the model), personFrac, useAuto, picks: [{ add, x, y, data }],
+//            sub (the combined subject), frac, ver, ok }. Working size, whole uncropped photo.
+async function ensureMask(e, bmp) {
+  if (e.mask !== undefined) return;
+  let m = null;
+  try { m = await personMask(bmp); } catch (err) { console.warn('person mask failed', err); }
+  const [w, h] = m ? [m.w, m.h] : maskCanvasSize(bmp.width, bmp.height);
+  e.mask = { w, h, person: m ? m.data : new Uint8Array(w * h), personFrac: m ? m.frac : 0, ok: !!m, useAuto: true, picks: [], sub: null, frac: 0, ver: 0 };
+  combineMask(e);
+}
+
+function combineMask(e) {
+  const M = e.mask, n = M.w * M.h;
+  let sub;
+  if (!M.picks.length) sub = M.useAuto ? M.person : new Uint8Array(n);
+  else {
+    sub = M.useAuto ? Uint8Array.from(M.person) : new Uint8Array(n);
+    for (const pk of M.picks) {
+      const d = pk.data;
+      if (pk.add) { for (let i = 0; i < n; i++) if (d[i] > sub[i]) sub[i] = d[i]; }
+      else for (let i = 0; i < n; i++) sub[i] = ((sub[i] * (255 - d[i])) / 255) | 0;
+    }
+  }
+  let on = 0; for (let i = 0; i < n; i++) on += sub[i];
+  M.sub = sub; M.frac = on / 255 / n; M.ver++; M.canvas = null;
+}
+
+const maskInfo = (e) => {
+  const M = e.mask;
+  if (!M) return null;
+  return { ok: M.ok, people: M.personFrac >= 0.005, personFrac: M.personFrac, useAuto: M.useAuto, picks: M.picks.length, frac: M.frac, ver: M.ver };
+};
+
+function maskCanvas(M) {
+  if (!M.canvas) {
+    const [c, x] = canvas(M.w, M.h);
+    const d = new ImageData(M.w, M.h);
+    for (let i = 0, j = 0; i < M.sub.length; i++, j += 4) { const v = M.sub[i]; d.data[j] = d.data[j + 1] = d.data[j + 2] = v; d.data[j + 3] = 255; }
+    x.putImageData(d, 0, 0);
+    M.canvas = c;
+  }
+  return M.canvas;
+}
+
+/**
+ * The subject mask (0..255) for an output ow x oh showing the photo with geometry g. photoScale = output px
+ * per photo px (default: the output is the whole geometry at ow wide); oy = first row, for export tiles.
+ */
+function maskFor(e, ow, oh, g, oy = 0, photoScale = null) {
+  const M = e.mask;
+  if (!M || !M.sub || M.frac < 0.0005) return null;
+  const W = e.fullW, H = e.fullH;
+  const s = photoScale ?? ow / geomSize(W, H, g)[0];
+  const k = (s * W) / M.w; // output px per mask px
+  const [, x] = canvas(ow, oh);
+  x.imageSmoothingQuality = 'high';
+  x.fillStyle = '#000'; x.fillRect(0, 0, ow, oh);
+  if (isIdentityGeom(g)) x.setTransform(k, 0, 0, (s * H) / M.h, 0, -oy);
+  else x.setTransform(...drawTransform(M.w, M.h, g, k, oy));
+  x.drawImage(maskCanvas(M), 0, 0);
+  const d = x.getImageData(0, 0, ow, oh).data;
+  const out = new Uint8Array(ow * oh);
+  for (let i = 0, j = 0; i < out.length; i++, j += 4) out[i] = d[j];
+  return out;
+}
+
+// LR-style overlay: the region being edited shows red
+function paintMask(out, mask, region) {
+  for (let i = 0, j = 0; i < mask.length; i++, j += 4) {
+    const a = 0.5 * (region === 'background' ? 255 - mask[i] : mask[i]) / 255;
+    if (a <= 0) continue;
+    out[j] = out[j] + (255 - out[j]) * a; out[j + 1] *= 1 - a * 0.85; out[j + 2] *= 1 - a * 0.85;
+  }
 }
 
 // Faces are found on the full photo (faces.js scales it, and tiles it if nothing is found);
@@ -134,11 +213,13 @@ async function analyze(e, bmp) {
   if (e.faces === undefined) {
     try { e.faces = await detectFaces(bmp); } catch (err) { e.faces = null; }
   }
+  await ensureMask(e, bmp);
   if (e.scene === undefined) {
     try { e.scene = sceneFromExif(await parseExif(e.orig || e.file, { ifd0: true, exif: true, gps: false, interop: false })); } catch (err) { e.scene = null; }
   }
   e.fullW = bmp.width; e.fullH = bmp.height;
-  e.ps = prepare(scaledData(bmp, SOLVE_SIDE, e.geom), { faces: mapPolys(e.faces, bmp.width, bmp.height, e.geom) });
+  const d = scaledData(bmp, SOLVE_SIDE, e.geom);
+  e.ps = prepare(d, { faces: mapPolys(e.faces, bmp.width, bmp.height, e.geom), subject: maskFor(e, d.width, d.height, e.geom) });
 }
 
 async function ensurePrepared(id) {
@@ -167,10 +248,10 @@ async function ensureDisplay(id, side, plain) {
   return e[slot];
 }
 
-function renderInto(src, params) {
-  const lut = buildLUT(params, 33);
+function renderInto(src, params, mask = null) {
+  const luts = buildLUTs(params, 33);
   const out = new Uint8ClampedArray(src.width * src.height * 4);
-  applyLUT(lut, src.data, out, src.width * src.height, 4, 4);
+  applyLUTs(luts, mask, src.data, out, src.width * src.height, 4, 4);
   if (hasSpatialFinish(params)) applyFinish(out, src.width, src.height, params);
   return { width: src.width, height: src.height, data: out };
 }
@@ -201,6 +282,7 @@ const handlers = {
     await analyze(e, bmp);
     const stats = measure(e.ps);
     stats.scene = e.scene;
+    stats.regions = regionStats(e.ps);
     const thumb = await toJpegBlob(scaledData(bmp, 480), 0.85);
     bmp.close();
     return { stats, thumb, converted: e.converted || null };
@@ -214,7 +296,39 @@ const handlers = {
     const thumb = await toJpegBlob(scaledData(bmp, 320), 0.8);
     bmp.close();
     touch(id);
-    return { stats: measure(e.ps), thumb, width: e.fullW, height: e.fullH, scene: e.scene, faces: e.faces ? e.faces.length : null, converted: e.converted || null };
+    return { stats: measure(e.ps), thumb, width: e.fullW, height: e.fullH, scene: e.scene, faces: e.faces ? e.faces.length : null, converted: e.converted || null, mask: maskInfo(e) };
+  },
+
+  // subject mask edits. op: 'add' / 'remove' (the object under x, y: 0..1 of the photo as shown, after
+  // crop and level), 'auto' (people on or off: on), 'undo' (last tap), 'clear' (all taps).
+  async mask({ id, op, x, y, on }) {
+    const e = cache.get(id);
+    if (!e) throw new Error('photo not loaded');
+    const bmp = await openBitmap(e, id);
+    try {
+      if (e.mask === undefined) await ensureMask(e, bmp);
+      const M = e.mask;
+      if (op === 'add' || op === 'remove') {
+        const W = bmp.width, H = bmp.height, g = e.geom;
+        let fx = x, fy = y;
+        if (!isIdentityGeom(g)) {
+          const [sx, sy] = toSource((g.x + x * g.w) * W, (g.y + y * g.h) * H, W, H, g.angle || 0);
+          fx = sx / W; fy = sy / H;
+        }
+        if (fx < 0 || fy < 0 || fx > 1 || fy > 1) throw new Error('That spot is outside the photo');
+        const m = await tapMask(bmp, fx, fy);
+        if (!m) throw new Error('The tap model did not load');
+        let on = 0; for (let i = 0; i < m.data.length; i++) on += m.data[i];
+        if (on / 255 / m.data.length < 0.0005) throw new Error('Nothing found there. Try tapping the middle of the thing.');
+        M.picks.push({ add: op === 'add', x: fx, y: fy, data: m.data });
+      } else if (op === 'auto') M.useAuto = !!on;
+      else if (op === 'undo') M.picks.pop();
+      else if (op === 'clear') M.picks = [];
+      combineMask(e);
+      await analyze(e, bmp); // re-measure with the new subject
+    } finally { bmp.close(); }
+    touch(id);
+    return { mask: maskInfo(e), before: measure(e.ps) };
   },
 
   // crop/level for one photo; everything measured afterwards (solve, loss checks) sees only the crop
@@ -238,21 +352,38 @@ const handlers = {
     return autoLevel(gray, d.width, d.height);
   },
 
-  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5 }) {
+  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true }) {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
     const res = lrParams
       ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene, pull })
       : solve(e.ps, o, refStats, { strength, scene: e.scene });
     let style = null;
-    if (finish && finish !== 'off' && FINISH_PROFILES[finish]) {
-      const f = fitFinish(e.ps, res.params, FINISH_PROFILES[finish], null, { strength: finishStrength });
+    const prof = finish && finish !== 'off' ? FINISH_PROFILES[finish] : null;
+    if (prof) {
+      const f = fitFinish(e.ps, res.params, prof, null, { strength: finishStrength });
       res.params = f.params; style = f.style;
+    }
+    // subject vs background: the photographer's similar published photos, else the reference's own split
+    let regions = null;
+    if (split && e.ps.subject) {
+      let want = null, move = REGION_MOVE, from = null;
+      if (prof && prof.data) {
+        want = nearestRegions(prof.data, signature(e.ps.L, e.ps.A, e.ps.B, e.ps.width, e.ps.height), !(style && style.mono));
+        move *= Math.min(1.5, finishStrength); from = want ? { kind: 'photographer', name: prof.name, k: want.k, n: want.n } : null;
+      }
+      if (!want && refStats && regionUsable(refStats.regions)) {
+        want = refStats.regions; move *= Math.min(1, strength); from = { kind: 'reference' };
+      }
+      if (want && move > 0) {
+        const r = fitRegions(e.ps, res.params, want, { move });
+        if (r) { res.params = r.params; regions = { ...r.regions, from }; }
+      }
     }
     const cur = processPixelSet(e.ps, res.params);
     const after = measure(e.ps, cur);
     const loss = lossReport(e.ps, cur, res.params);
-    return { params: res.params, targets: res.targets, before: o, after, loss, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style };
+    return { params: res.params, targets: res.targets, before: o, after, loss, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
   },
 
   async measureParams({ id, params, auto = null }) {
@@ -267,16 +398,27 @@ const handlers = {
         e.sample = Int32Array.from(idx);
       }
       const scratch = { L: new Float32Array(e.ps.n), A: new Float32Array(e.ps.n), B: new Float32Array(e.ps.n), lr: new Float32Array(e.ps.n), lg: new Float32Array(e.ps.n), lb: new Float32Array(e.ps.n) };
-      loss.culprits = culprits(e.ps, params, (q, idx, c) => processPixelSet(e.ps, q, idx, c), e.sample, scratch, SLIDERS.map((s) => s.key), auto);
+      const keys = SLIDERS.map((s) => s.key);
+      if (hasLocal(params) && e.ps.subject) for (const r of REGIONS) for (const s of LOCAL_SLIDERS) keys.push(`${r}:${s.key}`);
+      loss.culprits = culprits(e.ps, params, (q, idx, c) => processPixelSet(e.ps, q, idx, c), e.sample, scratch, keys, auto);
     }
     return { after: measure(e.ps, cur), loss };
   },
 
   // plain: the whole photo without crop/level (the crop tool draws its own frame over it)
-  async preview({ id, params, side = 1400, withOriginal = false, overlay = false, plain = false }) {
+  // showMask: 'subject' / 'background' paints that region red over the edit
+  async preview({ id, params, side = 1400, withOriginal = false, overlay = false, plain = false, showMask = null }) {
     const d = await ensureDisplay(id, side, plain);
-    const out = renderInto(d, params);
+    const e = cache.get(id);
+    let mask = null;
+    if ((hasLocal(params) || showMask) && e.mask) {
+      const key = `${e.mask.ver}`;
+      if (d.maskKey !== key) { d.mask = maskFor(e, d.width, d.height, plain ? null : e.geom); d.maskKey = key; }
+      mask = d.mask;
+    }
+    const out = renderInto(d, params, mask);
     if (overlay) paintClipping(d.data, out.data);
+    if (showMask && mask) paintMask(out.data, mask, showMask);
     const edited = await createImageBitmap(new ImageData(out.data, out.width, out.height));
     let original = null;
     if (withOriginal) original = await createImageBitmap(new ImageData(new Uint8ClampedArray(d.data), d.width, d.height));
@@ -291,7 +433,8 @@ const handlers = {
     const bmp = await openBitmap(e, id);
     const W = bmp.width, H = bmp.height;
     const [OW, OH] = geomSize(W, H, g);
-    const lut = buildLUT(params, 33);
+    const luts = buildLUTs(params, 33);
+    const masked = !luts.lut && e.mask && e.mask.frac >= 0.0005;
     const rgba = new Uint8ClampedArray(OW * OH * 4);
     // tiles keep each canvas well under iOS Safari's ~16.7 MP canvas limit
     const tileH = Math.max(64, Math.min(OH, Math.floor(4_000_000 / OW)));
@@ -309,7 +452,7 @@ const handlers = {
       }
       const d = x.getImageData(0, 0, OW, h).data;
       const band = rgba.subarray(y * OW * 4, (y + h) * OW * 4);
-      applyLUT(lut, d, band, OW * h, 4, 4, 1 + y);
+      applyLUTs(luts, masked ? maskFor(e, OW, h, g, y, 1) : null, d, band, OW * h, 4, 4, 1 + y);
       if (hasSpatialFinish(params)) applyFinish(band, OW, h, params, y, OW, OH);
       postMessage({ progress: { id, phase: 'render', f: (y + h) / OH } });
     }
