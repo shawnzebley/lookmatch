@@ -1,7 +1,8 @@
 // Edit pipeline. Every slider is a deterministic, global per-pixel operation, so the whole edit
 // compiles into one function RGB -> RGB and then into a 3D LUT for full-resolution rendering.
 //
-// Order: white balance (linear) -> exposure (linear) -> tone (on L*, applied as a luminance ratio)
+// Order: calibration (linear 3x3 + shadow tint) -> white balance (linear) -> exposure (linear)
+//        -> tone (on L*, applied as a luminance ratio) -> point curve + R/G/B curves (gamma sRGB, like Lightroom)
 //        -> HSL mixer -> color grading -> saturation / vibrance (Lab) -> gamut map -> sRGB.
 
 import { SRGB8_TO_LIN, linearToSrgb, srgbToLinear, linToLab, labToLin, yToL, lToY, rgbHue, wheelHueToAB } from './color.js';
@@ -40,6 +41,11 @@ for (const z of ['shadow', 'midtone', 'highlight']) {
   SLIDERS.push({ key: `${z}Hue`, label: `${Z}s hue`, group: 'Color grading', ui: [0, 359], cap: [0, 359], hue: true });
   SLIDERS.push({ key: `${z}Sat`, label: `${Z}s sat`, group: 'Color grading', ui: [0, 100], cap: [0, 35] });
 }
+for (const c of ['Red', 'Green', 'Blue']) {
+  SLIDERS.push({ key: `cal${c}Hue`, label: `${c} primary hue`, group: 'Calibration', ui: [-100, 100], cap: [0, 0], lr: `${c}Hue` });
+  SLIDERS.push({ key: `cal${c}Sat`, label: `${c} primary sat`, group: 'Calibration', ui: [-100, 100], cap: [0, 0], lr: `${c}Saturation` });
+}
+SLIDERS.push({ key: 'calShadowTint', label: 'Shadow tint', group: 'Calibration', ui: [-100, 100], cap: [0, 0], lr: 'ShadowTint' });
 SLIDERS.push({ key: 'gradeBalance', label: 'Balance', group: 'Color grading', ui: [-100, 100], cap: [-100, 100] });
 
 // skin hues get less push from these (Lightroom's vibrance does the same)
@@ -125,6 +131,67 @@ export function toneReversal(p) {
 
 export { gradeWeights };
 
+// ---- point curves ---------------------------------------------------------------------------
+// Curves are arrays of [x, y] in 0-255 (Lightroom's ToneCurvePV2012*). Params keys: curve, curveR, curveG, curveB.
+export const CURVE_KEYS = ['curve', 'curveR', 'curveG', 'curveB'];
+export function isIdentityCurve(pts) { return !pts || pts.length < 2 || pts.every(([x, y]) => x === y); }
+
+// Monotone cubic (Fritsch-Carlson) through the points; Lightroom's curve is a smooth spline that
+// doesn't overshoot between points, which this matches closely. Returns a 1024-entry LUT on [0,1].
+export function curveLUT(pts, N = 1024) {
+  const P = pts.slice().sort((a, b) => a[0] - b[0]).filter((q, i, a) => !i || q[0] > a[i - 1][0]).map(([x, y]) => [x / 255, y / 255]);
+  const lut = new Float32Array(N);
+  if (P.length < 2) { for (let i = 0; i < N; i++) lut[i] = i / (N - 1); return lut; }
+  const n = P.length, d = new Float64Array(n - 1), m = new Float64Array(n);
+  for (let i = 0; i < n - 1; i++) d[i] = (P[i + 1][1] - P[i][1]) / (P[i + 1][0] - P[i][0]);
+  m[0] = d[0]; m[n - 1] = d[n - 2];
+  for (let i = 1; i < n - 1; i++) m[i] = d[i - 1] * d[i] <= 0 ? 0 : (d[i - 1] + d[i]) / 2;
+  for (let i = 0; i < n - 1; i++) {
+    if (d[i] === 0) { m[i] = m[i + 1] = 0; continue; }
+    const a = m[i] / d[i], b = m[i + 1] / d[i], t = a * a + b * b;
+    if (t > 9) { const k = 3 / Math.sqrt(t); m[i] = k * a * d[i]; m[i + 1] = k * b * d[i]; }
+  }
+  let seg = 0;
+  for (let j = 0; j < N; j++) {
+    const x = j / (N - 1);
+    if (x <= P[0][0]) { lut[j] = P[0][1]; continue; }
+    if (x >= P[n - 1][0]) { lut[j] = P[n - 1][1]; continue; }
+    while (x > P[seg + 1][0]) seg++;
+    const h = P[seg + 1][0] - P[seg][0], t = (x - P[seg][0]) / h, t2 = t * t, t3 = t2 * t;
+    const y = (2 * t3 - 3 * t2 + 1) * P[seg][1] + (t3 - 2 * t2 + t) * h * m[seg] + (-2 * t3 + 3 * t2) * P[seg + 1][1] + (t3 - t2) * h * m[seg + 1];
+    lut[j] = Math.min(1, Math.max(0, y));
+  }
+  return lut;
+}
+function lookup(lut, v) {
+  let f = v * 1023; if (f <= 0) return lut[0]; if (f >= 1023) return lut[1023];
+  const i = f | 0; return lut[i] + (lut[i + 1] - lut[i]) * (f - i);
+}
+
+// ---- calibration --------------------------------------------------------------------------------
+// Approximates Lightroom's Calibration panel as a 3x3 matrix on linear RGB: each primary's hue slider
+// swings it toward its neighbour (red + -> yellow, green + -> cyan, blue + -> magenta), its saturation
+// slider pushes it away from / toward grey. Rows are normalised so white stays white.
+export function calibrationMatrix(p) {
+  const cols = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  const plus = [1, 2, 0], minus = [2, 0, 1]; // neighbour channel added for + / - hue
+  const names = ['Red', 'Green', 'Blue'];
+  let any = false;
+  for (let i = 0; i < 3; i++) {
+    const hh = (p[`cal${names[i]}Hue`] || 0) / 100, ss = (p[`cal${names[i]}Sat`] || 0) / 100;
+    if (!hh && !ss) continue;
+    any = true;
+    const c = cols[i];
+    if (hh > 0) c[plus[i]] += 0.35 * hh; else if (hh < 0) c[minus[i]] += -0.35 * hh;
+    const m = (c[0] + c[1] + c[2]) / 3, k = 1 + 0.45 * ss;
+    for (let j = 0; j < 3; j++) c[j] = m + (c[j] - m) * k;
+  }
+  if (!any) return null;
+  const M = [0, 1, 2].map((r) => [cols[0][r], cols[1][r], cols[2][r]]);
+  for (const row of M) { const s = row[0] + row[1] + row[2]; for (let j = 0; j < 3; j++) row[j] /= s; }
+  return M;
+}
+
 // ---- compile params into a per-pixel processor -------------------------------------------
 export function compile(p) {
   p = { ...defaultParams(), ...p };
@@ -144,6 +211,14 @@ export function compile(p) {
   const lumS = BANDS.map((b) => p[`lum_${b}`] / 100 * 18);
   const anyHsl = hueS.some((v) => v) || satS.some((v) => v) || lumS.some((v) => v);
 
+  const cal = calibrationMatrix(p);
+  const shTint = (p.calShadowTint || 0) / 100;
+  const cM = !isIdentityCurve(p.curve) ? curveLUT(p.curve) : null;
+  const cR = !isIdentityCurve(p.curveR) ? curveLUT(p.curveR) : null;
+  const cG = !isIdentityCurve(p.curveG) ? curveLUT(p.curveG) : null;
+  const cB = !isIdentityCurve(p.curveB) ? curveLUT(p.curveB) : null;
+  const anyCurve = cM || cR || cG || cB;
+
   const G = 30; // Lab units at 100% grading saturation
   const zones = p._gradeAB ? p._gradeAB.map(([u, v]) => [u * G / 100, v * G / 100]) : ['shadow', 'midtone', 'highlight'].map((z) => {
     const [da, db] = wheelHueToAB(p[`${z}Hue`]);
@@ -160,6 +235,18 @@ export function compile(p) {
 
   // process linear RGB -> writes linear RGB (in gamut) into res[0..2] and Lab into res[3..5]
   return function process(r, g, b, res) {
+    if (cal) {
+      const r2 = cal[0][0] * r + cal[0][1] * g + cal[0][2] * b;
+      const g2 = cal[1][0] * r + cal[1][1] * g + cal[1][2] * b;
+      const b2 = cal[2][0] * r + cal[2][1] * g + cal[2][2] * b;
+      r = Math.max(0, r2); g = Math.max(0, g2); b = Math.max(0, b2);
+    }
+    if (shTint) {
+      // + is magenta (less green) in the shadows, fading out by the midtones
+      const Ys = 0.2126729 * r + 0.7151522 * g + 0.072175 * b;
+      const w = 1 - smoothstep(0, 0.45, Math.sqrt(Ys));
+      g *= Math.exp(-0.25 * shTint * w);
+    }
     r *= gR; g *= gG; b *= gB;
     const Y = 0.2126729 * r + 0.7151522 * g + 0.072175 * b;
     const L0 = yToL(Y);
@@ -169,6 +256,15 @@ export function compile(p) {
     const Y1 = lToY(L1);
     if (Y > 1e-6) { const k = Y1 / Y; r *= k; g *= k; b *= k; }
     else { r = g = b = Y1; }
+
+    if (anyCurve) {
+      let sr = linearToSrgb(Math.min(1, r)), sg = linearToSrgb(Math.min(1, g)), sb = linearToSrgb(Math.min(1, b));
+      if (cM) { sr = lookup(cM, sr); sg = lookup(cM, sg); sb = lookup(cM, sb); }
+      if (cR) sr = lookup(cR, sr);
+      if (cG) sg = lookup(cG, sg);
+      if (cB) sb = lookup(cB, sb);
+      r = srgbToLinear(sr); g = srgbToLinear(sg); b = srgbToLinear(sb);
+    }
 
     linToLab(r, g, b, lab);
     let L = lab[0], A = lab[1], B = lab[2];

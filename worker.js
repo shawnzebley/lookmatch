@@ -1,6 +1,6 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
 import { prepare, measure } from './engine/measure.js';
-import { solve } from './engine/solver.js';
+import { solve, solvePreset } from './engine/solver.js';
 import { buildLUT, applyLUT, processPixelSet, SLIDERS } from './engine/pipeline.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
@@ -142,10 +142,12 @@ const handlers = {
     return { stats: measure(e.ps), thumb, width: e.fullW, height: e.fullH, scene: e.scene, faces: e.faces ? e.faces.length : null };
   },
 
-  async solve({ id, refStats, strength }) {
+  async solve({ id, refStats, strength, lrParams = null }) {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
-    const res = solve(e.ps, o, refStats, { strength, scene: e.scene });
+    const res = lrParams
+      ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene })
+      : solve(e.ps, o, refStats, { strength, scene: e.scene });
     const cur = processPixelSet(e.ps, res.params);
     const after = measure(e.ps, cur);
     const loss = lossReport(e.ps, cur, res.params);
