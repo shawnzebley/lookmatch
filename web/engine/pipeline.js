@@ -50,10 +50,7 @@ SLIDERS.push({ key: 'calShadowTint', label: 'Shadow tint', group: 'Calibration',
 // global and live in the LUT; vignette and grain depend on pixel position and run after it (applyFinish).
 SLIDERS.push({ key: 'finishBlacks', label: 'Deepen blacks', group: 'Finish', ui: [0, 100], cap: [0, 100] });
 SLIDERS.push({ key: 'finishRolloff', label: 'Roll off highlights', group: 'Finish', ui: [0, 100], cap: [0, 100] });
-SLIDERS.push({ key: 'finishShA', label: 'Shadow tint green↔magenta', group: 'Finish', ui: [-15, 15], cap: [-15, 15], step: 0.5 });
-SLIDERS.push({ key: 'finishShB', label: 'Shadow tint blue↔yellow', group: 'Finish', ui: [-15, 15], cap: [-15, 15], step: 0.5 });
-SLIDERS.push({ key: 'finishHiA', label: 'Highlight tint green↔magenta', group: 'Finish', ui: [-15, 15], cap: [-15, 15], step: 0.5 });
-SLIDERS.push({ key: 'finishHiB', label: 'Highlight tint blue↔yellow', group: 'Finish', ui: [-15, 15], cap: [-15, 15], step: 0.5 });
+// (finishShA/B, finishHiA/B Lab tints are still honoured by compile() but the photographer fit now uses the colour wheels)
 SLIDERS.push({ key: 'finishSat', label: 'Color intensity', group: 'Finish', ui: [-60, 60], cap: [-60, 60] });
 SLIDERS.push({ key: 'vignette', label: 'Vignette', group: 'Finish', ui: [-100, 100], cap: [-100, 100], lr: 'PostCropVignetteAmount' });
 SLIDERS.push({ key: 'grain', label: 'Grain', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainAmount' });

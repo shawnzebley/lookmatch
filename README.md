@@ -10,9 +10,15 @@ Every incoming photo is measured and solved on its own.
   - `pipeline.js` — Lightroom-style sliders as deterministic global ops, compiled to a 33³ LUT
   - `solver.js` — staged bounded Levenberg–Marquardt: tone → white balance → color → touch-up, with clipping, banding and skin guards
   - `transfer.js` — color transfer (histogram match + Monge-Kantorovich), baked to a LUT. Test-only for now: lost to the solver on every look in tools/compare.mjs
-  - `xmp.js`, `jpegmeta.js` — Lightroom settings (embedded XMP and .xmp preset), EXIF carry-over
+  - `xmp.js`, `jpegmeta.js` — Lightroom settings (embedded XMP and .xmp preset, crop fields), EXIF carry-over
+  - `geom.js` — crop + level: turned-frame crop rectangle, validity, largest-fit rectangle, auto level, Lightroom crop fields
+  - `finish.js`, `style.js`, `style-data.js` — "if <photographer> edited this photo": nearest published scenes -> black point, roll-off, colour-wheel grade, intensity, vignette, grain
 - `web/` — the iPhone web app (static files; `npm run build` copies the engine in)
 - `tools/` — `measure.mjs` (print stats), `match.mjs` (before/after table), `e2e.mjs` (headless browser test)
+
+## Files it reads
+JPEG, PNG, HEIC, and HEIF/HIF (Fujifilm 10-bit). The browser's own decoder goes first; a HEIF it can't read
+is decoded with libheif (web/vendor/libheif, loaded only then) and kept as a q97 JPEG for the session.
 
 ## Checks built in
 - Face outlines (MediaPipe Face Landmarker, in the worker) drive the skin guard; skin-colored areas are the fallback.
@@ -22,6 +28,9 @@ Every incoming photo is measured and solved on its own.
 ## Test scripts
 ```
 npm i
+python3 tools/fetch_published.py cvatik mckinnon xenie borisov   # published portfolios -> scratch/pub (never committed)
+python3 tools/style_records.py cvatik=scratch/pub/cvatik ...     # per-image numbers -> engine/style-data.js
+tools/with-server.sh node tools/e2e_edit.mjs scratch/e2e_edit     # HEIF upload, photographer finish + wheels, shrink, crop, export
 node tools/measure.mjs photo.jpg
 node tools/match.mjs ref.jpg a.jpg b.jpg --out out [--strength 0.8] [--full]
 tools/with-server.sh node tools/faces.mjs testdata/in/*   # cache face outlines for match.mjs

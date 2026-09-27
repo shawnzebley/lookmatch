@@ -3,3 +3,4 @@ testdata/
 out/
 scratch/
 *.log
+tools/__pycache__/

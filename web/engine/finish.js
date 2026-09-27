@@ -1,11 +1,18 @@
-// Finishing touches: the part of a photographer's published look that a preset or a single reference
-// photo doesn't carry. Every number is measured from the photographer's own published images
-// (tools/measure_published.py; method and dates in _state/lookmatch.md). L* percentiles, Lab means
-// by band (shadows L* < 30, highlights L* >= 70), mean chroma of colour images, centre-minus-edge L*.
+// Finishing touches: "if this photographer edited this photo, what would they do?"
+//
+// Each profile carries numbers measured from the photographer's own published images
+// (tools/measure_published.py for the medians below; tools/style_records.py for per-image rows in
+// style-data.js). For a photo, the published images with the most similar scenes are found
+// (engine/style.js) and their finished black point, white roll-off, shadow / midtone / highlight
+// colour, colour intensity and vignette become this photo's targets. The colour lands on the
+// colour-grading wheels, so what they'd do is visible and editable.
 
 import { processPixelSet } from './pipeline.js';
 import { lm } from './solver.js';
 import { counts } from './loss.js';
+import { wheelHueToAB, abToWheelHue } from './color.js';
+import { signature, nearestTargets } from './style.js';
+import { STYLE_DATA } from './style-data.js';
 
 export const FINISH_PROFILES = {
   off: { name: 'Off' },
@@ -40,10 +47,14 @@ export const FINISH_PROFILES = {
     p1: 2.7, p99: 91.5, chroma: 15.4, sh: [1.0, 5.1], hi: [0.9, 6.5], vignette: -20, grain: 8, grainSize: 15,
   },
 };
+for (const [k, p] of Object.entries(FINISH_PROFILES)) p.data = STYLE_DATA[k] || null;
 
-// How much of the gap to a profile's colour to close. The published averages include what was in
-// front of the lens; closing all of it would paint every photo that photographer's locations.
-const COLOR_MOVE = 0.35;
+// How much of the colour gap to close. Published images include what was in front of the lens;
+// with similar-scene neighbours less of the gap is scenery, so more of it can be closed.
+const MOVE_NEAREST = 0.5, MOVE_MEDIAN = 0.35;
+const WHEEL_MAX = 20; // most a wheel may move, in wheel units (20 = 6 Lab)
+const ZN = ['shadow', 'midtone', 'highlight'];
+const G = 30; // Lab units at 100% wheel saturation (pipeline.js)
 
 function sampleIdx(n) {
   const step = Math.max(1, Math.floor(n / 8000)), a = [];
@@ -51,50 +62,81 @@ function sampleIdx(n) {
   return Int32Array.from(a);
 }
 
-function stats(cur, idx) {
+function stats(cur, idx, skinMask) {
   const Ls = new Float32Array(idx.length);
-  let shA = 0, shB = 0, shN = 0, hiA = 0, hiB = 0, hiN = 0, C = 0;
+  const z = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  let C = 0, sa = 0, sb = 0, sn = 0;
   for (let k = 0; k < idx.length; k++) {
     const i = idx[k], L = cur.L[i], a = cur.A[i], b = cur.B[i];
     Ls[k] = L; C += Math.hypot(a, b);
-    if (L < 30) { shA += a; shB += b; shN++; } else if (L >= 70) { hiA += a; hiB += b; hiN++; }
+    const zi = L < 30 ? 0 : L < 70 ? 1 : 2;
+    z[zi][0] += a; z[zi][1] += b; z[zi][2]++;
+    if (skinMask && skinMask[i] && L > 35) { sa += a; sb += b; sn++; }
   }
   Ls.sort();
   const q = (p) => Ls[Math.min(Ls.length - 1, Math.floor(p * (Ls.length - 1)))];
   const n = idx.length;
+  const band = (zi) => (z[zi][2] > n * 0.03 ? [z[zi][0] / z[zi][2], z[zi][1] / z[zi][2]] : null);
   return {
-    p1: q(0.01), p99: q(0.99), chroma: C / n,
-    sh: shN > n * 0.03 ? [shA / shN, shB / shN] : null,
-    hi: hiN > n * 0.03 ? [hiA / hiN, hiB / hiN] : null,
+    p1: q(0.01), p99: q(0.99), chroma: C / n, sh: band(0), mid: band(1), hi: band(2),
+    skin: sn > 30 ? [sa / sn, sb / sn] : null,
   };
 }
 
+const wheelXY = (p, z) => { const s = p[`${z}Sat`] || 0; const [a, b] = wheelHueToAB(p[`${z}Hue`] || 0); return [a * s, b * s]; };
+const hueDeg = (ab) => { let h = (Math.atan2(ab[1], ab[0]) * 180) / Math.PI; return h < 0 ? h + 360 : h; };
+const wrap = (d) => ((d + 540) % 360) - 180;
+
+/** Per-photo targets: nearest published scenes when the profile has per-image data, else its medians. */
+export function styleTargets(ps, profile, mono = false) {
+  if (profile.data) {
+    const sig = signature(ps.L, ps.A, ps.B, ps.width, ps.height);
+    const t = nearestTargets(profile.data, sig, { color: !mono });
+    if (t) {
+      const pair = (a, b) => (t[a] != null && t[b] != null ? [t[a], t[b]] : null);
+      return {
+        basis: 'nearest', k: t.k, n: t.n, p1: t.p1, p99: t.p99, chroma: t.chroma,
+        sh: pair('shA', 'shB'), mid: pair('midA', 'midB'), hi: pair('hiA', 'hiB'),
+        vig: t.vig, vigMedian: t.vigMedian, spreadSh: t.spreadSh, spreadHi: t.spreadHi, sig,
+      };
+    }
+  }
+  return { basis: 'median', n: profile.n, p1: profile.p1, p99: profile.p99, chroma: profile.chroma, sh: profile.sh, mid: null, hi: profile.hi, vig: null };
+}
+
 /**
- * Fit the finish sliders for one photo, after the preset or match has been solved.
- *  1. tone ends: finishBlacks / finishRolloff so the darkest and brightest 1% land on the profile
- *     (only toward it; a matte profile may lift the black point instead of crushing it)
- *  2. colour: shadow and highlight tints and overall intensity, a third of the way to the profile
- *  3. vignette and grain from the profile where the preset has none
- * The crush is backed off until the app's crushed-shadow check stays quiet.
+ * Fit the finish for one photo, after the preset or match has been solved.
+ *  1. tone ends: finishBlacks / finishRolloff so the darkest and brightest 1% land on the target
+ *     (only toward it; a matte photographer lifts the black point instead of crushing it)
+ *  2. colour: the three colour-grading wheels (added to whatever the match put there) and overall
+ *     intensity move part of the way to the target shadow / midtone / highlight colour, with skin
+ *     hue held and no new clipped colour
+ *  3. vignette and grain, scaled by how much falloff the similar published photos show
+ * Returns { params, style } — style is what the page shows as "what they'd do".
  */
-export function fitFinish(ps, params, profile, idx = null) {
+export function fitFinish(ps, params, profile, idx = null, { strength = 1 } = {}) {
   const out = { ...params, finishBlacks: 0, finishRolloff: 0, finishShA: 0, finishShB: 0, finishHiA: 0, finishHiB: 0, finishSat: 0 };
-  if (!profile || profile.p1 == null) return out;
+  if (!profile || profile.p1 == null) return { params: out, style: null };
   const n = ps.n;
   idx = idx || sampleIdx(n);
+  const skinMask = ps.masks && ps.masks.skin;
   const cur = { L: new Float32Array(n), A: new Float32Array(n), B: new Float32Array(n), lr: new Float32Array(n), lg: new Float32Array(n), lb: new Float32Array(n) };
-  const at = (p) => { processPixelSet(ps, p, idx, cur); return stats(cur, idx); };
+  const at = (p) => { processPixelSet(ps, p, idx, cur); return stats(cur, idx, skinMask); };
   const st0 = at(out);
   const mono = st0.chroma < 3;
+  const T = styleTargets(ps, profile, mono);
+  const move = (T.basis === 'nearest' ? MOVE_NEAREST : MOVE_MEDIAN) * strength;
+  const toneK = Math.min(1, strength);
+  // tone-end targets part-way when the style is dialled down
+  T.p1 = st0.p1 + (T.p1 - st0.p1) * toneK; T.p99 = st0.p99 + (T.p99 - st0.p99) * toneK;
 
-  // 1. tone ends. finishBlacks crushes; a matte profile whose black point sits above this photo's
-  // gets there with the curve's black lift instead (fadeBlacks already exists for that).
-  const needB = st0.p1 > profile.p1 + 0.5, needR = st0.p99 > profile.p99 + 0.5;
+  // 1. tone ends
+  const needB = st0.p1 > T.p1 + 0.5, needR = st0.p99 > T.p99 + 0.5;
   if (needB || needR) {
     const fn = (x) => {
       const s = at({ ...out, finishBlacks: x[0], finishRolloff: x[1] });
       const c = counts(ps, cur, idx).crushed;
-      return [needB ? s.p1 - profile.p1 : 0, needR ? s.p99 - profile.p99 : 0, Math.max(0, c - 0.25) * 40, x[0] / 400, x[1] / 400];
+      return [needB ? s.p1 - T.p1 : 0, needR ? s.p99 - T.p99 : 0, Math.max(0, c - 0.25) * 40, x[0] / 400, x[1] / 400];
     };
     const r = lm(fn, [needB ? 40 : 0, needR ? 40 : 0], [0, 0], [needB ? 100 : 0, needR ? 100 : 0], { iters: 15 });
     out.finishBlacks = Math.round(r.x[0]); out.finishRolloff = Math.round(r.x[1]);
@@ -104,39 +146,82 @@ export function fitFinish(ps, params, profile, idx = null) {
       for (let it = 0; it < 6; it++) { const m = (lo + hi) / 2; if (crushedAt(m) > 0.3) hi = m; else lo = m; }
       out.finishBlacks = Math.floor(lo);
     }
-  } else if (profile.matte && st0.p1 < profile.p1 - 1) {
+  } else if ((profile.matte || T.p1 > 5) && st0.p1 < T.p1 - 1) {
     // lift toward the matte black point, half-way
-    out.fadeBlacks = Math.min(40, (params.fadeBlacks || 0) + (profile.p1 - st0.p1) * 0.5 * 4);
+    out.fadeBlacks = Math.min(40, (params.fadeBlacks || 0) + (T.p1 - st0.p1) * 0.5 * 4);
   }
 
-  // 2. colour, a third of the way. Skipped for black and white photos.
+  // 2. colour on the wheels. Skipped for black and white photos.
+  const s1 = at(out);
+  const base = ZN.map((z) => wheelXY(out, z));
+  let wheels = null;
   if (!mono) {
-    const s1 = at(out);
+    // trust the neighbours less where they disagree about a zone's colour
+    const trust = (spread) => (spread == null ? 1 : Math.max(0.4, Math.min(1, 6 / (spread + 3))));
+    const aim = (have, want, tr = 1) => (have && want ? [have[0] + (want[0] - have[0]) * move * tr, have[1] + (want[1] - have[1]) * move * tr] : null);
     const tgt = {
-      sh: s1.sh && profile.sh ? [s1.sh[0] + (profile.sh[0] - s1.sh[0]) * COLOR_MOVE, s1.sh[1] + (profile.sh[1] - s1.sh[1]) * COLOR_MOVE] : null,
-      hi: s1.hi && profile.hi ? [s1.hi[0] + (profile.hi[0] - s1.hi[0]) * COLOR_MOVE, s1.hi[1] + (profile.hi[1] - s1.hi[1]) * COLOR_MOVE] : null,
-      chroma: s1.chroma + (profile.chroma - s1.chroma) * COLOR_MOVE,
+      sh: aim(s1.sh, T.sh, trust(T.spreadSh)), mid: aim(s1.mid, T.mid), hi: aim(s1.hi, T.hi, trust(T.spreadHi)),
+      chroma: s1.chroma + (T.chroma - s1.chroma) * move,
     };
     const clip0 = counts(ps, cur, idx).color; // cur holds s1's pixels
+    const skin0 = s1.skin;
+    const withWheels = (x) => ({ ...out, _gradeAB: base.map(([a, b], z) => [a + x[2 * z], b + x[2 * z + 1]]), finishSat: x[6] });
     const fn = (x) => {
-      const s = at({ ...out, finishShA: x[0], finishShB: x[1], finishHiA: x[2], finishHiB: x[3], finishSat: x[4] });
+      const s = at(withWheels(x));
       const clip = counts(ps, cur, idx).color;
-      return [
-        // no new clipped colour (the loss check warns at 1%)
-        Math.max(0, clip - Math.max(clip0, 0.3)) * 25,
-        tgt.sh && s.sh ? (s.sh[0] - tgt.sh[0]) / 0.8 : 0, tgt.sh && s.sh ? (s.sh[1] - tgt.sh[1]) / 0.8 : 0,
-        tgt.hi && s.hi ? (s.hi[0] - tgt.hi[0]) / 0.8 : 0, tgt.hi && s.hi ? (s.hi[1] - tgt.hi[1]) / 0.8 : 0,
-        (s.chroma - tgt.chroma) / 0.6,
-        x[0] / 30, x[1] / 30, x[2] / 30, x[3] / 30, x[4] / 120,
-      ];
+      const r = [Math.max(0, clip - Math.max(clip0, 0.3)) * 25];
+      for (const [k, sc] of [['sh', 0.8], ['mid', 1.0], ['hi', 0.8]]) {
+        r.push(tgt[k] && s[k] ? (s[k][0] - tgt[k][0]) / sc : 0, tgt[k] && s[k] ? (s[k][1] - tgt[k][1]) / sc : 0);
+      }
+      r.push((s.chroma - tgt.chroma) / 0.6);
+      // skin: keep its hue within 4 degrees and don't drain it
+      if (skin0 && s.skin) {
+        const dh = wrap(hueDeg(s.skin) - hueDeg(skin0));
+        r.push(Math.max(0, Math.abs(dh) - 4) / 1.5, Math.max(0, 0.85 * Math.hypot(...skin0) - Math.hypot(...s.skin)) / 1.5);
+      }
+      for (let j = 0; j < 6; j++) r.push(x[j] / 40);
+      r.push(x[6] / 120);
+      return r;
     };
-    const r = lm(fn, [0, 0, 0, 0, 0], [-8, -8, -8, -8, -40], [8, 8, 8, 8, 40], { iters: 12 });
-    const rd = (v) => Math.round(v * 2) / 2;
-    out.finishShA = rd(r.x[0]); out.finishShB = rd(r.x[1]); out.finishHiA = rd(r.x[2]); out.finishHiB = rd(r.x[3]); out.finishSat = Math.round(r.x[4]);
+    // a zone with no target (too few pixels there, or no data) keeps its wheel where the match left it
+    const L = WHEEL_MAX, lo = [], hi = [];
+    for (const k of ['sh', 'mid', 'hi']) { const on = tgt[k] ? L : 0; lo.push(-on, -on); hi.push(on, on); }
+    lo.push(-40); hi.push(40);
+    const r = lm(fn, [0, 0, 0, 0, 0, 0, 0], lo, hi, { iters: 14 });
+    out.finishSat = Math.round(r.x[6]);
+    wheels = {};
+    ZN.forEach((z, zi) => {
+      const [a, b] = [base[zi][0] + r.x[2 * zi], base[zi][1] + r.x[2 * zi + 1]];
+      const sat = Math.min(100, Math.hypot(a, b));
+      out[`${z}Sat`] = Math.round(sat * 10) / 10;
+      out[`${z}Hue`] = sat > 0.05 ? abToWheelHue(a, b) : (out[`${z}Hue`] || 0);
+      const d = [r.x[2 * zi], r.x[2 * zi + 1]];
+      wheels[z] = { from: { hue: params[`${z}Hue`] || 0, sat: params[`${z}Sat`] || 0 }, to: { hue: out[`${z}Hue`], sat: out[`${z}Sat`] }, move: { hue: Math.hypot(...d) > 0.05 ? abToWheelHue(d[0], d[1]) : 0, amount: Math.round(Math.hypot(...d) * 10) / 10 } };
+    });
   }
 
   // 3. vignette and grain
-  if (!params.vignette && profile.vignette) out.vignette = profile.vignette;
-  if (!params.grain && profile.grain) { out.grain = profile.grain; out.grainSize = profile.grainSize ?? 20; }
-  return out;
+  if (!params.vignette && profile.vignette) {
+    let v = profile.vignette * Math.min(1.5, strength);
+    if (T.vig != null && T.vigMedian != null && Math.abs(T.vigMedian) > 2) v = Math.round(v * Math.max(0.3, Math.min(1.6, T.vig / T.vigMedian)));
+    out.vignette = v;
+  }
+  if (!params.grain && profile.grain && strength > 0) { out.grain = Math.round(profile.grain * Math.min(1.5, strength)); out.grainSize = profile.grainSize ?? 20; }
+
+  const s2 = at(out);
+  const r1 = (v) => (v == null ? null : Math.round(v * 10) / 10);
+  const pr = (v) => (v ? [r1(v[0]), r1(v[1])] : null);
+  const style = {
+    name: profile.name, who: profile.who, source: profile.source,
+    basis: T.basis, k: T.k || null, n: T.n,
+    target: { p1: r1(T.p1), p99: r1(T.p99), chroma: r1(T.chroma), sh: pr(T.sh), mid: pr(T.mid), hi: pr(T.hi) },
+    before: { p1: r1(s1.p1), p99: r1(s1.p99), chroma: r1(s1.chroma), sh: pr(s1.sh), mid: pr(s1.mid), hi: pr(s1.hi) },
+    after: { p1: r1(s2.p1), p99: r1(s2.p99), chroma: r1(s2.chroma), sh: pr(s2.sh), mid: pr(s2.mid), hi: pr(s2.hi) },
+    start: { p1: r1(st0.p1), p99: r1(st0.p99) },
+    wheels, mono,
+    blacks: out.finishBlacks, rolloff: out.finishRolloff, fade: (out.fadeBlacks || 0) - (params.fadeBlacks || 0),
+    sat: out.finishSat, vignette: out.vignette || 0, grain: out.grain || 0,
+  };
+  delete out._gradeAB;
+  return { params: out, style };
 }

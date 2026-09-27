@@ -43,6 +43,21 @@ export function exifSegment(u8) {
   return seg;
 }
 
+// EXIF Orientation of a JPEG (1 when absent or unreadable).
+export function jpegOrientation(u8) {
+  const segs = segments(u8);
+  const s = segs && segs.find((g) => g.marker === 0xe1 && startsWith(u8, g.start + 4, EXIF));
+  if (!s) return 1;
+  try {
+    const t = s.start + 10, le = u8[t] === 0x49;
+    const r16 = (o) => (le ? u8[o] | (u8[o + 1] << 8) : (u8[o] << 8) | u8[o + 1]);
+    const r32 = (o) => (le ? (u8[o] | (u8[o + 1] << 8) | (u8[o + 2] << 16) | (u8[o + 3] << 24)) >>> 0 : ((u8[o] << 24) | (u8[o + 1] << 16) | (u8[o + 2] << 8) | u8[o + 3]) >>> 0);
+    const ifd = t + r32(t + 4), n = r16(ifd);
+    for (let k = 0; k < n; k++) { const e = ifd + 2 + k * 12; if (r16(e) === 0x0112) return r16(e + 8) || 1; }
+  } catch (e) { /* fall through */ }
+  return 1;
+}
+
 export function xmpSegment(packet) {
   const enc = new TextEncoder();
   const ns = enc.encode(XMP_NS), body = enc.encode(packet);
