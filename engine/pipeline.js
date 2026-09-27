@@ -46,6 +46,13 @@ for (const c of ['Red', 'Green', 'Blue']) {
   SLIDERS.push({ key: `cal${c}Sat`, label: `${c} primary sat`, group: 'Calibration', ui: [-100, 100], cap: [0, 0], lr: `${c}Saturation` });
 }
 SLIDERS.push({ key: 'calShadowTint', label: 'Shadow tint', group: 'Calibration', ui: [-100, 100], cap: [0, 0], lr: 'ShadowTint' });
+// Finish: what a preset leaves to the phone pass (Snapseed/Mextures-style). Blacks and roll-off are
+// global and live in the LUT; vignette and grain depend on pixel position and run after it (applyFinish).
+SLIDERS.push({ key: 'finishBlacks', label: 'Deepen blacks', group: 'Finish', ui: [0, 100], cap: [0, 100] });
+SLIDERS.push({ key: 'finishRolloff', label: 'Roll off highlights', group: 'Finish', ui: [0, 100], cap: [0, 100] });
+SLIDERS.push({ key: 'vignette', label: 'Vignette', group: 'Finish', ui: [-100, 100], cap: [-100, 100], lr: 'PostCropVignetteAmount' });
+SLIDERS.push({ key: 'grain', label: 'Grain', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainAmount' });
+SLIDERS.push({ key: 'grainSize', label: 'Grain size', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainSize' });
 SLIDERS.push({ key: 'gradeBalance', label: 'Balance', group: 'Color grading', ui: [-100, 100], cap: [-100, 100] });
 
 // skin hues get less push from these (Lightroom's vibrance does the same)
@@ -228,6 +235,17 @@ export function compile(p) {
   const anyGrade = zones.some(([a, b]) => a || b);
   const piv = 0.5 + (p.gradeBalance / 100) * 0.2;
 
+  // finish: black crush (up to 30 L* at the bottom, fading out through the mids) and a highlight shoulder
+  // that caps output white at 100 - 0.2*rolloff with a soft 18 L* knee. Both are monotonic.
+  const fB = (p.finishBlacks || 0) / 100 * 30;
+  const top = 100 - (p.finishRolloff || 0) * 0.2, knee = top - 18;
+  const finishL = (L) => {
+    if (fB) { const x = Math.max(0, 1 - L / 100); L = Math.max(0, L - fB * x * x * x); }
+    if (top < 100 && L > knee) L = knee + (top - knee) * Math.tanh((L - knee) / (top - knee));
+    return L;
+  };
+  const anyFinishL = fB > 0 || top < 100;
+
   const sat = 1 + p.saturation / 100;
   const vib = p.vibrance / 100;
   const bw = new Float32Array(8);
@@ -304,6 +322,11 @@ export function compile(p) {
       A *= f; B *= f;
     }
 
+    if (anyFinishL) {
+      const L2 = finishL(L);
+      if (L > 0.5) { const k = L2 / L; A *= Math.min(1, 0.5 + 0.5 * k); B *= Math.min(1, 0.5 + 0.5 * k); }
+      L = L2;
+    }
     if (L < 0) L = 0;
     labToLin(L, A, B, out);
     // gamut map: keep L* and hue, pull chroma until in range
@@ -390,12 +413,66 @@ export function applyLUT(lut, src, dst, count, chIn = 4, chOut = 4, seed = 1) {
   }
 }
 
+// ---- finish pass (position-dependent) -------------------------------------------------------
+export function hasSpatialFinish(p) { return !!(p.vignette || p.grain); }
+
+const S2L = new Float32Array(256);
+for (let i = 0; i < 256; i++) S2L[i] = srgbToLinear(i / 255);
+function hash2(x, y, s) { let h = (x * 374761393 + y * 668265263 + s * 2147483647) | 0; h = (h ^ (h >>> 13)) * 1274126177 | 0; return ((h ^ (h >>> 16)) >>> 0) / 4294967296 - 0.5; }
+
+/**
+ * Vignette + grain on 8-bit RGBA rows already through the LUT. Works on a band of rows of a larger
+ * image: (y0, fullW, fullH) place the band so tiles and the preview agree. Grain cell size scales
+ * with the full width, so a 1400 px preview and the 24 MP export look the same.
+ * vignette: -100 darkens edges (Lightroom post-crop style, highlight-protecting), +100 lightens.
+ * grain: 0-100 amount, grainSize 0-100.
+ */
+export function applyFinish(buf, width, rows, p, y0 = 0, fullW = width, fullH = rows, seed = 7, ch = 4) {
+  const vig = (p.vignette || 0) / 100, gAmt = (p.grain || 0) / 100;
+  if (!vig && !gAmt) return;
+  const cx = fullW / 2, cy = fullH / 2, rx = fullW / 2, ry = fullH / 2;
+  const cell = Math.max(1, fullW / 1400 * (1 + (p.grainSize || 0) / 25)); // px per grain cell at this resolution
+  const amp = gAmt * 0.09;
+  for (let y = 0; y < rows; y++) {
+    const Y = y + y0, dy = (Y + 0.5 - cy) / ry;
+    const gy = Y / cell, iy = Math.floor(gy), fy = gy - iy, sy = fy * fy * (3 - 2 * fy);
+    for (let x = 0; x < width; x++) {
+      const o = (y * width + x) * ch;
+      let r = S2L[buf[o]], g = S2L[buf[o + 1]], b = S2L[buf[o + 2]];
+      if (vig) {
+        const dx = (x + 0.5 - cx) / rx;
+        const d = Math.sqrt((dx * dx + dy * dy) / 2);          // 0 center, 1 corner
+        const t = smoothstep(0.35, 1.05, d); const w = t * t;
+        if (vig < 0) {
+          // darken, protecting what's already bright (LR's highlight priority)
+          const Yl = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          const k = 1 + vig * 0.85 * w * (1 - 0.6 * smoothstep(0.5, 1, Yl));
+          r *= k; g *= k; b *= k;
+        } else { const k = vig * 0.7 * w; r += (1 - r) * k; g += (1 - g) * k; b += (1 - b) * k; }
+      }
+      let sr = linearToSrgb(r), sg = linearToSrgb(g), sb = linearToSrgb(b);
+      if (amp) {
+        const gx = x / cell, ix = Math.floor(gx), fx = gx - ix, sx = fx * fx * (3 - 2 * fx);
+        const n00 = hash2(ix, iy, seed), n10 = hash2(ix + 1, iy, seed), n01 = hash2(ix, iy + 1, seed), n11 = hash2(ix + 1, iy + 1, seed);
+        const n = (n00 + (n10 - n00) * sx) + ((n01 + (n11 - n01) * sx) - (n00 + (n10 - n00) * sx)) * sy;
+        const l = 0.2126 * sr + 0.7152 * sg + 0.0722 * sb;
+        const dn = n * 2 * amp * (0.35 + 2.6 * l * (1 - l)); // most in the mids, like film
+        sr += dn; sg += dn; sb += dn;
+      }
+      buf[o] = sr <= 0 ? 0 : sr >= 1 ? 255 : sr * 255 + 0.5 | 0;
+      buf[o + 1] = sg <= 0 ? 0 : sg >= 1 ? 255 : sg * 255 + 0.5 | 0;
+      buf[o + 2] = sb <= 0 ? 0 : sb >= 1 ? 255 : sb * 255 + 0.5 | 0;
+    }
+  }
+}
+
 // Convenience: render an 8-bit image object with params (used by tools and the preview).
 export function renderImage(img, p, N = 33) {
   const lut = buildLUT(p, N);
   const ch = img.channels || 4;
   const out = new Uint8Array(img.width * img.height * ch);
   applyLUT(lut, img.data, out, img.width * img.height, ch, ch);
+  if (hasSpatialFinish(p)) applyFinish(out, img.width, img.height, p, 0, img.width, img.height, 7, ch);
   return { width: img.width, height: img.height, channels: ch, data: out };
 }
 

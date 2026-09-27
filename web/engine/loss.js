@@ -34,7 +34,7 @@ const LABEL = {
   dullSkin: 'Faces dulled',
 };
 
-function counts(ps, cur, idx) {
+export function counts(ps, cur, idx) {
   let blown = 0, crushed = 0, color = 0;
   const N = idx ? idx.length : ps.n;
   for (let k = 0; k < N; k++) {

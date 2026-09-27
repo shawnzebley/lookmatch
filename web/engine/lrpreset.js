@@ -80,8 +80,7 @@ export function unsupported(settings) {
   if (nz('Clarity2012')) out.push('clarity');
   if (nz('Dehaze')) out.push('dehaze');
   if (nz('Texture')) out.push('texture');
-  if (nz('GrainAmount')) out.push('grain');
-  if (nz('PostCropVignetteAmount') || nz('VignetteAmount')) out.push('vignette');
+  if (nz('VignetteAmount') && !nz('PostCropVignetteAmount')) out.push('lens vignette');
   if (settings.ConvertToGrayscale === true) out.push('B&W mix');
   if (settings.hasLocal) out.push('local masks');
   if (typeof settings.CameraProfile === 'string' && !/^Adobe Standard$|^Embedded$/.test(settings.CameraProfile)) out.push(`profile: ${settings.CameraProfile}`);
