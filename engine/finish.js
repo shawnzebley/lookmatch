@@ -24,6 +24,16 @@ export const FINISH_PROFILES = {
     name: 'Xenie Zasetskaya', who: 'Xenie Zasetskaya', source: 'xenichez.com/en/portfolio', n: 185,
     p1: 1.6, p99: 86.1, chroma: 11.7, sh: [1.5, 3.6], hi: [1.3, 5.6], vignette: -40, grain: 10, grainSize: 15,
   },
+  // Behance: 8 Playboy editorials + Fine Art set, 104 images (15 black and white), 2026-09-27: bright, colourful, soft blacks, no vignette
+  anadias: {
+    name: 'Ana Dias', who: 'Ana Dias', source: 'behance.net/anadiasphotography', n: 104,
+    p1: 5.3, p99: 95.8, chroma: 20.4, sh: [7.6, 8.9], hi: [0.8, 4.7], vignette: 0, grain: 5, grainSize: 10, matte: true,
+  },
+  // 35photo.pro/dimm122 (@borisov_photo), 60 images (8 black and white), 2026-09-27: low-key, muted, warm shadows and highlights
+  borisov: {
+    name: 'Dmitry Borisov', who: 'Dmitry Borisov', source: '35photo.pro/dimm122', n: 60,
+    p1: 3.0, p99: 86.8, chroma: 10.9, sh: [6.3, 6.2], hi: [0.1, 8.2], vignette: -28, grain: 12, grainSize: 20,
+  },
   // petermckinnon.com portraits/people/places/lifestyle, 128 images (28 black and white), 2026-09-27
   mckinnon: {
     name: 'Peter McKinnon', who: 'Peter McKinnon', source: 'petermckinnon.com', n: 128,
@@ -107,9 +117,13 @@ export function fitFinish(ps, params, profile, idx = null) {
       hi: s1.hi && profile.hi ? [s1.hi[0] + (profile.hi[0] - s1.hi[0]) * COLOR_MOVE, s1.hi[1] + (profile.hi[1] - s1.hi[1]) * COLOR_MOVE] : null,
       chroma: s1.chroma + (profile.chroma - s1.chroma) * COLOR_MOVE,
     };
+    const clip0 = counts(ps, cur, idx).color; // cur holds s1's pixels
     const fn = (x) => {
       const s = at({ ...out, finishShA: x[0], finishShB: x[1], finishHiA: x[2], finishHiB: x[3], finishSat: x[4] });
+      const clip = counts(ps, cur, idx).color;
       return [
+        // no new clipped colour (the loss check warns at 1%)
+        Math.max(0, clip - Math.max(clip0, 0.3)) * 25,
         tgt.sh && s.sh ? (s.sh[0] - tgt.sh[0]) / 0.8 : 0, tgt.sh && s.sh ? (s.sh[1] - tgt.sh[1]) / 0.8 : 0,
         tgt.hi && s.hi ? (s.hi[0] - tgt.hi[0]) / 0.8 : 0, tgt.hi && s.hi ? (s.hi[1] - tgt.hi[1]) / 0.8 : 0,
         (s.chroma - tgt.chroma) / 0.6,
