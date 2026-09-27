@@ -79,7 +79,17 @@ export function lm(fn, x0, lo, hi, { iters = 25, h = null, lambda0 = 1e-2 } = {}
 // ---------------- targets ----------------------------------------------------------------------
 const hinge = (v, lo, hi) => (v < lo ? lo - v : v > hi ? v - hi : 0);
 
-export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5, scene = null } = {}) {
+// How much of the reference's tone shape to copy, by percentile. The ends (black point, white point,
+// fades, crushed or rolled-off highlights) are mostly the edit; the middle of the histogram is mostly
+// what was in the scene, so copying it makes this photo's content look like the reference's content.
+export const TONE_SHAPE = { 1: 1, 5: 0.5, 10: 0.2, 25: 0, 50: 1, 75: 0, 90: 0.2, 95: 0.5, 99: 1 };
+
+// Zone tints and HSL bands mix the grade with whatever colors were in the scene. Only part of the
+// measured difference is trusted as the edit (tested on tools/solver_eval.mjs).
+export const ZONE_MOVE = 0.5;
+export const BAND_MOVE = 0.5;
+
+export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5, scene = null, toneShape = TONE_SHAPE, zoneMove = ZONE_MOVE, bandMove = BAND_MOVE } = {}) {
   const s = Math.min(1, Math.max(0, strength));
   const o50 = o.tone.pct[50], r50 = ref.tone.pct[50];
   // weight relative look over absolute brightness: only part of the way to the reference's median,
@@ -100,7 +110,11 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5, sce
   for (const p of PCTS) {
     const d = ref.tone.pct[p] - r50;
     const full = Math.min(100, Math.max(0, anchor + d * (d < 0 ? below : above)));
-    const move = full - o.tone.pct[p];
+    // this photo's own shape, moved to the new median
+    const dO = o.tone.pct[p] - o50;
+    const own = Math.min(100, Math.max(0, anchor + dO * (dO < 0 ? anchor / Math.max(1, o50) : (100 - anchor) / Math.max(1, 100 - o50))));
+    const w = toneShape[p] ?? 1;
+    const move = own + w * (full - own) - o.tone.pct[p];
     pct[p] = o.tone.pct[p] + s * move * (move > 0 ? lift : 1);
   }
   const wbConf = Math.min(1, o.wb.confidence / 0.4) * Math.min(1, ref.wb.confidence / 0.4);
@@ -110,7 +124,8 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5, sce
   for (const z of ['shadows', 'midtones', 'highlights']) {
     const mass = Math.min(o.zones[z].mass, ref.zones[z].mass);
     if (mass < 0.02) continue;
-    zones[z] = { a: o.zones[z].a + s * (ref.zones[z].a - o.zones[z].a), b: o.zones[z].b + s * (ref.zones[z].b - o.zones[z].b), weight: Math.sqrt(Math.min(1, mass / 0.1)) };
+    const zs = s * zoneMove;
+    zones[z] = { a: o.zones[z].a + zs * (ref.zones[z].a - o.zones[z].a), b: o.zones[z].b + zs * (ref.zones[z].b - o.zones[z].b), weight: Math.sqrt(Math.min(1, mass / 0.1)) };
   }
   const bands = {};
   for (const b of BANDS) {
@@ -119,9 +134,9 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = 0.5, sce
     const dh = Math.max(-25, Math.min(25, wrapDeg(rb.hue - ob.hue)));
     const ratio = Math.max(0.5, Math.min(1.6, rb.chroma / Math.max(1, ob.chroma)));
     bands[b] = {
-      hue: ob.hue + s * dh,
-      chroma: ob.chroma * Math.pow(ratio, s),
-      lumRel: ob.lumRel + s * Math.max(-15, Math.min(15, rb.lumRel - ob.lumRel)),
+      hue: ob.hue + s * bandMove * dh,
+      chroma: ob.chroma * Math.pow(ratio, s * bandMove),
+      lumRel: ob.lumRel + s * bandMove * Math.max(-15, Math.min(15, rb.lumRel - ob.lumRel)),
       weight: Math.sqrt(Math.min(1, Math.min(ob.weight, rb.weight) / 0.05)),
     };
   }
