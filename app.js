@@ -3,9 +3,12 @@ import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
 import { FINISH_PROFILES } from './engine/finish.js';
 import { srgbToLinear, linearToSrgb } from './engine/color.js';
 import { PCTS } from './engine/measure.js';
-import { hsvToRgb } from './engine/color.js';
+import { hsvToRgb, wheelHueToAB, abToWheelHue } from './engine/color.js';
+import { isIdentityGeom, maxRect, towardValid, fitAfterTurn, validRect } from './engine/geom.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
+
+const APP_VERSION = '2026-09-27b';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -21,6 +24,33 @@ let toastT;
 function toast(msg, ms = 3200) {
   const t = $('#toast'); t.textContent = msg; t.hidden = false;
   clearTimeout(toastT); toastT = setTimeout(() => (t.hidden = true), ms);
+}
+
+// ---------------------------------------------------------------- problem log
+// Every failure is kept (last 20, this device only) with what's needed to fix it, so a screenshot
+// or a pasted "Copy details" says which file, which step and which browser.
+const ERR_KEY = 'lm_errors';
+function readErrors() { try { return JSON.parse(localStorage.getItem(ERR_KEY) || '[]'); } catch (e) { return []; } }
+function logError(step, err, file = null) {
+  const rec = {
+    at: new Date().toISOString(), step, message: String(err && err.message || err),
+    detail: String(err && (err.detail || err.stack) || '').split('\n').slice(0, 6).join('\n'),
+    file: file ? { name: file.name, type: file.type || '', mb: +(file.size / 1048576).toFixed(2) } : null,
+    ua: navigator.userAgent, app: APP_VERSION,
+  };
+  try { localStorage.setItem(ERR_KEY, JSON.stringify([rec, ...readErrors()].slice(0, 20))); } catch (e) { /* storage full */ }
+  return rec;
+}
+const errorText = (r) => `LookMatch ${r.app} · ${r.at}\nStep: ${r.step}\n${r.file ? `File: ${r.file.name} (${r.file.type || 'no type'}, ${r.file.mb} MB)\n` : ''}Error: ${r.message}\n${r.detail ? `${r.detail}\n` : ''}Browser: ${r.ua}`;
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); toast('Copied'); } catch (e) { toast('Copy failed; take a screenshot instead'); }
+}
+function showProblem(title, rec, extraActs = '') {
+  const s = openSheet(`<h2>${esc(title)}</h2><p>${esc(rec.message)}</p>
+    ${rec.file ? `<p class="muted small">${esc(rec.file.name)} · ${esc(rec.file.type || 'no type')} · ${rec.file.mb} MB</p>` : ''}
+    <div class="acts">${extraActs}<button id="pCopy">Copy details</button><button class="primary" data-close>OK</button></div>`);
+  $('#pCopy', s).onclick = () => copyText(errorText(rec));
+  return s;
 }
 
 // ---------------------------------------------------------------- settings
@@ -50,9 +80,16 @@ class Pool {
       const p = w.pending.get(m.rid);
       if (!p) return;
       w.pending.delete(m.rid);
-      m.ok ? p.res(m.res) : p.rej(new Error(m.error));
+      if (m.ok) p.res(m.res); else { const er = new Error(m.error); er.detail = m.stack; p.rej(er); }
     };
-    w.onerror = (e) => console.error('worker error', e);
+    w.onerror = (e) => {
+      // an uncaught worker failure (on a phone usually memory): fail the waiting job instead of spinning forever
+      console.error('worker error', e);
+      e.preventDefault?.();
+      const msg = `Photo engine stopped (${e.message || 'probably out of memory'}). Try fewer photos at once.`;
+      for (const [, p] of w.pending) p.rej(new Error(msg));
+      w.pending.clear();
+    };
     return w;
   }
   assign() { const w = this.workers[this.rr++ % this.workers.length]; return w.idx; }
@@ -168,9 +205,12 @@ async function newPresetFrom(file) {
   const sheet = openSheet(`<h2>New preset</h2><img class="big" id="npImg" alt=""><p class="muted small" id="npStatus">Measuring the reference…</p>
     <label class="muted small">Name</label><input type="text" id="npName" value="${esc(baseName(file.name))}">
     <div class="acts"><button class="ghost" data-close>Cancel</button><button class="primary" id="npSave" disabled>Save preset</button></div>`);
-  $('#npImg', sheet).src = blobURL(file);
+  const img = $('#npImg', sheet);
+  img.onerror = () => { img.hidden = true; }; // HEIF in browsers without it: the measured thumbnail replaces it
+  img.src = blobURL(file);
   try {
     const { stats, thumb } = await pool.call(0, 'measureRef', { file }, { priority: true });
+    img.hidden = false; img.src = blobURL(thumb);
     $('#npStatus', sheet).innerHTML = presetChips(stats);
     const btn = $('#npSave', sheet);
     btn.disabled = false;
@@ -181,7 +221,11 @@ async function newPresetFrom(file) {
       closeSheet(); await loadPresets(); renderPresets(); backupPreset(p);
       toast(`Saved “${p.name}”`);
     };
-  } catch (e) { $('#npStatus', sheet).textContent = `Couldn't read that image: ${e.message}`; }
+  } catch (e) {
+    const rec = logError('new preset: read reference', e, file);
+    $('#npStatus', sheet).innerHTML = `<span style="color:var(--bad)">Couldn't read that image.</span> ${esc(rec.message)} <button class="lnk" id="npCopy">Copy details</button>`;
+    $('#npCopy', sheet).onclick = () => copyText(errorText(rec));
+  }
 }
 
 // Lightroom presets: exact values; the solver only normalises each photo's exposure and white balance.
@@ -248,6 +292,7 @@ async function restorePresets() {
 
 // ---------------------------------------------------------------- match / batch
 function statusLabel(p) {
+  if (p.status === 'loading' && p.phase === 'heif') return 'converting HEIF';
   return { loading: 'reading', ready: 'queued', solving: 'matching', done: 'matched', error: 'error', exporting: 'exporting', exported: 'exported' }[p.status] || p.status;
 }
 
@@ -295,7 +340,12 @@ function renderMatch() {
     const busy = ['loading', 'solving', 'exporting'].includes(p.status);
     const t = h(`<button class="tile" data-id="${p.id}">${p.thumbURL ? `<img src="${p.thumbURL}" alt="">` : ''}
       ${busy ? '<div class="spin"></div>' : ''}${p.loss && p.loss.worst !== 'ok' && !busy ? `<span class="wbadge ${p.loss.worst}" title="${esc(p.loss.issues.map((i) => i.text).join(', '))}">!</span>` : ''}<span class="st ${p.status === 'done' || p.status === 'exported' ? 'done' : p.status === 'error' ? 'err' : ''}">${statusLabel(p)}</span></button>`);
-    t.onclick = () => { if (p.params) openDetail(p); else if (p.status === 'error') toast(p.error || 'Failed'); };
+    t.onclick = () => {
+      if (p.params) return openDetail(p);
+      if (p.status !== 'error') return;
+      const s = showProblem(`Couldn't use ${p.name}`, p.errRec || logError('photo', p.error, p.file), '<button class="danger" id="pRemove">Remove</button>');
+      $('#pRemove', s).onclick = () => { pool.call(p.worker, 'unload', { id: p.id }).catch(() => {}); S.photos = S.photos.filter((q) => q !== p); closeSheet(); renderMatch(); };
+    };
     grid.append(t);
   }
   v.append(grid);
@@ -310,9 +360,9 @@ async function addPhotos(files) {
     const p = { id: uid(), file, name: file.name || 'photo.jpg', status: 'loading', strength: pr ? pr.strength : 100, worker: pool.assign() };
     S.photos.push(p);
     pool.call(p.worker, 'load', { id: p.id, file }).then((r) => {
-      p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height;
+      p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted;
       p.status = 'ready'; rerenderMatchSoon(); runQueue();
-    }).catch((e) => { p.status = 'error'; p.error = e.message; rerenderMatchSoon(); });
+    }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('add photo: read', e, file); rerenderMatchSoon(); });
   }
   setTab('match');
 }
@@ -321,11 +371,11 @@ function solvePhoto(p, { priority = false } = {}) {
   const pr = currentPreset();
   if (!pr) return Promise.resolve();
   p.status = 'solving'; p.presetId = pr.id; rerenderMatchSoon();
-  return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100, lrParams: pr.lr ? pr.lrParams : null, finish: p.finish || pr.finish || 'off' }, { priority }).then((r) => {
-    Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, status: 'done' });
+  return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100, lrParams: pr.lr ? pr.lrParams : null, finish: p.finish || pr.finish || 'off', finishStrength: (p.finishStrength ?? 100) / 100 }, { priority }).then((r) => {
+    Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, style: r.style, status: 'done' });
     rerenderMatchSoon();
     return r;
-  }).catch((e) => { p.status = 'error'; p.error = e.message; rerenderMatchSoon(); });
+  }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('match photo', e, p.file); rerenderMatchSoon(); });
 }
 
 function runQueue() {
@@ -361,49 +411,166 @@ function numbersTable(p) {
   </table>${p.guardScale < 0.99 ? `<p class="muted small">Edit scaled to ${Math.round(p.guardScale * 100)}% to avoid clipping.</p>` : ''}`;
 }
 
-function sliderGroups(p) {
-  const groups = {};
-  for (const s of SLIDERS) (groups[s.group] ||= []).push(s);
-  return Object.entries(groups).map(([g, list], gi) => `<details class="group" ${gi < 1 ? 'open' : ''}><summary>${g}</summary>
-    ${list.map((s) => {
-      const v = p.params[s.key];
-      const step = s.step || 1;
-      return `<div class="sl ${Math.abs(v) > 1e-9 ? 'changed' : ''}" data-k="${s.key}"><label>${s.label}</label>
-        <input type="range" min="${s.ui[0]}" max="${s.ui[1]}" step="${step}" value="${v}">
-        <input type="number" min="${s.ui[0]}" max="${s.ui[1]}" step="${step}" value="${step < 1 ? (+v).toFixed(2) : Math.round(v)}"></div>`;
-    }).join('')}</details>`).join('');
+function sliderRow(s, v) {
+  const step = s.step || 1;
+  return `<div class="sl ${Math.abs(v) > 1e-9 ? 'changed' : ''}" data-k="${s.key}"><label>${s.label}</label>
+    <input type="range" min="${s.ui[0]}" max="${s.ui[1]}" step="${step}" value="${v}">
+    <input type="number" min="${s.ui[0]}" max="${s.ui[1]}" step="${step}" value="${step < 1 ? (+v).toFixed(2) : Math.round(v)}"></div>`;
 }
 
+// colour grading lives on the wheels card; everything else stays in the slider groups
+function sliderGroups(p) {
+  const groups = {};
+  for (const s of SLIDERS) if (s.group !== 'Color grading') (groups[s.group] ||= []).push(s);
+  return Object.entries(groups).map(([g, list], gi) => `<details class="group" ${gi < 1 ? 'open' : ''}><summary>${g}</summary>
+    ${list.map((s) => sliderRow(s, p.params[s.key])).join('')}</details>`).join('');
+}
+
+// ---------------------------------------------------------------- colour wheels
+const WHEELS = [['shadow', 'Shadows'], ['midtone', 'Midtones'], ['highlight', 'Highlights']];
+const SLIDER_BY = Object.fromEntries(SLIDERS.map((s) => [s.key, s]));
+// saturation on the wheel runs out from the centre on a square-root scale, so the usual 5-30 range is easy to see and grab
+const satToR = (s) => Math.sqrt(Math.max(0, Math.min(100, s)) / 100);
+const rToSat = (r) => Math.min(100, 100 * r * r);
+
+function gradeCard(p) {
+  return `<div class="wheels">${WHEELS.map(([z, label]) => `<div class="wh" data-z="${z}" data-keys="${z}Hue ${z}Sat">
+      <div class="wheel"><canvas></canvas></div><div class="wl">${label}</div><div class="wv muted small"></div></div>`).join('')}</div>
+    ${sliderRow(SLIDER_BY.gradeBalance, p.params.gradeBalance)}
+    <p class="muted small" style="margin:4px 0 0">Drag a dot to grade. Double-tap a wheel to clear it.${p.style && p.style.wheels ? ' The faint dot is where the match left it; the line is what the finishing touch added.' : ''}</p>`;
+}
+
+function drawWheel(el) {
+  const z = el.dataset.z, p = D.p, cv = el.querySelector('canvas');
+  const css = cv.getBoundingClientRect().width || 110, dpr = Math.min(3, devicePixelRatio || 1);
+  if (cv.width !== Math.round(css * dpr)) { cv.width = cv.height = Math.round(css * dpr); }
+  const x = cv.getContext('2d'), S = cv.width, c = S / 2, R = S / 2 - 3 * dpr;
+  x.clearRect(0, 0, S, S);
+  x.strokeStyle = 'rgba(255,255,255,.18)'; x.lineWidth = dpr;
+  for (const s of [10, 25, 50]) { x.beginPath(); x.arc(c, c, R * satToR(s), 0, 2 * Math.PI); x.stroke(); }
+  const pt = (hue, sat) => { const r = R * satToR(sat), t = (hue * Math.PI) / 180; return [c + r * Math.cos(t), c - r * Math.sin(t)]; };
+  const hue = p.params[`${z}Hue`] || 0, sat = p.params[`${z}Sat`] || 0;
+  const w = p.style && p.style.wheels && p.style.wheels[z];
+  if (w && w.move.amount >= 0.5) {
+    const [fx, fy] = pt(w.from.hue, w.from.sat);
+    const [tx, ty] = pt(w.to.hue, w.to.sat);
+    x.strokeStyle = 'rgba(255,255,255,.75)'; x.lineWidth = 1.5 * dpr; x.setLineDash([3 * dpr, 3 * dpr]);
+    x.beginPath(); x.moveTo(fx, fy); x.lineTo(tx, ty); x.stroke(); x.setLineDash([]);
+    x.fillStyle = 'rgba(255,255,255,.45)'; x.beginPath(); x.arc(fx, fy, 3.5 * dpr, 0, 2 * Math.PI); x.fill();
+  }
+  const [px, py] = pt(hue, sat);
+  const [r, g, b] = hsvToRgb(hue, Math.min(1, 0.25 + sat / 60), 0.95);
+  x.fillStyle = sat > 0.05 ? `rgb(${r * 255 | 0},${g * 255 | 0},${b * 255 | 0})` : '#888';
+  x.strokeStyle = '#fff'; x.lineWidth = 2 * dpr;
+  x.beginPath(); x.arc(px, py, 7 * dpr, 0, 2 * Math.PI); x.fill(); x.stroke();
+  el.querySelector('.wv').textContent = sat > 0.05 ? `${Math.round(hue)}° · ${f1(sat)}` : 'none';
+  el.classList.toggle('changed', sat > 0.05);
+}
+
+function bindWheels() {
+  document.querySelectorAll('#grade .wh').forEach((el) => {
+    const z = el.dataset.z, cv = el.querySelector('canvas');
+    drawWheel(el);
+    let drag = false, lastTap = 0;
+    const setFrom = (e) => {
+      const r = cv.getBoundingClientRect(), c = r.width / 2, R = r.width / 2 - 3;
+      const dx = e.clientX - r.left - c, dy = -(e.clientY - r.top - c);
+      const rr = Math.min(1, Math.hypot(dx, dy) / R);
+      let h = (Math.atan2(dy, dx) * 180) / Math.PI; if (h < 0) h += 360;
+      D.p.params[`${z}Hue`] = Math.round(h);
+      D.p.params[`${z}Sat`] = rr < 0.06 ? 0 : Math.round(rToSat(rr) * 10) / 10;
+      D.userEdited = true;
+      drawWheel(el); requestPreview(false);
+    };
+    cv.addEventListener('pointerdown', (e) => {
+      const now = Date.now();
+      if (now - lastTap < 300) { D.p.params[`${z}Sat`] = 0; D.userEdited = true; drawWheel(el); requestPreview(false); scheduleMeasure(); lastTap = 0; return; }
+      lastTap = now;
+      cv.setPointerCapture(e.pointerId); drag = true; setFrom(e);
+    });
+    cv.addEventListener('pointermove', (e) => { if (drag) setFrom(e); });
+    const end = () => { if (drag) { drag = false; scheduleMeasure(); } };
+    cv.addEventListener('pointerup', end); cv.addEventListener('pointercancel', end);
+  });
+}
+
+// ---------------------------------------------------------------- "what would they do"
+const HUE_NAMES = [[12, 'red'], [28, 'red-orange'], [45, 'orange'], [58, 'amber'], [75, 'yellow'], [105, 'yellow-green'], [150, 'green'], [172, 'green-teal'], [195, 'teal'], [215, 'cyan-blue'], [250, 'blue'], [275, 'violet'], [310, 'purple'], [340, 'magenta'], [361, 'red']];
+const hueName = (h) => { h = ((h % 360) + 360) % 360; return HUE_NAMES.find(([lim]) => h < lim)[1]; };
+const warmth = (h) => (h >= 10 && h < 70 ? 'warmer' : h >= 170 && h < 260 ? 'cooler' : null);
+
+function styleNote(p, pr) {
+  const key = p.finish || pr?.finish || 'off';
+  const f = FINISH_PROFILES[key];
+  if (!f || key === 'off') return '<p class="muted small" style="margin:6px 0 0">Pick a photographer to see what they would do to this photo. Their black point, highlight roll-off, colour grade, vignette and grain are read from their published work, from the shots most like this scene.</p>';
+  const st = p.style;
+  if (!st) return `<p class="muted small" style="margin:6px 0 0">Working out what ${esc(f.name)} would do…</p>`;
+  const li = [];
+  if (st.blacks > 0) li.push(`Deepen blacks: darkest 1% from L* ${f1(st.start.p1)} to ${f1(st.after.p1)}`);
+  else if (st.fade > 0.5) li.push(`Matte blacks: lift the darkest 1% to L* ${f1(st.after.p1)}`);
+  if (st.rolloff > 0) li.push(`Roll off highlights: brightest 1% from ${f1(st.start.p99)} to ${f1(st.after.p99)}`);
+  if (st.mono) li.push('Black and white photo: tone only, no colour grade');
+  else if (st.wheels) {
+    for (const [z, label] of WHEELS) {
+      const w = st.wheels[z];
+      if (!w || w.move.amount < 1) continue;
+      const wm = warmth(w.move.hue);
+      li.push(`${label}: push toward ${hueName(w.move.hue)}${wm ? ` (${wm})` : ''}, strength ${Math.round(w.move.amount)}`);
+    }
+    if (Math.abs(st.sat) >= 3) li.push(`${st.sat < 0 ? 'Mute' : 'Boost'} colour ${Math.abs(st.sat)}% (mean chroma ${f1(st.before.chroma)} → ${f1(st.after.chroma)}, theirs ${f1(st.target.chroma)})`);
+  }
+  if (st.vignette) li.push(`Vignette ${st.vignette}`);
+  if (st.grain) li.push(`Grain ${st.grain}`);
+  if (!li.length) li.push('Almost nothing: this photo already sits where their work does');
+  const basis = st.basis === 'nearest'
+    ? `From the ${st.k} of ${st.n} published ${esc(f.name)} photos whose scenes are closest to this one (${esc(f.source)}).`
+    : `From all ${st.n} published ${esc(f.name)} photos (${esc(f.source)}); no per-photo matching for them yet.`;
+  return `<div class="style"><div class="st-h">What ${esc(f.name)} would do here</div><ul>${li.map((t) => `<li>${esc(t)}</li>`).join('')}</ul><p class="muted small">${basis}</p></div>`;
+}
+
+// ---------------------------------------------------------------- detail view
 function openDetail(p) {
   const pr = currentPreset();
   const el = $('#detail');
   el.hidden = false;
+  el.classList.remove('cropping');
   document.body.style.overflow = 'hidden';
   el.innerHTML = `<div class="dtop">
       <div class="dhead"><button class="ghost" id="dBack">‹ Back</button><div class="nm">${esc(p.name)}</div><button class="primary" id="dExport">Export</button></div>
       <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
-        ${pr ? `<img class="refthumb" src="${pr.thumb}" alt="reference"><span class="reflbl">ref</span>` : ''}</div>
-      <div class="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
-        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><div class="grow"></div><button id="reMatch">Re-match</button></div>
+        ${pr ? `<img class="refthumb" id="refthumb" src="${pr.thumb}" alt="reference"><span class="reflbl" id="reflbl">ref</span>` : ''}</div>
+      <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
+        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn">Crop</button><div class="grow"></div><button id="reMatch">Re-match</button></div>
+      <div class="cropbar" id="cropbar" hidden>
+        <div class="aspects" id="aspects"><button data-a="free">Free</button><button data-a="orig">Original</button><button data-a="1">1:1</button><button data-a="0.8">4:5</button><button data-a="1.5">3:2</button><button data-a="1.7778">16:9</button><button data-a="flip" aria-label="Swap width and height">⇄</button></div>
+        <div class="level"><label for="lvl">Level</label><input type="range" id="lvl" min="-45" max="45" step="0.1" value="0"><output id="lvlOut">0.0°</output><button id="lvlAuto">Auto</button></div>
+        <div class="row"><button class="ghost" id="cropReset">Reset</button><div class="grow"></div><button id="cropCancel">Cancel</button><button class="primary" id="cropDone">Done</button></div>
+      </div>
       <div class="lossbar" id="loss"></div>
     </div>
-    <div class="dbody">
+    <div id="dspace"></div>
+    <div class="dbody" id="dbody">
       <div class="card"><h3>Finishing touch</h3><div class="fin" id="fin">${finishButtons(p, pr)}</div>
-        <p class="muted small" id="finNote" style="margin:6px 0 0">${finishNote(p, pr)}</p>
+        <div id="finNote">${styleNote(p, pr)}</div>
+        <div class="strength" style="margin-top:10px"><span class="muted small">Style</span><input type="range" id="fstr" min="0" max="150" step="5" value="${p.finishStrength ?? 100}"><output id="fstrOut">${p.finishStrength ?? 100}%</output></div>
         <div class="row" style="margin-top:8px"><button id="finAll">Use on all photos</button></div></div>
+      <div class="card"><h3>Color grading</h3><div id="grade">${gradeCard(p)}</div></div>
       <div class="card" id="sliders">${sliderGroups(p)}</div>
       <div class="card"><h3>Match strength</h3><div class="strength"><input type="range" id="str" min="0" max="100" step="1" value="${p.strength}"><output id="strOut">${p.strength}%</output></div>
         <p class="muted small" style="margin:6px 0 0">Changing strength re-solves this photo. Preset default: ${pr?.strength ?? 100}%.</p></div>
       <div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div>
     </div>`;
-  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false };
+  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null };
+  el.scrollTop = 0;
   $('#dBack').onclick = closeDetail;
   $('#dExport').onclick = () => exportPhotos([p]);
   $('#mode').onclick = (e) => { const m = e.target.dataset.m; if (!m) return; D.mode = m; [...$('#mode').children].forEach((b) => b.classList.toggle('on', b.dataset.m === m)); draw(); };
   $('#clipBtn').onclick = () => setOverlay(!D.overlay);
+  $('#cropBtn').onclick = () => enterCrop();
   $('#reMatch').onclick = async () => {
     $('#reMatch').disabled = true; $('#reMatch').textContent = 'Matching…';
     await solvePhoto(p, { priority: true });
+    D && (D.userEdited = false);
     refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Re-match';
   };
   const str = $('#str');
@@ -417,32 +584,59 @@ function openDetail(p) {
   $('#fin').onclick = async (e) => {
     const k = e.target.closest('button')?.dataset.f;
     if (!k || D?.p !== p) return;
-    p.finish = k;
-    $('#fin').innerHTML = finishButtons(p, pr); $('#finNote').textContent = 'Applying…';
+    p.finish = k; p.style = null;
+    $('#fin').innerHTML = finishButtons(p, pr); $('#finNote').innerHTML = styleNote(p, pr);
+    await solvePhoto(p, { priority: true });
+    refreshDetail();
+  };
+  const fstr = $('#fstr');
+  fstr.oninput = () => ($('#fstrOut').textContent = `${fstr.value}%`);
+  fstr.onchange = async () => {
+    p.finishStrength = +fstr.value;
+    if ((p.finish || pr?.finish || 'off') === 'off') return;
     await solvePhoto(p, { priority: true });
     refreshDetail();
   };
   $('#finAll').onclick = () => {
     const k = p.finish || pr?.finish || 'off';
-    for (const ph of S.photos) if (ph !== p) { ph.finish = k; if (ph.status === 'done' || ph.status === 'exported') ph.status = 'ready'; }
+    for (const ph of S.photos) if (ph !== p) { ph.finish = k; ph.finishStrength = p.finishStrength; if (ph.status === 'done' || ph.status === 'exported') ph.status = 'ready'; }
     runQueue();
     toast(`${FINISH_PROFILES[k].name} on all photos`);
   };
+  bindCropBar();
   bindSliders();
+  bindWheels();
   bindStage();
+  el.onscroll = () => requestAnimationFrame(applyShrink);
+  applyShrink();
   renderLoss();
   requestPreview(true);
   scheduleMeasure(0);
 }
 
+// ---------------------------------------------------------------- photo shrinks while scrolling
+// The stage starts at 40% of the screen height (62% in landscape) and gives up height as the
+// controls scroll, down to STAGE_MIN of that. A spacer takes the height it gave up, so the
+// sliders track the finger instead of jumping.
+const STAGE_MIN = 0.5;
+function stageMax() { return Math.round(window.innerHeight * (window.innerWidth > window.innerHeight ? 0.62 : 0.4)); }
+function applyShrink() {
+  if (!D) return;
+  const st = $('#stage'), sp = $('#dspace'), det = $('#detail');
+  if (!st || !sp) return;
+  if (D.crop) { st.style.height = ''; sp.style.height = '0px'; return; }
+  const mx = stageMax(), mn = Math.round(mx * STAGE_MIN);
+  const d = Math.max(0, Math.min(mx - mn, det.scrollTop));
+  st.style.height = `${mx - d}px`;
+  sp.style.height = `${d}px`;
+  const small = d > (mx - mn) * 0.6;
+  $('#refthumb')?.classList.toggle('mini', small);
+}
+window.addEventListener('resize', () => { if (D) { applyShrink(); if (D.crop) drawCrop(); } });
+
 function finishButtons(p, pr) {
   const cur = p.finish || pr?.finish || 'off';
   return Object.entries(FINISH_PROFILES).map(([k, f]) => `<button data-f="${k}" class="${k === cur ? 'on' : ''}">${esc(f.name)}</button>`).join('');
-}
-function finishNote(p, pr) {
-  const f = FINISH_PROFILES[p.finish || pr?.finish || 'off'];
-  if (!f || !f.source) return 'Adds the black point, highlight roll-off, color, vignette and grain measured from a photographer\'s published work.';
-  return `Measured from ${f.n} published images on ${f.source}. Tone ends are matched; color moves a third of the way so your scene stays yours.`;
 }
 
 function setOverlay(on) {
@@ -455,12 +649,13 @@ function setOverlay(on) {
 
 const SL_LABEL = Object.fromEntries(SLIDERS.map((s) => [s.key, s.label]));
 function fmtVal(k, v) { return k === 'exposure' ? `${v > 0 ? '+' : ''}${(+v).toFixed(2)}` : `${v > 0 ? '+' : ''}${Math.round(v)}`; }
+const controlFor = (k) => document.querySelector(`#sliders .sl[data-k="${k}"], #grade .sl[data-k="${k}"], #grade .wh[data-keys~="${k}"]`);
 
 function renderLoss() {
   if (!D) return;
   const box = $('#loss');
   const L = D.p.loss;
-  document.querySelectorAll('#sliders .sl.culprit').forEach((r) => r.classList.remove('culprit'));
+  document.querySelectorAll('#sliders .culprit, #grade .culprit').forEach((r) => r.classList.remove('culprit'));
   if (!L) { box.innerHTML = ''; return; }
   const legend = D.overlay ? `<div class="legend"><span><i style="background:#ff1e1e"></i>blown</span><span><i style="background:#286eff"></i>crushed</span><span><i style="background:#ffb900"></i>clipped color</span><span class="muted">dim = already in original</span></div>` : '';
   if (!L.issues.length) {
@@ -472,17 +667,17 @@ function renderLoss() {
   const chips = L.issues.map((i) => `<span class="lchip ${i.level}">${esc(i.text)}</span>`).join('');
   const cul = (L.culprits || []).map((c) => `<button class="lnk" data-k="${c.key}">${esc(SL_LABEL[c.key] || c.key)} ${fmtVal(c.key, c.value)}</button>`).join(', ');
   box.innerHTML = `<div class="lrow">${chips}</div>${cul ? `<div class="lrow small">Mostly from ${cul}</div>` : ''}${D.overlay ? legend : '<div class="lrow small"><button class="lnk" id="showClip">Show it on the photo</button></div>'}`;
-  for (const c of L.culprits || []) document.querySelector(`#sliders .sl[data-k="${c.key}"]`)?.classList.add('culprit');
+  for (const c of L.culprits || []) controlFor(c.key)?.classList.add('culprit');
   box.querySelectorAll('button.lnk[data-k]').forEach((b) => (b.onclick = () => jumpToSlider(b.dataset.k)));
   if ($('#showClip')) $('#showClip').onclick = () => setOverlay(true);
 }
 
 function jumpToSlider(k) {
-  const row = document.querySelector(`#sliders .sl[data-k="${k}"]`);
+  const row = controlFor(k);
   if (!row) return;
-  row.closest('details').open = true;
-  const top = $('.dtop').getBoundingClientRect().height;
   const det = $('#detail');
+  const dt = row.closest('details'); if (dt) dt.open = true;
+  const top = $('.dtop').getBoundingClientRect().height;
   det.scrollTo({ top: det.scrollTop + row.getBoundingClientRect().top - top - 12, behavior: 'smooth' });
   row.classList.remove('flash'); void row.offsetWidth; row.classList.add('flash');
 }
@@ -509,18 +704,20 @@ function refreshDetail() {
   if (!D) return;
   $('#nums').innerHTML = numbersTable(D.p);
   const prD = S.presets.find((q) => q.id === D.p.presetId) || currentPreset();
-  if ($('#fin')) { $('#fin').innerHTML = finishButtons(D.p, prD); $('#finNote').textContent = finishNote(D.p, prD); }
+  if ($('#fin')) { $('#fin').innerHTML = finishButtons(D.p, prD); $('#finNote').innerHTML = styleNote(D.p, prD); }
   const open = [...document.querySelectorAll('#sliders details')].map((d) => d.open);
   $('#sliders').innerHTML = sliderGroups(D.p);
   [...document.querySelectorAll('#sliders details')].forEach((d, i) => (d.open = open[i]));
+  $('#grade').innerHTML = gradeCard(D.p);
   bindSliders();
+  bindWheels();
   renderLoss();
   requestPreview(false);
   scheduleMeasure(0);
 }
 
 function bindSliders() {
-  document.querySelectorAll('#sliders .sl').forEach((row) => {
+  document.querySelectorAll('#sliders .sl, #grade .sl').forEach((row) => {
     const k = row.dataset.k;
     const [range, num] = row.querySelectorAll('input');
     const set = (v, from) => {
@@ -540,36 +737,41 @@ function bindSliders() {
   });
 }
 
+const previewSide = () => Math.min(1600, Math.round(Math.max(window.innerWidth, 400) * Math.min(2, devicePixelRatio || 1)));
+
 async function requestPreview(withOriginal) {
   if (!D) return;
+  if (D.crop) return; // the crop tool draws its own frame
   if (D.busy) { D.again = true; return; }
   D.busy = true;
   const p = D.p;
-  const side = Math.min(1600, Math.round(Math.max(window.innerWidth, 400) * Math.min(2, devicePixelRatio || 1)));
   try {
-    const r = await pool.call(p.worker, 'preview', { id: p.id, params: { ...p.params }, side, overlay: D.overlay, withOriginal: withOriginal || !D.orig }, { priority: true });
+    const r = await pool.call(p.worker, 'preview', { id: p.id, params: { ...p.params }, side: previewSide(), overlay: D.overlay, withOriginal: withOriginal || !D.orig }, { priority: true });
     if (!D || D.p !== p) return;
     if (r.original) D.orig = r.original;
     D.edit = r.edited;
     draw();
-  } catch (e) { toast(e.message); }
+  } catch (e) { toast(e.message); logError('preview', e, p.file); }
   if (!D) return;
   D.busy = false;
   if (D.again) { D.again = false; requestPreview(false); }
 }
 
 function draw() {
-  if (!D || !D.edit) return;
+  if (!D) return;
+  if (D.crop) return drawCrop();
+  if (!D.edit) return;
   const cv = $('#cv');
   const { width: w, height: hgt } = D.edit;
   if (cv.width !== w || cv.height !== hgt) { cv.width = w; cv.height = hgt; }
   const x = cv.getContext('2d');
   const m = D.holding ? 'before' : D.mode;
-  if (m === 'after' || !D.orig) x.drawImage(D.edit, 0, 0);
-  else if (m === 'before') x.drawImage(D.orig, 0, 0);
+  const orig = D.orig && D.orig.width === w && D.orig.height === hgt ? D.orig : null;
+  if (m === 'after' || !orig) x.drawImage(D.edit, 0, 0);
+  else if (m === 'before') x.drawImage(orig, 0, 0);
   else {
     const sx = Math.round(w * D.split);
-    x.drawImage(D.orig, 0, 0, sx, hgt, 0, 0, sx, hgt);
+    x.drawImage(orig, 0, 0, sx, hgt, 0, 0, sx, hgt);
     x.drawImage(D.edit, sx, 0, w - sx, hgt, sx, 0, w - sx, hgt);
     x.fillStyle = 'rgba(255,255,255,.9)'; x.fillRect(sx - 1, 0, 2, hgt);
   }
@@ -583,12 +785,19 @@ function bindStage() {
   const pos = (e) => { const r = cv.getBoundingClientRect(); return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)); };
   cv.addEventListener('pointerdown', (e) => {
     cv.setPointerCapture(e.pointerId);
+    if (D.crop) return cropDown(e);
     if (D.mode === 'split') { dragging = true; D.split = pos(e); }
     else if (D.mode === 'after') D.holding = true;
     draw();
   });
-  cv.addEventListener('pointermove', (e) => { if (dragging) { D.split = pos(e); draw(); } });
-  const up = () => { dragging = false; if (D && D.holding) { D.holding = false; draw(); } };
+  cv.addEventListener('pointermove', (e) => {
+    if (D.crop) return cropMove(e);
+    if (dragging) { D.split = pos(e); draw(); }
+  });
+  const up = (e) => {
+    if (D && D.crop) return cropUp(e);
+    dragging = false; if (D && D.holding) { D.holding = false; draw(); }
+  };
   cv.addEventListener('pointerup', up);
   cv.addEventListener('pointercancel', up);
   cv.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -596,13 +805,242 @@ function bindStage() {
 
 function closeDetail() {
   clearTimeout(measureT);
-  $('#detail').hidden = true; $('#detail').innerHTML = '';
+  const el = $('#detail');
+  el.onscroll = null; el.classList.remove('cropping');
+  el.hidden = true; el.innerHTML = '';
   document.body.style.overflow = '';
   D = null;
   renderMatch();
 }
 
+// ---------------------------------------------------------------- crop + level
+// The photo turns under a fixed frame (like Lightroom): the frame is drawn over the whole turned
+// photo and can't leave it. Done hands the geometry to the worker, which crops before measuring,
+// so the match and the loss checks see only what's kept.
+function cropDims() { return [D.p.w || D.crop.img.width, D.p.h || D.crop.img.height]; }
+const rectAspect = (r) => { const [W, H] = cropDims(); return (r.w * W) / (r.h * H); };
+
+async function enterCrop() {
+  const p = D.p;
+  const [W, H] = [p.w, p.h];
+  const g = p.geom;
+  D.crop = {
+    angle: g ? g.angle : 0, r: g ? { x: g.x, y: g.y, w: g.w, h: g.h } : { x: 0, y: 0, w: 1, h: 1 },
+    aspect: g ? null : W / H, auto: !g, prev: g ? { ...g } : null, img: null, drag: null,
+  };
+  const det = $('#detail');
+  det.scrollTop = 0; det.classList.add('cropping');
+  $('#dctl').hidden = true; $('#cropbar').hidden = false; $('#loss').hidden = true; $('#dbody').hidden = true;
+  $('#lblL').hidden = true; $('#lblR').hidden = true;
+  applyShrink();
+  syncCropBar();
+  try {
+    const r = await pool.call(p.worker, 'preview', { id: p.id, params: { ...p.params }, side: previewSide(), plain: true }, { priority: true });
+    if (!D || !D.crop) return;
+    D.crop.img = r.edited;
+    drawCrop();
+  } catch (e) { toast(e.message); exitCrop(); }
+}
+
+function exitCrop() {
+  if (!D) return;
+  D.crop = null;
+  const det = $('#detail');
+  det.classList.remove('cropping');
+  $('#dctl').hidden = false; $('#cropbar').hidden = true; $('#loss').hidden = false; $('#dbody').hidden = false;
+  applyShrink();
+  $('#cropBtn').classList.toggle('on', !!D.p.geom);
+}
+
+function syncCropBar() {
+  const c = D.crop;
+  $('#lvl').value = c.angle; $('#lvlOut').textContent = `${c.angle > 0 ? '+' : ''}${(+c.angle).toFixed(1)}°`;
+  const [W, H] = [D.p.w, D.p.h];
+  const cur = c.aspect;
+  document.querySelectorAll('#aspects button').forEach((b) => {
+    const a = b.dataset.a;
+    let on = false;
+    if (a === 'free') on = cur == null;
+    else if (a === 'orig') on = cur != null && Math.abs(cur - W / H) < 1e-3;
+    else if (a !== 'flip') on = cur != null && !(Math.abs(cur - W / H) < 1e-3) && (Math.abs(cur - +a) < 1e-3 || Math.abs(cur - 1 / +a) < 1e-3);
+    b.classList.toggle('on', on);
+  });
+}
+
+function bindCropBar() {
+  $('#aspects').onclick = (e) => {
+    const a = e.target.closest('button')?.dataset.a;
+    if (!a || !D.crop?.img) return;
+    const c = D.crop, [W, H] = cropDims();
+    const r = c.r, cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    if (a === 'free') { c.aspect = null; syncCropBar(); return; }
+    let asp;
+    if (a === 'orig') asp = W / H;
+    else if (a === 'flip') asp = 1 / rectAspect(r);
+    else asp = +a; // as labelled (width:height); ⇄ turns it the other way
+    c.aspect = asp; c.auto = true;
+    c.r = maxRect(W, H, c.angle, asp, cx, cy);
+    syncCropBar(); drawCrop();
+  };
+  const lvl = $('#lvl');
+  lvl.oninput = () => { if (D.crop) D.crop.drag = 'level'; setAngle(+lvl.value); };
+  lvl.onchange = () => { if (D.crop) { D.crop.drag = null; drawCrop(); } };
+  $('#lvlAuto').onclick = async () => {
+    const b = $('#lvlAuto'); b.disabled = true; b.textContent = '…';
+    try {
+      const r = await pool.call(D.p.worker, 'autoLevel', { id: D.p.id }, { priority: true });
+      if (!D || !D.crop) return;
+      if (r.confidence < 0.15) toast('No clear horizon or straight lines to level from');
+      else { setAngle(r.angle); toast(`Levelled ${r.angle > 0 ? '+' : ''}${r.angle.toFixed(1)}°`); }
+    } catch (e) { toast(e.message); }
+    b.disabled = false; b.textContent = 'Auto';
+  };
+  $('#cropReset').onclick = () => {
+    const c = D.crop, [W, H] = cropDims();
+    c.angle = 0; c.aspect = W / H; c.auto = true; c.r = { x: 0, y: 0, w: 1, h: 1 };
+    syncCropBar(); drawCrop();
+  };
+  $('#cropCancel').onclick = () => exitCrop() || requestPreview(false);
+  $('#cropDone').onclick = async () => {
+    const p = D.p, c = D.crop;
+    const g = { angle: Math.round(c.angle * 10) / 10, x: c.r.x, y: c.r.y, w: c.r.w, h: c.r.h };
+    const geom = isIdentityGeom(g) ? null : g;
+    const changed = JSON.stringify(geom) !== JSON.stringify(p.geom || null);
+    exitCrop();
+    if (!changed) return requestPreview(false);
+    p.geom = geom;
+    $('#cropBtn').classList.toggle('on', !!geom);
+    try {
+      const r = await pool.call(p.worker, 'setGeom', { id: p.id, geom }, { priority: true });
+      p.before = r.before;
+    } catch (e) { toast(e.message); logError('crop', e, p.file); return; }
+    if (!D || D.p !== p) return;
+    D.orig = null;
+    requestPreview(true);
+    if (!D.userEdited) {
+      $('#reMatch').disabled = true; $('#reMatch').textContent = 'Matching…';
+      await solvePhoto(p, { priority: true });
+      if (!D || D.p !== p) return;
+      refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Re-match';
+    } else {
+      $('#nums').innerHTML = numbersTable(p);
+      scheduleMeasure(0);
+      toast('Cropped. Your slider changes are kept; tap Re-match to fit the look to the crop.', 4500);
+    }
+  };
+}
+
+function setAngle(a) {
+  const c = D.crop;
+  if (!c) return;
+  const [W, H] = cropDims();
+  c.angle = Math.max(-45, Math.min(45, a));
+  if (c.auto) { const asp = c.aspect || rectAspect(c.r); c.r = maxRect(W, H, c.angle, asp); }
+  else c.r = fitAfterTurn(c.r, W, H, c.angle);
+  syncCropBar(); drawCrop();
+}
+
+function drawCrop() {
+  const c = D && D.crop;
+  if (!c || !c.img) return;
+  const cv = $('#cv'), img = c.img, w = img.width, h = img.height;
+  if (cv.width !== w || cv.height !== h) { cv.width = w; cv.height = h; }
+  const x = cv.getContext('2d');
+  x.setTransform(1, 0, 0, 1, 0, 0);
+  x.fillStyle = '#000'; x.fillRect(0, 0, w, h);
+  x.save(); x.translate(w / 2, h / 2); x.rotate((c.angle * Math.PI) / 180); x.drawImage(img, -w / 2, -h / 2); x.restore();
+  const rx = c.r.x * w, ry = c.r.y * h, rw = c.r.w * w, rh = c.r.h * h;
+  x.fillStyle = 'rgba(0,0,0,.58)';
+  x.beginPath(); x.rect(0, 0, w, h); x.rect(rx, ry, rw, rh); x.fill('evenodd');
+  const k = w / (cv.getBoundingClientRect().width || w); // canvas px per CSS px
+  x.strokeStyle = 'rgba(255,255,255,.95)'; x.lineWidth = 1.5 * k; x.strokeRect(rx, ry, rw, rh);
+  // thirds while dragging, a finer grid while levelling helps line up the horizon
+  x.strokeStyle = 'rgba(255,255,255,.35)'; x.lineWidth = 1 * k;
+  const n = c.drag === 'level' ? 6 : 3;
+  x.beginPath();
+  for (let i = 1; i < n; i++) { x.moveTo(rx + (rw * i) / n, ry); x.lineTo(rx + (rw * i) / n, ry + rh); x.moveTo(rx, ry + (rh * i) / n); x.lineTo(rx + rw, ry + (rh * i) / n); }
+  x.stroke();
+  // corner handles
+  x.strokeStyle = '#fff'; x.lineWidth = 3.5 * k; const L = 18 * k;
+  for (const [cx, cy, sx, sy] of [[rx, ry, 1, 1], [rx + rw, ry, -1, 1], [rx + rw, ry + rh, -1, -1], [rx, ry + rh, 1, -1]]) {
+    x.beginPath(); x.moveTo(cx + sx * L, cy); x.lineTo(cx, cy); x.lineTo(cx, cy + sy * L); x.stroke();
+  }
+}
+
+function cropHit(e) {
+  const cv = $('#cv'), b = cv.getBoundingClientRect();
+  const u = (e.clientX - b.left) / b.width, v = (e.clientY - b.top) / b.height;
+  const r = D.crop.r;
+  const px = [r.x * b.width, r.y * b.height, (r.x + r.w) * b.width, (r.y + r.h) * b.height];
+  const ex = e.clientX - b.left, ey = e.clientY - b.top;
+  const corners = [[px[0], px[1]], [px[2], px[1]], [px[2], px[3]], [px[0], px[3]]];
+  let best = -1, bd = 30;
+  corners.forEach(([cx, cy], i) => { const d = Math.hypot(ex - cx, ey - cy); if (d < bd) { bd = d; best = i; } });
+  if (best >= 0) return { kind: 'corner', i: best, u, v };
+  if (D.crop.aspect == null) {
+    const inY = ey > px[1] && ey < px[3], inX = ex > px[0] && ex < px[2];
+    if (inY && Math.abs(ex - px[0]) < 20) return { kind: 'edge', side: 'l', u, v };
+    if (inY && Math.abs(ex - px[2]) < 20) return { kind: 'edge', side: 'r', u, v };
+    if (inX && Math.abs(ey - px[1]) < 20) return { kind: 'edge', side: 't', u, v };
+    if (inX && Math.abs(ey - px[3]) < 20) return { kind: 'edge', side: 'b', u, v };
+  }
+  if (ex > px[0] && ex < px[2] && ey > px[1] && ey < px[3]) return { kind: 'move', u, v };
+  return null;
+}
+
+function cropDown(e) {
+  const c = D.crop;
+  if (!c || !c.img) return;
+  const hit = cropHit(e);
+  if (!hit) return;
+  c.drag = hit.kind; c.hit = hit; c.start = { ...c.r };
+  drawCrop();
+}
+
+function cropMove(e) {
+  const c = D.crop;
+  if (!c || !c.drag || c.drag === 'level') return;
+  const cv = $('#cv'), b = cv.getBoundingClientRect();
+  const u = (e.clientX - b.left) / b.width, v = (e.clientY - b.top) / b.height;
+  const [W, H] = cropDims(), s = c.start, MIN = 0.06;
+  const valid = (a, t) => towardValid(a, t, W, H, c.angle);
+  let t;
+  if (c.drag === 'move') {
+    const du = u - c.hit.u, dv = v - c.hit.v;
+    const shift = (r, dx, dy) => ({ ...r, x: r.x + dx, y: r.y + dy });
+    t = shift(s, du, dv);
+    if (!validRect(t, W, H, c.angle)) { const a = valid(s, shift(s, du, 0)); t = valid(a, shift(a, 0, dv)); }
+  } else if (c.drag === 'corner') {
+    const i = c.hit.i;
+    const ax = i === 0 || i === 3 ? s.x + s.w : s.x, ay = i === 0 || i === 1 ? s.y + s.h : s.y;
+    const sx = i === 0 || i === 3 ? -1 : 1, sy = i === 0 || i === 1 ? -1 : 1;
+    let nw = Math.max(MIN, (u - ax) * sx), nh = Math.max(MIN, (v - ay) * sy);
+    if (c.aspect) {
+      const hp = ((nw * W) / c.aspect + nh * H) / 2; // meet the finger half-way between width and height
+      nw = (hp * c.aspect) / W; nh = hp / H;
+    }
+    t = valid(s, { x: sx < 0 ? ax - nw : ax, y: sy < 0 ? ay - nh : ay, w: nw, h: nh });
+  } else if (c.drag === 'edge') {
+    const sd = c.hit.side;
+    if (sd === 'l') { const x = Math.min(u, s.x + s.w - MIN); t = { ...s, x, w: s.x + s.w - x }; }
+    if (sd === 'r') t = { ...s, w: Math.max(MIN, u - s.x) };
+    if (sd === 't') { const y = Math.min(v, s.y + s.h - MIN); t = { ...s, y, h: s.y + s.h - y }; }
+    if (sd === 'b') t = { ...s, h: Math.max(MIN, v - s.y) };
+    t = valid(s, t);
+  }
+  if (t) { c.r = t; c.auto = false; drawCrop(); }
+}
+
+function cropUp() {
+  const c = D.crop;
+  if (!c) return;
+  c.drag = null; drawCrop();
+}
+
 // ---------------------------------------------------------------- export
+progressListeners.add((pr) => {
+  if (pr.phase === 'heif') { const p = S.photos.find((q) => q.id === pr.id); if (p) { p.phase = 'heif'; rerenderMatchSoon(); } }
+});
 progressListeners.add((pr) => {
   const el = $('#expStatus');
   if (el && pr.phase) el.dataset.phase = `${pr.phase} ${Math.round(pr.f * 100)}%`;
@@ -685,7 +1123,7 @@ async function exportPhotos(list) {
 }
 
 function exportArgs(p) {
-  return { id: p.id, params: p.params, quality: S.settings.quality, lightroom: S.settings.lightroom, lrMode: S.settings.lrMode, name: baseName(p.name) };
+  return { id: p.id, params: p.params, geom: p.geom || null, quality: S.settings.quality, lightroom: S.settings.lightroom, lrMode: S.settings.lrMode, name: baseName(p.name) };
 }
 
 // iOS only allows the share sheet from a tap, so each batch waits for one.
@@ -719,6 +1157,7 @@ function renderSettings() {
   const v = $('#view-settings');
   const s = S.settings;
   const tok = drive.token();
+  const errs = readErrors();
   v.innerHTML = `<div class="settings">
     <div class="card"><h3>Export</h3>
       <div class="field"><label class="t">Send exports to</label>
@@ -743,6 +1182,7 @@ function renderSettings() {
         <li>Authorized redirect URI: <code>${esc(drive.redirectUri())}</code></li>
         <li>Paste the client ID above.</li></ol></details>
     </div>
+    <div class="card"><h3>Recent problems</h3>${errs.length ? `<p class="small">${errs.length} logged on this device. Latest: ${esc(errs[0].step)}, ${esc(errs[0].message)}</p><div class="bar"><button id="sErrCopy">Copy all</button><button class="ghost" id="sErrClear">Clear</button></div>` : '<p class="muted small">None logged.</p>'}</div>
     <div class="card"><h3>About</h3><p class="muted small">Everything runs on this phone. Photo presets store measured targets, not slider values. Imported Lightroom presets apply their exact values after each photo's exposure and white balance are normalised. Each photo is measured and solved on its own. Workers: ${pool.workers.length}.</p></div>
   </div>`;
   $('#sDest').value = s.dest; $('#sLRM').value = s.lrMode;
@@ -755,6 +1195,8 @@ function renderSettings() {
     if (S.photos.length && !(await confirmSheet('Reload to sign in?', 'Photos you added will need to be added again.', 'Continue'))) return;
     drive.connect(s.clientId);
   };
+  if ($('#sErrCopy')) $('#sErrCopy').onclick = () => copyText(errs.map(errorText).join('\n\n'));
+  if ($('#sErrClear')) $('#sErrClear').onclick = () => { localStorage.removeItem(ERR_KEY); renderSettings(); };
   if ($('#sDisc')) $('#sDisc').onclick = () => { drive.disconnect(); renderSettings(); };
   if ($('#sBackup')) $('#sBackup').onclick = async () => { for (const p of S.presets) await backupPreset(p); toast(`Backed up ${S.presets.length} preset(s) to Drive › LookMatch › presets`); };
   if ($('#sRestore')) $('#sRestore').onclick = async () => { try { const n = await restorePresets(); toast(`Restored ${n} preset(s)`); } catch (e) { toast(e.message); } };
@@ -819,4 +1261,4 @@ $('#pickPhotos').onchange = (e) => { const fs = [...e.target.files]; e.target.va
 })();
 
 // for automated tests
-window.__lm = { S, pool, addPhotos, newPresetFrom, exportPhotos, openDetail, solvePhoto };
+window.__lm = { S, pool, addPhotos, newPresetFrom, exportPhotos, openDetail, solvePhoto, D: () => D };

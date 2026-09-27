@@ -78,8 +78,9 @@ function seq(tag, pts) {
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 
 // XMP packet to embed in a JPEG (Lightroom reads embedded XMP on import for JPEG/HEIC/TIFF)
-export function xmpPacket(p, mode = 'sliders') {
+export function xmpPacket(p, mode = 'sliders', extra = null) {
   const { attrs, curve, curveR, curveG, curveB } = crsSettings(p, mode);
+  if (extra) Object.assign(attrs, extra);
   const at = Object.entries(attrs).map(([k, v]) => `   crs:${k}="${esc(v)}"`).join('\n');
   return `<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="LookMatch">
@@ -99,8 +100,9 @@ ${seq('ToneCurvePV2012Blue', curveB)}
 
 // A Lightroom develop preset (.xmp) holding this photo's computed settings. Import it in
 // Lightroom (mobile: Presets > ... > Import Presets; Classic: Develop > Presets > Import) and apply to the original.
-export function xmpPreset(p, name, mode = 'sliders') {
+export function xmpPreset(p, name, mode = 'sliders', extra = null) {
   const { attrs, curve, curveR, curveG, curveB } = crsSettings(p, mode);
+  if (extra) Object.assign(attrs, extra);
   const uuid = (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`).replace(/-/g, '').toUpperCase().slice(0, 32);
   const head = {
     PresetType: 'Normal', Cluster: '', UUID: uuid, SupportsAmount: 'False', SupportsColor: 'True', SupportsMonochrome: 'False',
