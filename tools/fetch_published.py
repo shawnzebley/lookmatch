@@ -33,6 +33,12 @@ SOURCES = {
     'cvatik': lambda: squarespace(['https://www.cvatik.com/portrait']),
     'mckinnon': lambda: squarespace([f'https://www.petermckinnon.com/{p}' for p in ('portraits', 'people', 'places', 'lifestyle')]),
     'xenie': lambda: wfolio('https://xenichez.com/en/portfolio'),
+    # www. only: the bare lightwitch.com has a broken certificate
+    'courtney': lambda: squarespace([f'https://www.lightwitch.com/{p}' for p in ('latest', 'portrait-clients', 'couples', 'fashion', 'musicians', 'commercial-works', 'personal-work', 'humanless', 'strange-fusions', 'archive')]),
+    # Ana Dias: Behance hides these projects behind an adult-content sign-in, so the file list was read in a
+    # signed-in Chrome (scratch/ana_list.txt, 'projectId:prefix.suffix,...;...') and fetched from the CDN
+    'anadias': lambda: [f'https://mir-s3-cdn-cf.behance.net/project_modules/1400/{it.split(".")[0]}{g.split(":")[0]}.{it.split(".")[1]}.jpg'
+                        for g in open('scratch/ana_list.txt').read().strip().split(';') for it in g.split(':')[1].split(',')],
     'borisov': lambda: list(dict.fromkeys(re.findall(r'href="https://35photo\.pro/dimm122/photo_\d+/"[^>]*href-mobile="([^"]+)"', get('https://35photo.pro/dimm122').decode('utf8', 'ignore')))),
 }
 
