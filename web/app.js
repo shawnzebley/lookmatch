@@ -3,12 +3,13 @@ import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
 import { FINISH_PROFILES } from './engine/finish.js';
 import { srgbToLinear, linearToSrgb } from './engine/color.js';
 import { PCTS } from './engine/measure.js';
-import { hsvToRgb, wheelHueToAB, abToWheelHue } from './engine/color.js';
+import { hsvToRgb, wheelHueToAB, abToWheelHue, labToLin } from './engine/color.js';
+import { profileSummary } from './engine/style.js';
 import { isIdentityGeom, maxRect, towardValid, fitAfterTurn, validRect } from './engine/geom.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-27b';
+const APP_VERSION = '2026-09-27c';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -59,8 +60,10 @@ const S = {
   presets: [],
   settings: { clientId: '243038152226-jfgss8uq68lb72bi9j5jqgkdlg475kj8.apps.googleusercontent.com', quality: 92, lightroom: true, lrMode: 'sliders', dest: 'drive', ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') },
   presetId: localStorage.getItem('lm_preset') || null,
+  look: (() => { try { return JSON.parse(localStorage.getItem('lm_look') || 'null'); } catch (e) { return null; } })(),
+  styleTab: null, autoOpen: false,
   photos: [],
-  tab: 'presets',
+  tab: 'match',
 };
 const saveSettings = () => localStorage.setItem(SETTINGS_KEY, JSON.stringify(S.settings));
 
@@ -118,7 +121,7 @@ const cores = navigator.hardwareConcurrency || 4;
 const pool = new Pool(Math.max(1, Math.min(3, cores - 2)));
 
 // ---------------------------------------------------------------- presets
-const currentPreset = () => S.presets.find((p) => p.id === S.presetId) || null;
+const currentPreset = () => (S.look && S.look.kind === 'preset' ? S.presets.find((p) => p.id === S.look.id) || null : null);
 
 function swatch(zone) {
   const [r, g, b] = hsvToRgb(zone.hue, Math.min(1, zone.sat / 12), 0.8);
@@ -139,21 +142,22 @@ function presetChips(st, pr = null) {
 
 async function loadPresets() {
   S.presets = await db.listPresets();
-  if (!currentPreset() && S.presets[0]) S.presetId = S.presets[0].id;
+  // older installs picked a preset before looks existed: keep using it
+  if (!S.look && S.presetId && S.presets.find((p) => p.id === S.presetId)) S.look = { kind: 'preset', id: S.presetId };
 }
 
 function renderPresets() {
   const v = $('#view-presets');
   v.innerHTML = '';
   if (!S.presets.length) {
-    v.append(h(`<div class="empty"><b>No presets yet</b>Pick a photo with the look you want, or import a Lightroom preset (.xmp or .lrtemplate) to apply its exact values.<br><br><button class="primary" id="newPresetEmpty">New preset from a photo</button><br><br><button id="importLREmpty">Import Lightroom preset</button></div>`));
+    v.append(h(`<div class="empty"><b>No references yet</b>Pick a photo with the look you want, or import a Lightroom preset (.xmp or .lrtemplate) to apply its exact values.<br><br><button class="primary" id="newPresetEmpty">New reference photo</button><br><br><button id="importLREmpty">Import Lightroom preset</button></div>`));
     $('#newPresetEmpty').onclick = () => $('#pickRef').click();
     $('#importLREmpty').onclick = () => $('#pickLR').click();
     return;
   }
   const list = h('<div class="preset-list"></div>');
   for (const p of S.presets) {
-    const el = h(`<div class="preset ${p.id === S.presetId ? 'sel' : ''}">
+    const el = h(`<div class="preset ${S.look && S.look.kind === 'preset' && S.look.id === p.id ? 'sel' : ''}">
       <div class="ph"><img src="${p.thumb}" alt=""><div style="min-width:0"><div class="nm">${esc(p.name)}</div>
       <div class="muted small">Default strength ${p.strength}%</div>${presetChips(p.stats, p)}</div></div>
       <div class="row">
@@ -167,7 +171,7 @@ function renderPresets() {
     el.onclick = async (e) => {
       const a = e.target.dataset.a;
       if (!a) return;
-      if (a === 'use') { S.presetId = p.id; localStorage.setItem('lm_preset', p.id); setTab('match'); }
+      if (a === 'use') { S.styleTab = 'preset'; setLook({ kind: 'preset', id: p.id }); setTab('match'); }
       if (a === 'rename') {
         const name = await ask('Rename preset', p.name);
         if (name) { p.name = name; await db.putPreset(p); backupPreset(p); renderPresets(); }
@@ -184,7 +188,7 @@ function renderPresets() {
         const keys = Object.keys(FINISH_PROFILES);
         p.finish = keys[(keys.indexOf(p.finish || 'off') + 1) % keys.length];
         await db.putPreset(p); backupPreset(p); renderPresets();
-        for (const ph of S.photos) if (ph.presetId === p.id && (ph.status === 'done' || ph.status === 'exported')) ph.status = 'ready';
+        for (const ph of S.photos) if (presetOf(ph) === p && !ph.finish && (ph.status === 'done' || ph.status === 'exported')) ph.status = 'ready';
         runQueue();
         toast(`Finish: ${FINISH_PROFILES[p.finish].name}`);
       }
@@ -202,9 +206,9 @@ function renderPresets() {
 }
 
 async function newPresetFrom(file) {
-  const sheet = openSheet(`<h2>New preset</h2><img class="big" id="npImg" alt=""><p class="muted small" id="npStatus">Measuring the reference…</p>
+  const sheet = openSheet(`<h2>New reference</h2><img class="big" id="npImg" alt=""><p class="muted small" id="npStatus">Measuring the reference…</p>
     <label class="muted small">Name</label><input type="text" id="npName" value="${esc(baseName(file.name))}">
-    <div class="acts"><button class="ghost" data-close>Cancel</button><button class="primary" id="npSave" disabled>Save preset</button></div>`);
+    <div class="acts"><button class="ghost" data-close>Cancel</button><button class="primary" id="npSave" disabled>Save reference</button></div>`);
   const img = $('#npImg', sheet);
   img.onerror = () => { img.hidden = true; }; // HEIF in browsers without it: the measured thumbnail replaces it
   img.src = blobURL(file);
@@ -217,8 +221,10 @@ async function newPresetFrom(file) {
     btn.onclick = async () => {
       const p = { id: uid(), name: $('#npName', sheet).value.trim() || 'Untitled look', stats, thumb: await blobToDataURL(thumb), strength: 100, created: Date.now() };
       await db.putPreset(p);
-      S.presetId = p.id; localStorage.setItem('lm_preset', p.id);
       closeSheet(); await loadPresets(); renderPresets(); backupPreset(p);
+      S.styleTab = 'preset'; setLook({ kind: 'preset', id: p.id });
+      if (D && D.p) { D.styleKind = 'preset'; }
+      if (S.tab !== 'match' && !D) setTab('match');
       toast(`Saved “${p.name}”`);
     };
   } catch (e) {
@@ -257,8 +263,8 @@ async function importLightroom(files) {
       await db.putPreset(p); backupPreset(p); n++; last = p;
     } catch (e) { console.warn('preset import failed', file.name, e); }
   }
-  if (last) { S.presetId = last.id; localStorage.setItem('lm_preset', last.id); }
   await loadPresets(); renderPresets();
+  if (last) { S.styleTab = 'preset'; setLook({ kind: 'preset', id: last.id }); }
   toast(n ? `Imported ${n} Lightroom preset${n > 1 ? 's' : ''}` : 'No usable presets in those files');
 }
 
@@ -290,72 +296,183 @@ async function restorePresets() {
   return n;
 }
 
-// ---------------------------------------------------------------- match / batch
+// ---------------------------------------------------------------- looks
+// A look is a photographer's style ({ kind: 'photographer', key }) or a saved reference
+// ({ kind: 'preset', id }: a photo's measured look, or an imported Lightroom preset).
+// S.look applies to every photo; p.look overrides it for one photo (set in the editor).
+const LOOK_KEY = 'lm_look';
+const PHOTOGRAPHERS = Object.keys(FINISH_PROFILES).filter((k) => k !== 'off');
+const presetById = (id) => S.presets.find((q) => q.id === id) || null;
+const lookValid = (l) => !!l && (l.kind === 'photographer' ? !!FINISH_PROFILES[l.key] : !!presetById(l.id));
+const lookOf = (p) => (lookValid(p.look) ? p.look : lookValid(S.look) ? S.look : null);
+const presetOf = (p) => { const l = lookOf(p); return l && l.kind === 'preset' ? presetById(l.id) : null; };
+const lookName = (l) => (!l ? '' : l.kind === 'photographer' ? FINISH_PROFILES[l.key].name : presetById(l.id)?.name || 'reference');
+const sameLook = (a, b) => !!a && !!b && a.kind === b.kind && (a.key || a.id) === (b.key || b.id);
+// photographer finish in effect for a photo: the photographer itself, or the one added on top of a reference
+const finishKeyOf = (p) => { const l = lookOf(p); if (!l) return 'off'; return l.kind === 'photographer' ? l.key : p.finish || presetById(l.id)?.finish || 'off'; };
+
+function setLook(l) {
+  S.look = l;
+  try { localStorage.setItem(LOOK_KEY, JSON.stringify(l)); } catch (e) { /* private mode */ }
+  if (l.kind === 'preset') { S.presetId = l.id; localStorage.setItem('lm_preset', l.id); }
+  const pr = l.kind === 'preset' ? presetById(l.id) : null;
+  for (const ph of S.photos) {
+    ph.look = null; ph.finish = undefined; ph.strength = pr ? pr.strength : 100;
+    if (['done', 'exported', 'ready'].includes(ph.status)) ph.status = 'ready';
+  }
+  if (S.photos.length === 1) S.autoOpen = true;
+  runQueue(); renderMatch();
+}
+
+// plain-words summary of a photographer's published work (medians of the measured set)
+function describePhotographer(key) {
+  const f = FINISH_PROFILES[key];
+  const s = profileSummary(f.data) || { p50: null, p1: f.p1, p99: f.p99, chroma: f.chroma, sh: f.sh, hi: f.hi };
+  const tone = (ab) => (!ab || ab[1] == null ? null : ab[1] > 5.5 ? 'warm' : ab[1] < 1.5 ? 'cool' : 'neutral');
+  const bits = [];
+  if (s.p50 != null) bits.push(s.p50 < 28 ? 'low-key' : s.p50 > 50 ? 'bright' : 'mid-key');
+  bits.push(s.p1 < 2.5 ? 'deep blacks' : s.p1 > 5.5 ? 'matte blacks' : 'firm blacks');
+  bits.push(s.p99 < 82 ? 'dim highlights' : s.p99 < 90 ? 'soft highlights' : 'clean whites');
+  bits.push(s.chroma < 12 ? 'muted colour' : s.chroma > 16 ? 'rich colour' : 'natural colour');
+  if (tone(s.sh)) bits.push(`${tone(s.sh)} shadows`);
+  if (tone(s.hi) && tone(s.hi) !== tone(s.sh)) bits.push(`${tone(s.hi)} highlights`);
+  if ((f.vignette || 0) <= -25) bits.push('vignette');
+  return { text: bits.join(' · '), s };
+}
+// three dots: the photographer's shadow, midtone and highlight colour (chroma doubled so it reads at dot size)
+function toneDots(s) {
+  const dot = (L, ab) => {
+    if (!ab || ab[0] == null) return '';
+    const o = [0, 0, 0]; labToLin(L, ab[0] * 2, ab[1] * 2, o);
+    const c = o.map((v) => Math.round(255 * linearToSrgb(Math.min(1, Math.max(0, v)))));
+    return `<i style="background:rgb(${c.join(',')})"></i>`;
+  };
+  return `<span class="dots">${dot(22, s.sh)}${dot(50, s.mid)}${dot(80, s.hi)}</span>`;
+}
+
+// ---------------------------------------------------------------- edit view: 1 photos, 2 style
 function statusLabel(p) {
   if (p.status === 'loading' && p.phase === 'heif') return 'converting HEIF';
-  return { loading: 'reading', ready: 'queued', solving: 'matching', done: 'matched', error: 'error', exporting: 'exporting', exported: 'exported' }[p.status] || p.status;
+  if (p.status === 'ready' && !lookOf(p)) return 'pick a style';
+  return { loading: 'reading', ready: 'queued', solving: 'styling', done: 'done', error: 'error', exporting: 'exporting', exported: 'exported' }[p.status] || p.status;
+}
+
+function photoTile(p) {
+  const busy = ['loading', 'solving', 'exporting'].includes(p.status);
+  const t = h(`<button class="tile" data-id="${p.id}">${p.thumbURL ? `<img src="${p.thumbURL}" alt="">` : ''}
+    ${busy ? '<div class="spin"></div>' : ''}${p.loss && p.loss.worst !== 'ok' && !busy ? `<span class="wbadge ${p.loss.worst}" title="${esc(p.loss.issues.map((i) => i.text).join(', '))}">!</span>` : ''}<span class="st ${p.status === 'done' || p.status === 'exported' ? 'done' : p.status === 'error' ? 'err' : ''}">${statusLabel(p)}</span></button>`);
+  t.onclick = () => {
+    if (p.params) return openDetail(p);
+    if (p.status !== 'error') { if (!lookOf(p)) $('#stepStyle')?.scrollIntoView({ behavior: 'smooth' }); return; }
+    const s = showProblem(`Couldn't use ${p.name}`, p.errRec || logError('photo', p.error, p.file), '<button class="danger" id="pRemove">Remove</button>');
+    $('#pRemove', s).onclick = () => { pool.call(p.worker, 'unload', { id: p.id }).catch(() => {}); S.photos = S.photos.filter((q) => q !== p); closeSheet(); renderMatch(); };
+  };
+  return t;
+}
+
+function photographerCards(current, onPick) {
+  const list = h('<div class="pcards"></div>');
+  for (const k of PHOTOGRAPHERS) {
+    const f = FINISH_PROFILES[k], { text, s } = describePhotographer(k);
+    const on = current && current.kind === 'photographer' && current.key === k;
+    const b = h(`<button class="pcard ${on ? 'on' : ''}"><div class="pc-top"><b>${esc(f.name)}</b>${toneDots(s)}</div>
+      <div class="pc-desc">${esc(text)}</div><div class="pc-src muted">${s.n || f.n} published photos · ${esc(f.source)}</div></button>`);
+    b.onclick = () => onPick({ kind: 'photographer', key: k });
+    list.append(b);
+  }
+  return list;
+}
+
+function referenceCards(current, onPick) {
+  const wrap = h('<div></div>');
+  if (S.presets.length) {
+    const list = h('<div class="rcards"></div>');
+    for (const pr of S.presets) {
+      const on = current && current.kind === 'preset' && current.id === pr.id;
+      const b = h(`<button class="rcard ${on ? 'on' : ''}"><img src="${pr.thumb}" alt=""><span>${esc(pr.name)}</span>${pr.lr ? '<em>Lightroom</em>' : ''}</button>`);
+      b.onclick = () => onPick({ kind: 'preset', id: pr.id });
+      list.append(b);
+    }
+    wrap.append(list);
+  } else {
+    wrap.append(h('<p class="muted small" style="margin:4px 0 10px">Pick a photo whose look you want. Each of your photos gets its own edit toward it.</p>'));
+  }
+  const acts = h(`<div class="row wrap"><button class="primary" data-a="ref">+ Reference photo</button><button data-a="lr">Import Lightroom preset</button>${S.presets.length ? '<button class="ghost" data-a="manage">Manage</button>' : ''}</div>`);
+  acts.onclick = (e) => {
+    const a = e.target.dataset.a;
+    if (a === 'ref') $('#pickRef').click();
+    if (a === 'lr') $('#pickLR').click();
+    if (a === 'manage') { closeDetailIfOpen(); setTab('presets'); }
+  };
+  wrap.append(acts);
+  return wrap;
 }
 
 function renderMatch() {
   const v = $('#view-match');
-  const pr = currentPreset();
+  if (!v) return;
   v.innerHTML = '';
-  if (!S.presets.length) {
-    v.append(h(`<div class="empty"><b>Make a preset first</b>Go to Presets and pick a reference photo.</div>`));
-    return;
-  }
-  const pick = h('<div class="pick-preset"></div>');
-  for (const p of S.presets) {
-    const b = h(`<button class="${p.id === S.presetId ? 'on' : ''}"><img src="${p.thumb}" alt="">${esc(p.name)}</button>`);
-    b.onclick = () => {
-      if (p.id === S.presetId) return;
-      S.presetId = p.id; localStorage.setItem('lm_preset', p.id);
-      for (const ph of S.photos) { ph.strength = p.strength; if (ph.status === 'done' || ph.status === 'exported') ph.status = 'ready'; }
-      renderMatch(); runQueue();
-    };
-    pick.append(b);
-  }
-  v.append(pick);
+  const look = lookValid(S.look) ? S.look : null;
+  const total = S.photos.length;
   const done = S.photos.filter((p) => p.status === 'done' || p.status === 'exported').length;
-  const bar = h(`<div class="bar">
-    <button class="primary" id="addPhotos">Add photos</button>
-    <div class="grow muted small">${S.photos.length ? `${done} of ${S.photos.length} matched to “${esc(pr?.name)}”` : ''}</div>
-    ${S.photos.length ? '<button id="exportAll">Export all</button><button class="ghost" id="clearAll">Clear</button>' : ''}
-  </div>`);
-  v.append(bar);
-  if (S.photos.length) v.append(h(`<div class="progress"><i style="width:${(done / S.photos.length) * 100}%"></i></div>`));
+
+  // 1. photos
+  const photos = h(`<section class="step"><div class="step-h"><span class="n">1</span><h2>Photos</h2><div class="grow"></div>
+    ${total ? '<button class="ghost small" id="clearAll">Clear</button>' : ''}</div></section>`);
+  if (!total) {
+    photos.append(h(`<button class="pickbig" id="addPhotos"><span class="plus">+</span><b>Select photos</b><span class="muted small">One or a batch · JPEG, HEIC, HIF</span></button>`));
+  } else {
+    const strip = h('<div class="strip"></div>');
+    strip.append(h('<button class="tile add" id="addPhotos" aria-label="Add photos"><span>+</span></button>'));
+    for (const p of S.photos) strip.append(photoTile(p));
+    photos.append(strip);
+    const line = !look ? 'Now pick a style below.'
+      : done < total ? `Styling like ${esc(lookName(look))}… ${done} of ${total}`
+        : `${total === 1 ? 'Done.' : `All ${total} done.`} Tap a photo to fine-tune, crop or export.`;
+    photos.append(h(`<p class="muted small step-note">${line}</p>`));
+    if (look && done < total) photos.append(h(`<div class="progress"><i style="width:${(done / total) * 100}%"></i></div>`));
+  }
+  v.append(photos);
   $('#addPhotos', v).onclick = () => $('#pickPhotos').click();
-  if ($('#exportAll', v)) $('#exportAll', v).onclick = () => exportPhotos(S.photos.filter((p) => p.params));
   if ($('#clearAll', v)) $('#clearAll', v).onclick = async () => {
     if (!(await confirmSheet('Clear all photos?', 'Unexported edits are lost. Originals are untouched.', 'Clear'))) return;
     for (const p of S.photos) pool.call(p.worker, 'unload', { id: p.id }).catch(() => {});
-    S.photos = []; renderMatch();
+    S.photos = []; renderMatch(); setTab('match');
   };
-  if (!S.photos.length) {
-    v.append(h(`<div class="empty"><b>Add photos to match</b>Each photo gets its own edit, solved from its own measurements.</div>`));
-    return;
-  }
-  const grid = h('<div class="grid"></div>');
-  for (const p of S.photos) {
-    const busy = ['loading', 'solving', 'exporting'].includes(p.status);
-    const t = h(`<button class="tile" data-id="${p.id}">${p.thumbURL ? `<img src="${p.thumbURL}" alt="">` : ''}
-      ${busy ? '<div class="spin"></div>' : ''}${p.loss && p.loss.worst !== 'ok' && !busy ? `<span class="wbadge ${p.loss.worst}" title="${esc(p.loss.issues.map((i) => i.text).join(', '))}">!</span>` : ''}<span class="st ${p.status === 'done' || p.status === 'exported' ? 'done' : p.status === 'error' ? 'err' : ''}">${statusLabel(p)}</span></button>`);
-    t.onclick = () => {
-      if (p.params) return openDetail(p);
-      if (p.status !== 'error') return;
-      const s = showProblem(`Couldn't use ${p.name}`, p.errRec || logError('photo', p.error, p.file), '<button class="danger" id="pRemove">Remove</button>');
-      $('#pRemove', s).onclick = () => { pool.call(p.worker, 'unload', { id: p.id }).catch(() => {}); S.photos = S.photos.filter((q) => q !== p); closeSheet(); renderMatch(); };
-    };
-    grid.append(t);
-  }
-  v.append(grid);
+
+  // 2. style
+  const kind = S.styleTab || look?.kind || 'photographer';
+  const style = h(`<section class="step ${total && !look ? 'attention' : ''}" id="stepStyle"><div class="step-h"><span class="n">2</span><h2>Style</h2>
+      <div class="grow"></div>${look ? `<span class="muted small">Using ${esc(lookName(look))}</span>` : ''}</div>
+    <div class="seg wide" id="styleSeg"><button data-k="photographer" class="${kind === 'photographer' ? 'on' : ''}">Photographer</button><button data-k="preset" class="${kind === 'preset' ? 'on' : ''}">Reference photo</button></div>
+    <p class="muted small step-note">${kind === 'photographer' ? 'What that photographer would do to each of your photos, read from the published shots most like each scene.' : 'Copy the look of one photo onto yours. Your saved references and Lightroom presets are here.'}</p>
+    </section>`);
+  const pick = (l) => { if (!sameLook(l, S.look)) setLook(l); };
+  style.append(kind === 'photographer' ? photographerCards(look, pick) : referenceCards(look, pick));
+  $('#styleSeg', style).onclick = (e) => { const k = e.target.dataset.k; if (!k) return; S.styleTab = k; renderMatch(); };
+  v.append(style);
+  setTopActions();
 }
 
 let renderQueued = false;
-function rerenderMatchSoon() { if (renderQueued) return; renderQueued = true; requestAnimationFrame(() => { renderQueued = false; if (S.tab === 'match') renderMatch(); }); }
+function rerenderMatchSoon() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    if (S.tab !== 'match') return;
+    // keep the page where it was: only the photo strip and status line change while styling
+    const y = window.scrollY, sx = $('#view-match .strip')?.scrollLeft || 0;
+    renderMatch();
+    window.scrollTo(0, y);
+    const st = $('#view-match .strip'); if (st) st.scrollLeft = sx;
+  });
+}
 
 async function addPhotos(files) {
-  const pr = currentPreset();
+  const look = lookValid(S.look) ? S.look : null;
+  const pr = look && look.kind === 'preset' ? presetById(look.id) : null;
+  if (!S.photos.length && files.length === 1) S.autoOpen = true;
   for (const file of files) {
     const p = { id: uid(), file, name: file.name || 'photo.jpg', status: 'loading', strength: pr ? pr.strength : 100, worker: pool.assign() };
     S.photos.push(p);
@@ -367,28 +484,53 @@ async function addPhotos(files) {
   setTab('match');
 }
 
+function solveArgs(p) {
+  const look = lookOf(p);
+  if (!look) return null;
+  const finishStrength = (p.finishStrength ?? 100) / 100;
+  if (look.kind === 'photographer') return { refStats: null, lrParams: {}, strength: 1, finish: look.key, finishStrength, pull: 0.25 };
+  const pr = presetById(look.id);
+  return { refStats: pr.stats, lrParams: pr.lr ? pr.lrParams : null, strength: p.strength / 100, finish: p.finish || pr.finish || 'off', finishStrength };
+}
+
 function solvePhoto(p, { priority = false } = {}) {
-  const pr = currentPreset();
-  if (!pr) return Promise.resolve();
-  p.status = 'solving'; p.presetId = pr.id; rerenderMatchSoon();
-  return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100, lrParams: pr.lr ? pr.lrParams : null, finish: p.finish || pr.finish || 'off', finishStrength: (p.finishStrength ?? 100) / 100 }, { priority }).then((r) => {
+  const args = solveArgs(p);
+  if (!args) return Promise.resolve();
+  const look = lookOf(p);
+  p.status = 'solving'; p.solvedLook = look; rerenderMatchSoon();
+  return pool.call(p.worker, 'solve', { id: p.id, ...args }, { priority }).then((r) => {
     Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, style: r.style, status: 'done' });
     rerenderMatchSoon();
+    // one photo in, style picked: go straight to the editor
+    if (S.autoOpen && S.photos.length === 1 && !D && S.tab === 'match') { S.autoOpen = false; openDetail(p); }
+    // restyled in the background while its editor is open (style changed for all photos)
+    else if (!priority && D && D.p === p && !D.crop) { D.userEdited = false; refreshDetail(); }
     return r;
-  }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('match photo', e, p.file); rerenderMatchSoon(); });
+  }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('style photo', e, p.file); rerenderMatchSoon(); });
 }
 
 function runQueue() {
-  for (const p of S.photos) if (p.status === 'ready') solvePhoto(p);
+  for (const p of S.photos) if (p.status === 'ready' && lookOf(p)) solvePhoto(p);
 }
 
 // ---------------------------------------------------------------- detail view
 let D = null; // active detail state
 
 function numbersTable(p) {
-  const pr = currentPreset();
+  const pr = presetOf(p);
   const b = p.before, a = p.after, T = p.targets, r = pr?.stats;
-  if (!b || !a || !T) return '';
+  if (!b || !a) return '';
+  if (!T) {
+    // photographer looks and Lightroom presets have no single reference to measure against
+    const st = p.style, row2 = (label, bv, av, tv = '') => `<tr><td>${label}</td><td>${bv}</td><td>${av}</td><td>${tv}</td></tr>`;
+    const newClip2 = (Math.max(0, a.tone.clipHi - b.tone.clipHi) * 100).toFixed(2) + ' / ' + (Math.max(0, a.tone.clipLo - b.tone.clipLo) * 100).toFixed(2);
+    return `<table class="nums"><tr><th></th><th>Before</th><th>After</th><th>${st ? 'Theirs' : ''}</th></tr>
+      ${row2('Median L*', f1(b.tone.pct[50]), f1(a.tone.pct[50]))}
+      ${row2('Black / white (p1 / p99)', `${f1(b.tone.pct[1])} / ${f1(b.tone.pct[99])}`, `${f1(a.tone.pct[1])} / ${f1(a.tone.pct[99])}`, st ? `${f1(st.target.p1)} / ${f1(st.target.p99)}` : '')}
+      ${row2('Mean chroma', f1(b.color.meanChroma), f1(a.color.meanChroma), st ? f1(st.target.chroma) : '')}
+      ${row2('Skin hue° (lit side)', b.skin.frac > 0.005 ? `${f1(b.skin.hue)} (${f1(b.skin.litHue)})` : 'n/a', a.skin.frac > 0.005 ? `${f1(a.skin.hue)} (${f1(a.skin.litHue)})` : 'n/a', '35–64')}
+      ${row2('New clipping hi / lo %', '–', newClip2, '≤ 0.10')}</table>`;
+  }
   const toneErr = (s) => PCTS.reduce((acc, q) => acc + Math.abs(s.tone.pct[q] - T.tone.pct[q]), 0) / PCTS.length;
   const wbErr = (s) => Math.hypot(s.wb.a - T.wb.a, s.wb.b - T.wb.b);
   const zs = Object.keys(T.zones);
@@ -499,12 +641,12 @@ const HUE_NAMES = [[12, 'red'], [28, 'red-orange'], [45, 'orange'], [58, 'amber'
 const hueName = (h) => { h = ((h % 360) + 360) % 360; return HUE_NAMES.find(([lim]) => h < lim)[1]; };
 const warmth = (h) => (h >= 10 && h < 70 ? 'warmer' : h >= 170 && h < 260 ? 'cooler' : null);
 
-function styleNote(p, pr) {
-  const key = p.finish || pr?.finish || 'off';
+function styleNote(p) {
+  const key = finishKeyOf(p);
   const f = FINISH_PROFILES[key];
-  if (!f || key === 'off') return '<p class="muted small" style="margin:6px 0 0">Pick a photographer to see what they would do to this photo. Their black point, highlight roll-off, colour grade, vignette and grain are read from their published work, from the shots most like this scene.</p>';
+  if (!f || key === 'off') return '';
   const st = p.style;
-  if (!st) return `<p class="muted small" style="margin:6px 0 0">Working out what ${esc(f.name)} would do…</p>`;
+  if (!st || p.status === 'solving') return `<p class="muted small" style="margin:8px 0 0">Working out what ${esc(f.name)} would do…</p>`;
   const li = [];
   if (st.blacks > 0) li.push(`Deepen blacks: darkest 1% from L* ${f1(st.start.p1)} to ${f1(st.after.p1)}`);
   else if (st.fade > 0.5) li.push(`Matte blacks: lift the darkest 1% to L* ${f1(st.after.p1)}`);
@@ -524,13 +666,81 @@ function styleNote(p, pr) {
   if (!li.length) li.push('Almost nothing: this photo already sits where their work does');
   const basis = st.basis === 'nearest'
     ? `From the ${st.k} of ${st.n} published ${esc(f.name)} photos whose scenes are closest to this one (${esc(f.source)}).`
-    : `From all ${st.n} published ${esc(f.name)} photos (${esc(f.source)}); no per-photo matching for them yet.`;
+    : `From all ${st.n} published ${esc(f.name)} photos (${esc(f.source)}).`;
   return `<div class="style"><div class="st-h">What ${esc(f.name)} would do here</div><ul>${li.map((t) => `<li>${esc(t)}</li>`).join('')}</ul><p class="muted small">${basis}</p></div>`;
+}
+
+const strengthRow = (id, label, v, max) => `<div class="strength"><span class="muted small slbl">${label}</span><input type="range" id="${id}" min="0" max="${max}" step="5" value="${v}"><output id="${id}Out">${v}%</output></div>`;
+
+// the editor's Style card: the same two choices as the main page, for this photo only
+function styleCard(p) {
+  const look = lookOf(p), kind = (D && D.styleKind) || look?.kind || 'photographer';
+  const pr = presetOf(p), fk = finishKeyOf(p);
+  let body;
+  if (kind === 'photographer') {
+    body = `<div class="chips-row" id="dPick">${PHOTOGRAPHERS.map((k) => `<button data-l="photographer:${k}" class="${look?.kind === 'photographer' && look.key === k ? 'on' : ''}">${esc(FINISH_PROFILES[k].name)}</button>`).join('')}</div>
+      ${look?.kind === 'photographer' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : '<p class="muted small" style="margin:8px 0 0">Pick one to restyle this photo.</p>'}`;
+  } else {
+    body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
+      ${pr ? `${strengthRow('str', 'Match', p.strength, 100)}
+        <div class="sub">Add a photographer's finish on top</div><div class="fin" id="fin">${finishButtons(p, pr)}</div>
+        ${fk !== 'off' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : ''}`
+    : '<p class="muted small" style="margin:8px 0 0">Pick a reference to copy its look onto this photo.</p>'}`;
+  }
+  const others = S.photos.length > 1;
+  return `<h3>Style</h3><div class="seg wide" id="dSeg"><button data-k="photographer" class="${kind === 'photographer' ? 'on' : ''}">Photographer</button><button data-k="preset" class="${kind === 'preset' ? 'on' : ''}">Reference photo</button></div>
+    ${body}${others && look ? '<div class="row" style="margin-top:10px"><button id="lookAll">Use this style on all photos</button></div>' : ''}`;
+}
+
+function renderStyleCard() {
+  if (!D) return;
+  const p = D.p, box = $('#styleCard');
+  box.innerHTML = styleCard(p);
+  const resolve = async () => {
+    p.style = null; renderStyleCard();
+    await solvePhoto(p, { priority: true });
+    if (!D || D.p !== p) return;
+    D.userEdited = false;
+    refreshDetail();
+  };
+  $('#dSeg', box).onclick = (e) => { const k = e.target.dataset.k; if (!k) return; D.styleKind = k; renderStyleCard(); };
+  $('#dPick', box).onclick = (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.a === 'ref') return $('#pickRef').click();
+    const [kind, id] = b.dataset.l.split(':');
+    const l = kind === 'photographer' ? { kind, key: id } : { kind, id };
+    if (sameLook(l, lookOf(p))) return;
+    p.look = l; p.finish = undefined;
+    if (kind === 'preset') p.strength = presetById(id)?.strength ?? 100;
+    resolve();
+  };
+  if ($('#fin', box)) $('#fin', box).onclick = (e) => { const k = e.target.closest('button')?.dataset.f; if (!k) return; p.finish = k; resolve(); };
+  for (const [id, key] of [['str', 'strength'], ['fstr', 'finishStrength']]) {
+    const r = $(`#${id}`, box);
+    if (!r) continue;
+    r.oninput = () => ($(`#${id}Out`, box).textContent = `${r.value}%`);
+    r.onchange = () => { p[key] = +r.value; resolve(); };
+  }
+  if ($('#lookAll', box)) $('#lookAll', box).onclick = () => {
+    const l = lookOf(p);
+    S.look = l;
+    try { localStorage.setItem(LOOK_KEY, JSON.stringify(l)); } catch (e) { /* private mode */ }
+    for (const ph of S.photos) {
+      if (ph === p) { ph.look = null; continue; }
+      Object.assign(ph, { look: null, finish: p.finish, finishStrength: p.finishStrength, strength: p.strength });
+      if (['done', 'exported', 'ready'].includes(ph.status)) ph.status = 'ready';
+    }
+    runQueue();
+    toast(`${lookName(l)} on all ${S.photos.length} photos`);
+  };
+  // reference thumbnail on the photo follows the look
+  const pr = presetOf(p), rt = $('#refthumb'), rl = $('#reflbl');
+  if (rt) { rt.hidden = !pr; rl.hidden = !pr; if (pr) rt.src = pr.thumb; }
 }
 
 // ---------------------------------------------------------------- detail view
 function openDetail(p) {
-  const pr = currentPreset();
   const el = $('#detail');
   el.hidden = false;
   el.classList.remove('cropping');
@@ -538,9 +748,9 @@ function openDetail(p) {
   el.innerHTML = `<div class="dtop">
       <div class="dhead"><button class="ghost" id="dBack">‹ Back</button><div class="nm">${esc(p.name)}</div><button class="primary" id="dExport">Export</button></div>
       <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
-        ${pr ? `<img class="refthumb" id="refthumb" src="${pr.thumb}" alt="reference"><span class="reflbl" id="reflbl">ref</span>` : ''}</div>
+        <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span></div>
       <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
-        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn">Crop</button><div class="grow"></div><button id="reMatch">Re-match</button></div>
+        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><div class="grow"></div><button id="reMatch">Redo</button></div>
       <div class="cropbar" id="cropbar" hidden>
         <div class="aspects" id="aspects"><button data-a="free">Free</button><button data-a="orig">Original</button><button data-a="1">1:1</button><button data-a="0.8">4:5</button><button data-a="1.5">3:2</button><button data-a="1.7778">16:9</button><button data-a="flip" aria-label="Swap width and height">⇄</button></div>
         <div class="level"><label for="lvl">Level</label><input type="range" id="lvl" min="-45" max="45" step="0.1" value="0"><output id="lvlOut">0.0°</output><button id="lvlAuto">Auto</button></div>
@@ -550,17 +760,12 @@ function openDetail(p) {
     </div>
     <div id="dspace"></div>
     <div class="dbody" id="dbody">
-      <div class="card"><h3>Finishing touch</h3><div class="fin" id="fin">${finishButtons(p, pr)}</div>
-        <div id="finNote">${styleNote(p, pr)}</div>
-        <div class="strength" style="margin-top:10px"><span class="muted small">Style</span><input type="range" id="fstr" min="0" max="150" step="5" value="${p.finishStrength ?? 100}"><output id="fstrOut">${p.finishStrength ?? 100}%</output></div>
-        <div class="row" style="margin-top:8px"><button id="finAll">Use on all photos</button></div></div>
+      <div class="card" id="styleCard"></div>
       <div class="card"><h3>Color grading</h3><div id="grade">${gradeCard(p)}</div></div>
       <div class="card" id="sliders">${sliderGroups(p)}</div>
-      <div class="card"><h3>Match strength</h3><div class="strength"><input type="range" id="str" min="0" max="100" step="1" value="${p.strength}"><output id="strOut">${p.strength}%</output></div>
-        <p class="muted small" style="margin:6px 0 0">Changing strength re-solves this photo. Preset default: ${pr?.strength ?? 100}%.</p></div>
       <div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div>
     </div>`;
-  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null };
+  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null };
   el.scrollTop = 0;
   $('#dBack').onclick = closeDetail;
   $('#dExport').onclick = () => exportPhotos([p]);
@@ -568,41 +773,12 @@ function openDetail(p) {
   $('#clipBtn').onclick = () => setOverlay(!D.overlay);
   $('#cropBtn').onclick = () => enterCrop();
   $('#reMatch').onclick = async () => {
-    $('#reMatch').disabled = true; $('#reMatch').textContent = 'Matching…';
+    $('#reMatch').disabled = true; $('#reMatch').textContent = 'Working…';
     await solvePhoto(p, { priority: true });
     D && (D.userEdited = false);
-    refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Re-match';
+    refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Redo';
   };
-  const str = $('#str');
-  str.oninput = () => ($('#strOut').textContent = `${str.value}%`);
-  str.onchange = async () => {
-    p.strength = +str.value;
-    $('#reMatch').disabled = true;
-    await solvePhoto(p, { priority: true });
-    refreshDetail(); $('#reMatch').disabled = false;
-  };
-  $('#fin').onclick = async (e) => {
-    const k = e.target.closest('button')?.dataset.f;
-    if (!k || D?.p !== p) return;
-    p.finish = k; p.style = null;
-    $('#fin').innerHTML = finishButtons(p, pr); $('#finNote').innerHTML = styleNote(p, pr);
-    await solvePhoto(p, { priority: true });
-    refreshDetail();
-  };
-  const fstr = $('#fstr');
-  fstr.oninput = () => ($('#fstrOut').textContent = `${fstr.value}%`);
-  fstr.onchange = async () => {
-    p.finishStrength = +fstr.value;
-    if ((p.finish || pr?.finish || 'off') === 'off') return;
-    await solvePhoto(p, { priority: true });
-    refreshDetail();
-  };
-  $('#finAll').onclick = () => {
-    const k = p.finish || pr?.finish || 'off';
-    for (const ph of S.photos) if (ph !== p) { ph.finish = k; ph.finishStrength = p.finishStrength; if (ph.status === 'done' || ph.status === 'exported') ph.status = 'ready'; }
-    runQueue();
-    toast(`${FINISH_PROFILES[k].name} on all photos`);
-  };
+  renderStyleCard();
   bindCropBar();
   bindSliders();
   bindWheels();
@@ -703,8 +879,7 @@ function scheduleMeasure(delay = 350) {
 function refreshDetail() {
   if (!D) return;
   $('#nums').innerHTML = numbersTable(D.p);
-  const prD = S.presets.find((q) => q.id === D.p.presetId) || currentPreset();
-  if ($('#fin')) { $('#fin').innerHTML = finishButtons(D.p, prD); $('#finNote').innerHTML = styleNote(D.p, prD); }
+  renderStyleCard();
   const open = [...document.querySelectorAll('#sliders details')].map((d) => d.open);
   $('#sliders').innerHTML = sliderGroups(D.p);
   [...document.querySelectorAll('#sliders details')].forEach((d, i) => (d.open = open[i]));
@@ -918,14 +1093,14 @@ function bindCropBar() {
     D.orig = null;
     requestPreview(true);
     if (!D.userEdited) {
-      $('#reMatch').disabled = true; $('#reMatch').textContent = 'Matching…';
+      $('#reMatch').disabled = true; $('#reMatch').textContent = 'Working…';
       await solvePhoto(p, { priority: true });
       if (!D || D.p !== p) return;
-      refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Re-match';
+      refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Redo';
     } else {
       $('#nums').innerHTML = numbersTable(p);
       scheduleMeasure(0);
-      toast('Cropped. Your slider changes are kept; tap Re-match to fit the look to the crop.', 4500);
+      toast('Cropped. Your slider changes are kept; tap Redo to fit the style to the crop.', 4500);
     }
   };
 }
@@ -1060,7 +1235,7 @@ async function exportPhotos(list) {
     if (ok) drive.connect(S.settings.clientId);
     return;
   }
-  const pr = currentPreset();
+  const pr = { name: lookName(list.length === 1 ? lookOf(list[0]) : S.look) || 'look' };
   const sheet = openSheet(`<h2>Exporting ${list.length} photo${list.length > 1 ? 's' : ''}</h2><p id="expStatus" class="muted">Starting…</p>
     <div class="progress"><i id="expBar"></i></div><div id="expActs" class="acts"><button class="ghost" id="expCancel">Stop</button></div>`, { dismissable: false });
   let cancelled = false;
@@ -1228,18 +1403,27 @@ function confirmSheet(title, body, okLabel = 'OK') {
 }
 
 // ---------------------------------------------------------------- tabs + boot
+function setTopActions() {
+  const ta = $('#topActions');
+  ta.innerHTML = '';
+  if (S.tab === 'presets') {
+    const b = h('<button class="primary">+ Reference</button>'); b.onclick = () => $('#pickRef').click();
+    const l = h('<button>Import LR</button>'); l.onclick = () => $('#pickLR').click();
+    ta.append(l, b);
+  }
+  if (S.tab === 'match' && S.photos.some((p) => p.params)) {
+    const n = S.photos.filter((p) => p.params).length;
+    const b = h(`<button class="primary">Export${n > 1 ? ` all ${n}` : ''}</button>`); b.onclick = () => exportPhotos(S.photos.filter((p) => p.params));
+    ta.append(b);
+  }
+}
+
 function setTab(t) {
   S.tab = t;
   document.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === t));
   for (const k of ['presets', 'match', 'settings']) $(`#view-${k}`).hidden = k !== t;
-  $('#title').textContent = { presets: 'Presets', match: 'Match', settings: 'Settings' }[t];
-  const ta = $('#topActions');
-  ta.innerHTML = '';
-  if (t === 'presets') {
-    const b = h('<button class="primary">+ New</button>'); b.onclick = () => $('#pickRef').click();
-    const l = h('<button>Import LR</button>'); l.onclick = () => $('#pickLR').click();
-    ta.append(l, b);
-  }
+  $('#title').textContent = { presets: 'References', match: 'LookMatch', settings: 'Settings' }[t];
+  setTopActions();
   if (t === 'presets') renderPresets();
   if (t === 'match') renderMatch();
   if (t === 'settings') renderSettings();
@@ -1256,7 +1440,7 @@ $('#pickPhotos').onchange = (e) => { const fs = [...e.target.files]; e.target.va
   await loadPresets();
   if (r?.ok) { toast('Google Drive connected'); setTab('match'); for (const p of S.presets) if (!p.driveId) backupPreset(p); }
   else if (r?.error) { toast(`Drive sign-in failed: ${r.error}`); setTab('settings'); }
-  else setTab(S.presets.length ? 'match' : 'presets');
+  else setTab('match');
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
 })();
 

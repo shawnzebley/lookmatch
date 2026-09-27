@@ -76,3 +76,17 @@ export function nearestTargets(data, sig, { color = true, k = null } = {}) {
   out.vigMedian = vs.length ? vs[Math.floor(vs.length / 2)] : null;
   return out;
 }
+
+/** Medians of a photographer's published set (colour images for colour fields), for describing the look. */
+export function profileSummary(data) {
+  if (!data || !data.rows || !data.rows.length) return null;
+  const S = SIG_FIELDS.length, T = (f) => S + TARGET_FIELDS.indexOf(f);
+  const col = data.rows.filter((r) => !r[T('bw')]);
+  const med = (rows, i) => { const v = rows.map((r) => r[i]).filter((x) => x != null).sort((a, b) => a - b); return v.length ? v[Math.floor(v.length / 2)] : null; };
+  return {
+    n: data.rows.length, bw: data.rows.length - col.length,
+    p50: med(data.rows, SIG_FIELDS.indexOf('p50')), p1: med(data.rows, T('p1')), p99: med(data.rows, T('p99')), chroma: med(col, T('chroma')),
+    sh: [med(col, T('shA')), med(col, T('shB'))], mid: [med(col, T('midA')), med(col, T('midB'))], hi: [med(col, T('hiA')), med(col, T('hiB'))],
+    vig: med(data.rows, T('vig')),
+  };
+}

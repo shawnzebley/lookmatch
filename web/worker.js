@@ -238,11 +238,11 @@ const handlers = {
     return autoLevel(gray, d.width, d.height);
   },
 
-  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1 }) {
+  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5 }) {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
     const res = lrParams
-      ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene })
+      ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene, pull })
       : solve(e.ps, o, refStats, { strength, scene: e.scene });
     let style = null;
     if (finish && finish !== 'off' && FINISH_PROFILES[finish]) {

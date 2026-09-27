@@ -18,7 +18,6 @@ await page.setInputFiles('#pickRef', 'testdata/in/kodim23.png');
 await page.waitForSelector('#npSave:not([disabled])', { timeout: 60000 });
 await page.click('#npSave');
 await page.waitForTimeout(300);
-await page.click('.preset [data-a=use]');
 
 const files = ['DSCF0001.HIF', 'IMG_0002.HEIC', 'big24.jpg', 'kodim05.png'].map((f) => 'testdata/in/' + f);
 const t0 = Date.now();
@@ -29,9 +28,10 @@ console.log(await page.evaluate(() => window.__lm.S.photos.map((p) => `${p.name}
 await page.screenshot({ path: `${shots}/01_grid.png` });
 
 // detail of the HIF, pick Cvatik
-await page.click('.tile');
+await page.waitForFunction(() => document.querySelector('#detail').hidden === false || true); if (await page.$eval('#detail', (e) => e.hidden)) await page.click('.strip .tile:not(.add)');
 await page.waitForFunction(() => document.querySelector('#cv')?.width > 0, null, { timeout: 30000 });
-await page.click('#fin button[data-f=cvatik]');
+await page.click('#dSeg button[data-k=photographer]');
+await page.click('#dPick button[data-l="photographer:cvatik"]');
 await page.waitForFunction(() => window.__lm.S.photos[0].style, null, { timeout: 60000 });
 await page.waitForTimeout(800);
 console.log('style:', JSON.stringify(await page.evaluate(() => { const s = window.__lm.S.photos[0].style; return { basis: s.basis, k: s.k, n: s.n, wheels: s.wheels, sat: s.sat, blacks: s.blacks, vig: s.vignette }; })));
