@@ -1,5 +1,5 @@
 // Network-first cache so the app opens offline but always picks up new versions.
-const C = 'lookmatch-v7';
+const C = 'lookmatch-v8';
 self.addEventListener('install', (e) => self.skipWaiting());
 self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', (e) => {

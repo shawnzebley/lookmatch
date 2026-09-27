@@ -8,7 +8,9 @@ export const SIG_FIELDS = ['p50', 'spread', 'warm', 'yellow', 'green', 'blue', '
 const SIG_SCALE = [15, 20, 0.12, 0.08, 0.12, 0.12, 0.06, 0.2, 12, 0.06];
 const SIG_WEIGHT = [1.2, 0.8, 1, 0.8, 1, 1, 0.6, 0.8, 0.7, 1.4];
 
-export const TARGET_FIELDS = ['p1', 'p99', 'chroma', 'shA', 'shB', 'midA', 'midB', 'hiA', 'hiB', 'vig', 'bw'];
+// r*: subject vs background (tools/style_records.py): subject share of the frame, L* separation,
+// tint difference (a*, b*), ln chroma ratio. Null when the photo has no usable split.
+export const TARGET_FIELDS = ['p1', 'p99', 'chroma', 'shA', 'shB', 'midA', 'midB', 'hiA', 'hiB', 'vig', 'bw', 'rFrac', 'rSep', 'rDA', 'rDB', 'rLogC'];
 
 const deg = (a, b) => { let h = (Math.atan2(b, a) * 180) / Math.PI; return h < 0 ? h + 360 : h; };
 
@@ -38,12 +40,15 @@ export function signature(L, A, B, width, height) {
  * Weighted targets from the k published photos nearest to `sig`.
  * data: { rows: [[...SIG_FIELDS, ...TARGET_FIELDS]] }. Returns null if there is no data.
  */
-export function nearestTargets(data, sig, { color = true, k = null } = {}) {
+export function nearestTargets(data, sig, { color = true, k = null, need = null } = {}) {
   if (!data || !data.rows || data.rows.length < 8) return null;
   const S = SIG_FIELDS.length;
   const bwI = S + TARGET_FIELDS.indexOf('bw');
-  let rows = data.rows.filter((r) => (color ? !r[bwI] : true));
-  if (rows.length < 6) rows = data.rows;
+  let all = data.rows;
+  // only published photos that have this measurement (e.g. a subject/background split)
+  if (need) { const nI = S + TARGET_FIELDS.indexOf(need); all = all.filter((r) => r[nI] != null); if (all.length < 6) return null; }
+  let rows = all.filter((r) => (color ? !r[bwI] : true));
+  if (rows.length < 6) rows = all;
   const d = rows.map((r) => {
     let s = 0;
     for (let j = 0; j < S; j++) { const z = (r[j] - sig[j]) / SIG_SCALE[j]; s += SIG_WEIGHT[j] * z * z; }
@@ -77,6 +82,13 @@ export function nearestTargets(data, sig, { color = true, k = null } = {}) {
   return out;
 }
 
+/** How the photographer's subjects sit against their backgrounds in the published photos most like this one. */
+export function nearestRegions(data, sig, color = true) {
+  const t = nearestTargets(data, sig, { color, need: 'rSep' });
+  if (!t) return null;
+  return { sep: t.rSep, dA: t.rDA, dB: t.rDB, logC: t.rLogC, k: t.k, n: t.n };
+}
+
 /** Medians of a photographer's published set (colour images for colour fields), for describing the look. */
 export function profileSummary(data) {
   if (!data || !data.rows || !data.rows.length) return null;
@@ -88,5 +100,7 @@ export function profileSummary(data) {
     p50: med(data.rows, SIG_FIELDS.indexOf('p50')), p1: med(data.rows, T('p1')), p99: med(data.rows, T('p99')), chroma: med(col, T('chroma')),
     sh: [med(col, T('shA')), med(col, T('shB'))], mid: [med(col, T('midA')), med(col, T('midB'))], hi: [med(col, T('hiA')), med(col, T('hiB'))],
     vig: med(data.rows, T('vig')),
+    // subject vs background, colour photos with a person in them
+    sep: med(col.filter((r) => r[T('rSep')] != null), T('rSep')), logC: med(col.filter((r) => r[T('rLogC')] != null), T('rLogC')),
   };
 }

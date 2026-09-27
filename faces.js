@@ -1,7 +1,8 @@
 // Face outlines with MediaPipe Face Landmarker (Apache-2.0). Runs inside the engine worker.
 // The model is tuned for faces that fill a good part of the frame, so when the whole-image pass finds
 // nothing, it retries on overlapping zoomed-in tiles to catch small faces in full-body and group shots.
-import { FilesetResolver, FaceLandmarker } from './vendor/mediapipe/vision_bundle.mjs';
+import { FaceLandmarker } from './vendor/mediapipe/vision_bundle.mjs';
+import { createTask } from './mp.js';
 
 // face silhouette, in order around the face (MediaPipe face mesh indices)
 const OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
@@ -10,8 +11,7 @@ let lmP = null;
 function landmarker() {
   if (!lmP) {
     lmP = (async () => {
-      const files = await FilesetResolver.forVisionTasks(new URL('./vendor/mediapipe/wasm', import.meta.url).href, true);
-      return FaceLandmarker.createFromOptions(files, {
+      return createTask(FaceLandmarker, {
         baseOptions: { modelAssetPath: new URL('./models/face_landmarker.task', import.meta.url).href, delegate: 'CPU' },
         runningMode: 'IMAGE', numFaces: 8, minFaceDetectionConfidence: 0.45, minFacePresenceConfidence: 0.45,
       });

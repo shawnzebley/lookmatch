@@ -2,8 +2,8 @@
 // mode 'sliders': Basic-panel sliders + fade points in the point curve (editable, approximate).
 // mode 'curve'  : the whole tone map baked into ToneCurvePV2012 (closer match, Basic tone sliders at 0).
 
-import { SLIDERS, toneMapL, fadeLevels, isIdentityCurve } from './pipeline.js';
-import { srgbToLinear, linearToSrgb, yToL, lToY } from './color.js';
+import { SLIDERS, toneMapL, fadeLevels, isIdentityCurve, localActive, REGIONS } from './pipeline.js';
+import { srgbToLinear, linearToSrgb, yToL, lToY, wheelHueToAB, abToWheelHue } from './color.js';
 import { BANDS } from './measure.js';
 
 const r0 = (v) => Math.round(v);
@@ -72,6 +72,53 @@ export function crsSettings(p, mode = 'sliders') {
   return { attrs: a, curve: curvePoints(p, mode), curveR: ch('curveR'), curveG: ch('curveG'), curveB: ch('curveB') };
 }
 
+// Subject / background amounts as Lightroom masks: an AI "Select Subject" mask (MaskSubType 1), inverted for
+// the background, so Lightroom finds the subject again on its side. Local values are -1..1 (exposure: stops / 4).
+// Lightroom masks have no vibrance (folded into saturation) and one colour swatch instead of three wheels.
+// Not yet checked against Lightroom itself.
+const LOCAL_CRS = { exposure: ['LocalExposure2012', 4], contrast: ['LocalContrast2012', 100], highlights: ['LocalHighlights2012', 100], shadows: ['LocalShadows2012', 100],
+  whites: ['LocalWhites2012', 100], blacks: ['LocalBlacks2012', 100], temp: ['LocalTemperature', 100], tint: ['LocalTint', 100], saturation: ['LocalSaturation', 100] };
+const guid = () => `{${(globalThis.crypto?.randomUUID?.() || '00000000-0000-4000-8000-' + Date.now().toString(16).padStart(12, '0')).toUpperCase()}}`;
+const f6 = (v) => (+v).toFixed(6);
+export function maskCorrections(p) {
+  if (!p.local) return '';
+  const items = [];
+  for (const r of REGIONS) {
+    const loc = p.local[r];
+    if (!localActive(loc)) continue;
+    const at = { What: 'Correction', CorrectionAmount: f6(1), CorrectionActive: 'true', CorrectionName: r === 'subject' ? 'LookMatch subject' : 'LookMatch background', CorrectionSyncID: guid() };
+    for (const [k, [name, div]] of Object.entries(LOCAL_CRS)) at[name] = f6(Math.max(-1, Math.min(1, (loc[k] || 0) / div)));
+    if (loc.vibrance) at.LocalSaturation = f6(Math.max(-1, Math.min(1, (loc.saturation || 0) / 100 + 0.6 * loc.vibrance / 100)));
+    // three local wheels -> one colour swatch (midtones count most)
+    let a = 0, b = 0;
+    for (const [z, w] of [['shadow', 0.3], ['midtone', 0.5], ['highlight', 0.2]]) { const sat = loc[`${z}Sat`] || 0; if (sat) { const [u, v] = wheelHueToAB(loc[`${z}Hue`] || 0); a += w * u * sat; b += w * v * sat; } }
+    const sat = Math.min(100, Math.hypot(a, b) / 0.5);
+    at.LocalToningHue = f6(sat > 0.5 ? abToWheelHue(a, b) : 0); at.LocalToningSaturation = f6(sat / 100);
+    const attrs = Object.entries(at).map(([k, v]) => `       crs:${k}="${v}"`).join('\n');
+    items.push(`     <rdf:li>
+      <rdf:Description
+${attrs}>
+      <crs:CorrectionMasks>
+       <rdf:Seq>
+        <rdf:li
+         crs:What="Mask/Image"
+         crs:MaskActive="true"
+         crs:MaskName="Subject"
+         crs:MaskBlendMode="0"
+         crs:MaskInverted="${r === 'background'}"
+         crs:MaskSyncID="${guid()}"
+         crs:MaskValue="1.000000"
+         crs:MaskSubType="1"
+         crs:ReferencePoint="0.500000 0.500000"/>
+       </rdf:Seq>
+      </crs:CorrectionMasks>
+      </rdf:Description>
+     </rdf:li>`);
+  }
+  if (!items.length) return '';
+  return `   <crs:MaskGroupBasedCorrections>\n    <rdf:Seq>\n${items.join('\n')}\n    </rdf:Seq>\n   </crs:MaskGroupBasedCorrections>\n`;
+}
+
 function seq(tag, pts) {
   return `   <crs:${tag}>\n    <rdf:Seq>\n${pts.map(([x, y]) => `     <rdf:li>${x}, ${y}</rdf:li>`).join('\n')}\n    </rdf:Seq>\n   </crs:${tag}>`;
 }
@@ -92,7 +139,7 @@ ${seq('ToneCurvePV2012', curve)}
 ${seq('ToneCurvePV2012Red', curveR)}
 ${seq('ToneCurvePV2012Green', curveG)}
 ${seq('ToneCurvePV2012Blue', curveB)}
-  </rdf:Description>
+${maskCorrections(p)}  </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>
 <?xpacket end="w"?>`;
@@ -131,7 +178,7 @@ ${seq('ToneCurvePV2012', curve)}
 ${seq('ToneCurvePV2012Red', curveR)}
 ${seq('ToneCurvePV2012Green', curveG)}
 ${seq('ToneCurvePV2012Blue', curveB)}
-  </rdf:Description>
+${maskCorrections(p)}  </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>
 `;
