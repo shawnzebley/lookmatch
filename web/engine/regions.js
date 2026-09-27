@@ -13,6 +13,12 @@ import { counts } from './loss.js';
 // STEP of each relation per photo (a photographer's subject mask is a nudge, not a relight).
 export const REGION_MOVE = 0.4;
 const STEP = { sep: 6, dA: 3, dB: 3, logC: 0.22 };
+// A reference photo is the look Shawn asked for, so its warm-subject / cool-background split is copied
+// further than a photographer's averages. Darkening or dulling the subject against its background is
+// still mostly the reference's own scene (Pepsi: a bright cyan backdrop behind the model), so those
+// barely move, and cooling the subject against its background (dark clothes on a warm grey wall read as a
+// cool subject) goes a quarter as far.
+export const REF_REGION = { move: 0.65, step: { sep: 6, dA: 9, dB: 9, logC: 0.3 }, darken: 0.1, dull: 0.1, cool: 0.25 };
 const KEYS = ['exposure', 'temp', 'tint', 'saturation'];
 const CAP = { exposure: 0.5, temp: 25, tint: 20, saturation: 30 };
 const SCALE = { exposure: 0.5, temp: 30, tint: 30, saturation: 30 };
@@ -39,16 +45,17 @@ function skinStats(ps, cur, idx) {
  * Targets for this photo from a set of relations: want = { sep, dA, dB, logC } (a reference's, or a
  * photographer's similar published photos). move scales how far toward them this photo goes.
  */
-export function regionTargets(now, want, move = REGION_MOVE) {
+export function regionTargets(now, want, move = REGION_MOVE, { step = STEP, darken = 0.35, dull = 0.5, cool = 1 } = {}) {
   if (!now || !want) return null;
   // Pulling the subject back into its background (darker, or duller than it) is the rarer edit, and
   // usually the scene's own light rather than a choice, so those moves go a third / half as far.
   const t = (k) => {
     if (want[k] == null || Number.isNaN(want[k])) return now[k];
     let d = (want[k] - now[k]) * move;
-    if (d < 0 && k === 'sep') d *= 0.35;
-    if (d < 0 && k === 'logC') d *= 0.5;
-    return now[k] + Math.max(-STEP[k], Math.min(STEP[k], d));
+    if (d < 0 && k === 'sep') d *= darken;
+    if (d < 0 && k === 'logC') d *= dull;
+    if (d < 0 && (k === 'dA' || k === 'dB')) d *= cool;
+    return now[k] + Math.max(-step[k], Math.min(step[k], d));
   };
   return { sep: t('sep'), dA: t('dA'), dB: t('dB'), logC: t('logC'), move, want };
 }
@@ -58,7 +65,7 @@ export function regionTargets(now, want, move = REGION_MOVE) {
  * params.local, which is replaced). want: { sep, dA, dB, logC }. Returns { params, regions } or null
  * when the photo has no usable subject/background split.
  */
-export function fitRegions(ps, params, want, { move = REGION_MOVE, idx = null } = {}) {
+export function fitRegions(ps, params, want, { move = REGION_MOVE, idx = null, step = STEP, darken = 0.35, dull = 0.5, cool = 1 } = {}) {
   if (!ps.subject || !want) return null;
   idx = idx || sampleIdx(ps.n);
   const n = ps.n;
@@ -67,7 +74,7 @@ export function fitRegions(ps, params, want, { move = REGION_MOVE, idx = null } 
   delete base.local;
   const st0 = regionStats(ps, processPixelSet(ps, base, idx, cur), idx);
   if (!regionUsable(st0)) return null;
-  const T = regionTargets(st0, want, move);
+  const T = regionTargets(st0, want, move, { step, darken, dull, cool });
   const clip0 = counts(ps, cur, idx);
   const skin0 = skinStats(ps, cur, idx);
   const f = st0.frac;

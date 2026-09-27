@@ -2,7 +2,7 @@
 import { prepare, measure, regionStats, regionUsable } from './engine/measure.js';
 import { solve, solvePreset } from './engine/solver.js';
 import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
-import { fitRegions, REGION_MOVE } from './engine/regions.js';
+import { fitRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
 import { signature, nearestRegions } from './engine/style.js';
 import { buildLUTs, applyLUTs, applyFinish, hasSpatialFinish, hasLocal, processPixelSet, SLIDERS, LOCAL_SLIDERS, REGIONS } from './engine/pipeline.js';
 import { lossReport, culprits } from './engine/loss.js';
@@ -373,10 +373,10 @@ const handlers = {
         move *= Math.min(1.5, finishStrength); from = want ? { kind: 'photographer', name: prof.name, k: want.k, n: want.n } : null;
       }
       if (!want && refStats && regionUsable(refStats.regions)) {
-        want = refStats.regions; move *= Math.min(1, strength); from = { kind: 'reference' };
+        want = refStats.regions; move = REF_REGION.move * Math.min(1, strength); from = { kind: 'reference' };
       }
       if (want && move > 0) {
-        const r = fitRegions(e.ps, res.params, want, { move });
+        const r = fitRegions(e.ps, res.params, want, from && from.kind === 'reference' ? { ...REF_REGION, move } : { move });
         if (r) { res.params = r.params; regions = { ...r.regions, from }; }
       }
     }
