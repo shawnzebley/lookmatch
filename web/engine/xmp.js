@@ -2,7 +2,7 @@
 // mode 'sliders': Basic-panel sliders + fade points in the point curve (editable, approximate).
 // mode 'curve'  : the whole tone map baked into ToneCurvePV2012 (closer match, Basic tone sliders at 0).
 
-import { SLIDERS, toneMapL, fadeLevels } from './pipeline.js';
+import { SLIDERS, toneMapL, fadeLevels, isIdentityCurve } from './pipeline.js';
 import { srgbToLinear, linearToSrgb, yToL, lToY } from './color.js';
 import { BANDS } from './measure.js';
 
@@ -19,6 +19,8 @@ function curvePoints(p, mode) {
       const y = 255 * linearToSrgb(lToY(toneMapL(L, q)));
       pts.push([x, Math.round(y)]);
     }
+  } else if (!isIdentityCurve(p.curve) && !p.fadeBlacks && !p.fadeWhites) {
+    pts.push(...p.curve);
   } else {
     const fl = fadeLevels(p);
     const lo = Math.round(255 * linearToSrgb(lToY(fl.lo * 100)));
@@ -60,9 +62,12 @@ export function crsSettings(p, mode = 'sliders') {
     SplitToningBalance: r0(p.gradeBalance),
     ColorGradeMidtoneHue: r0(p.midtoneHue), ColorGradeMidtoneSat: r0(p.midtoneSat),
     ColorGradeShadowLum: 0, ColorGradeMidtoneLum: 0, ColorGradeHighlightLum: 0,
+    RedHue: r0(p.calRedHue || 0), RedSaturation: r0(p.calRedSat || 0), GreenHue: r0(p.calGreenHue || 0), GreenSaturation: r0(p.calGreenSat || 0),
+    BlueHue: r0(p.calBlueHue || 0), BlueSaturation: r0(p.calBlueSat || 0), ShadowTint: r0(p.calShadowTint || 0),
     ColorGradeBlending: 50, ColorGradeGlobalHue: 0, ColorGradeGlobalSat: 0, ColorGradeGlobalLum: 0,
   });
-  return { attrs: a, curve: curvePoints(p, mode) };
+  const ch = (k) => (isIdentityCurve(p[k]) ? [[0, 0], [255, 255]] : p[k]);
+  return { attrs: a, curve: curvePoints(p, mode), curveR: ch('curveR'), curveG: ch('curveG'), curveB: ch('curveB') };
 }
 
 function seq(tag, pts) {
@@ -72,9 +77,8 @@ const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replac
 
 // XMP packet to embed in a JPEG (Lightroom reads embedded XMP on import for JPEG/HEIC/TIFF)
 export function xmpPacket(p, mode = 'sliders') {
-  const { attrs, curve } = crsSettings(p, mode);
+  const { attrs, curve, curveR, curveG, curveB } = crsSettings(p, mode);
   const at = Object.entries(attrs).map(([k, v]) => `   crs:${k}="${esc(v)}"`).join('\n');
-  const ident = [[0, 0], [255, 255]];
   return `<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="LookMatch">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -82,9 +86,9 @@ export function xmpPacket(p, mode = 'sliders') {
    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
 ${at}>
 ${seq('ToneCurvePV2012', curve)}
-${seq('ToneCurvePV2012Red', ident)}
-${seq('ToneCurvePV2012Green', ident)}
-${seq('ToneCurvePV2012Blue', ident)}
+${seq('ToneCurvePV2012Red', curveR)}
+${seq('ToneCurvePV2012Green', curveG)}
+${seq('ToneCurvePV2012Blue', curveB)}
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>
@@ -94,7 +98,7 @@ ${seq('ToneCurvePV2012Blue', ident)}
 // A Lightroom develop preset (.xmp) holding this photo's computed settings. Import it in
 // Lightroom (mobile: Presets > ... > Import Presets; Classic: Develop > Presets > Import) and apply to the original.
 export function xmpPreset(p, name, mode = 'sliders') {
-  const { attrs, curve } = crsSettings(p, mode);
+  const { attrs, curve, curveR, curveG, curveB } = crsSettings(p, mode);
   const uuid = (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`).replace(/-/g, '').toUpperCase().slice(0, 32);
   const head = {
     PresetType: 'Normal', Cluster: '', UUID: uuid, SupportsAmount: 'False', SupportsColor: 'True', SupportsMonochrome: 'False',
@@ -104,7 +108,6 @@ export function xmpPreset(p, name, mode = 'sliders') {
   const all = { ...head, ...attrs };
   delete all.WhiteBalance;
   const at = Object.entries(all).map(([k, v]) => `   crs:${k}="${esc(v)}"`).join('\n');
-  const ident = [[0, 0], [255, 255]];
   return `<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="LookMatch">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
   <rdf:Description rdf:about=""
@@ -121,9 +124,9 @@ ${at}>
     </rdf:Alt>
    </crs:Group>
 ${seq('ToneCurvePV2012', curve)}
-${seq('ToneCurvePV2012Red', ident)}
-${seq('ToneCurvePV2012Green', ident)}
-${seq('ToneCurvePV2012Blue', ident)}
+${seq('ToneCurvePV2012Red', curveR)}
+${seq('ToneCurvePV2012Green', curveG)}
+${seq('ToneCurvePV2012Blue', curveB)}
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>

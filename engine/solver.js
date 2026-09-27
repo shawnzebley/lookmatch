@@ -400,7 +400,7 @@ export function solve(ps, o, ref, opts = {}) {
     }
   }
   const final = clampParams(params, true);
-  for (const k of Object.keys(final)) if (!SLIDER_BY_KEY[k].hue) final[k] = Math.round(final[k] * (k === 'exposure' ? 100 : 1)) / (k === 'exposure' ? 100 : 1);
+  for (const k of Object.keys(final)) if (SLIDER_BY_KEY[k] && !SLIDER_BY_KEY[k].hue) final[k] = Math.round(final[k] * (k === 'exposure' ? 100 : 1)) / (k === 'exposure' ? 100 : 1);
   return {
     params: final,
     targets: T,
@@ -413,3 +413,48 @@ export function solve(ps, o, ref, opts = {}) {
 function abToWheelHueFast(a, b) { return abToWheelHue(a, b); }
 
 export { TONE_KEYS, WB_KEYS, HSL_KEYS };
+
+// ---------------- preset mode ------------------------------------------------------------------------
+/**
+ * Apply a Lightroom preset's exact values and only normalise the input photo first: an exposure and
+ * white-balance offset so the photo walks into the preset the way a well-exposed, neutral file would.
+ * Presets are built on files like that; a dark or orange phone shot pushed through one lands wrong.
+ * presetParams: from lrpreset.toParams. opts.strength (0-1) scales the preset's own look.
+ */
+export function solvePreset(ps, o, presetParams, opts = {}) {
+  const t0 = performance.now();
+  const s = Math.min(1, Math.max(0, opts.strength ?? 1));
+  // scale the look (not the normalisation) by strength; curves blend toward identity
+  const look = { ...defaultParams() };
+  for (const [k, v] of Object.entries(presetParams)) {
+    if (Array.isArray(v)) look[k] = v.map(([x, y]) => [x, Math.round(x + (y - x) * s)]);
+    else if (typeof v === 'number') look[k] = SLIDER_BY_KEY[k]?.hue ? v : v * s;
+  }
+  const idx = sampleIdx(ps.n, 6000, null, 41);
+  const neutralIdx = sampleIdx(ps.n, 2500, (i) => ps.masks.neutral[i], 13);
+  const cur = { L: new Float32Array(ps.n), A: new Float32Array(ps.n), B: new Float32Array(ps.n), lr: new Float32Array(ps.n), lg: new Float32Array(ps.n), lb: new Float32Array(ps.n) };
+  // target median: pull halfway toward a normal exposure, less for low-key scenes so night stays night
+  const med0 = o.tone.pct[50];
+  const lowKey = med0 < 25 || (opts.scene?.ev != null && opts.scene.ev < 7);
+  const medT = med0 + (46 - med0) * (lowKey ? 0.2 : 0.5);
+  const wbW = neutralIdx.length > 200 ? 1 : 0.4;
+  const fn = (x) => {
+    const p = { ...defaultParams(), exposure: x[0], temp: x[1], tint: x[2] };
+    processPixelSet(ps, p, idx, cur);
+    const st = measure(ps, cur, idx);
+    let na = 0, nb = 0;
+    if (neutralIdx.length) { processPixelSet(ps, p, neutralIdx, cur); for (const i of neutralIdx) { na += cur.A[i]; nb += cur.B[i]; } na /= neutralIdx.length; nb /= neutralIdx.length; }
+    return [
+      (st.tone.pct[50] - medT) / 2,
+      Math.max(0, st.tone.clipHi - o.tone.clipHi - 0.001) * 3000,
+      // keep a little of the photo's own warmth (golden hour should stay golden)
+      (na - 0.3 * o.wb.a) / 0.8 * wbW, (nb - 0.3 * o.wb.b) / 0.8 * wbW,
+      x[0] / 1.2, x[1] / 80, x[2] / 80,
+    ];
+  };
+  const res = lm(fn, [0, 0, 0], [-1.5, -60, -50], [1.5, 60, 50], { iters: 20 });
+  const params = { ...look, exposure: (look.exposure || 0) + res.x[0], temp: (look.temp || 0) + res.x[1], tint: (look.tint || 0) + res.x[2] };
+  params.exposure = Math.round(params.exposure * 100) / 100;
+  params.temp = Math.round(params.temp); params.tint = Math.round(params.tint);
+  return { params, targets: null, guardScale: 1, normalise: { exposure: res.x[0], temp: res.x[1], tint: res.x[2] }, timings: { total: performance.now() - t0, evals: res.evals } };
+}

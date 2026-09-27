@@ -1,4 +1,6 @@
-import { SLIDERS, defaultParams } from './engine/pipeline.js';
+import { SLIDERS, defaultParams, compile } from './engine/pipeline.js';
+import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
+import { srgbToLinear, linearToSrgb } from './engine/color.js';
 import { PCTS } from './engine/measure.js';
 import { hsvToRgb } from './engine/color.js';
 import * as db from './lib/db.js';
@@ -84,7 +86,10 @@ function swatch(zone) {
   const [r, g, b] = hsvToRgb(zone.hue, Math.min(1, zone.sat / 12), 0.8);
   return `rgb(${r * 255 | 0},${g * 255 | 0},${b * 255 | 0})`;
 }
-function presetChips(st) {
+function presetChips(st, pr = null) {
+  if (pr?.lr) {
+    return `<div class="chips"><span class="chip">Lightroom preset · exact values</span>${pr.unsupported?.length ? `<span class="chip">not applied: ${esc(pr.unsupported.join(', '))}</span>` : ''}</div>`;
+  }
   const t = st.tone, z = st.zones;
   return `<div class="chips">
     <span class="chip">median L* ${f1(t.pct[50])}</span>
@@ -103,15 +108,16 @@ function renderPresets() {
   const v = $('#view-presets');
   v.innerHTML = '';
   if (!S.presets.length) {
-    v.append(h(`<div class="empty"><b>No presets yet</b>Pick a photo with the look you want. The app measures its tone and color and saves that as a preset.<br><br><button class="primary" id="newPresetEmpty">New preset from a photo</button></div>`));
+    v.append(h(`<div class="empty"><b>No presets yet</b>Pick a photo with the look you want, or import a Lightroom preset (.xmp or .lrtemplate) to apply its exact values.<br><br><button class="primary" id="newPresetEmpty">New preset from a photo</button><br><br><button id="importLREmpty">Import Lightroom preset</button></div>`));
     $('#newPresetEmpty').onclick = () => $('#pickRef').click();
+    $('#importLREmpty').onclick = () => $('#pickLR').click();
     return;
   }
   const list = h('<div class="preset-list"></div>');
   for (const p of S.presets) {
     const el = h(`<div class="preset ${p.id === S.presetId ? 'sel' : ''}">
       <div class="ph"><img src="${p.thumb}" alt=""><div style="min-width:0"><div class="nm">${esc(p.name)}</div>
-      <div class="muted small">Default strength ${p.strength}%</div>${presetChips(p.stats)}</div></div>
+      <div class="muted small">Default strength ${p.strength}%</div>${presetChips(p.stats, p)}</div></div>
       <div class="row">
         <button class="primary" data-a="use">Use</button>
         <button data-a="rename">Rename</button>
@@ -168,6 +174,40 @@ async function newPresetFrom(file) {
   } catch (e) { $('#npStatus', sheet).textContent = `Couldn't read that image: ${e.message}`; }
 }
 
+// Lightroom presets: exact values; the solver only normalises each photo's exposure and white balance.
+function lrThumb(params) {
+  // strip: grey ramp on top, then skin, teal, green, blue, red patches, all through the preset
+  const W = 160, H = 96, c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const x = c.getContext('2d'), img = x.createImageData(W, H), f = compile(params), res = new Float32Array(6);
+  const patches = [[224, 172, 140], [150, 105, 80], [40, 110, 120], [70, 120, 60], [60, 90, 170], [180, 50, 45], [235, 225, 205], [30, 30, 35]];
+  for (let y = 0; y < H; y++) for (let i = 0; i < W; i++) {
+    let rgb;
+    if (y < H / 2) { const g = i / (W - 1) * 255; rgb = [g, g, g]; } else rgb = patches[Math.min(7, Math.floor(i / (W / 8)))];
+    f(srgbToLinear(rgb[0] / 255), srgbToLinear(rgb[1] / 255), srgbToLinear(rgb[2] / 255), res);
+    const o = (y * W + i) * 4;
+    img.data[o] = 255 * linearToSrgb(res[0]); img.data[o + 1] = 255 * linearToSrgb(res[1]); img.data[o + 2] = 255 * linearToSrgb(res[2]); img.data[o + 3] = 255;
+  }
+  x.putImageData(img, 0, 0);
+  return c.toDataURL('image/jpeg', 0.85);
+}
+
+async function importLightroom(files) {
+  let n = 0, last = null;
+  for (const file of files) {
+    try {
+      const { name, settings } = parsePreset(await file.text(), file.name);
+      const params = toParams(settings);
+      if (!Object.keys(params).length) continue;
+      const p = { id: uid(), name: name || baseName(file.name), lr: true, lrParams: params, unsupported: unsupported(settings), stats: null, thumb: lrThumb(params), strength: 100, created: Date.now() };
+      await db.putPreset(p); backupPreset(p); n++; last = p;
+    } catch (e) { console.warn('preset import failed', file.name, e); }
+  }
+  if (last) { S.presetId = last.id; localStorage.setItem('lm_preset', last.id); }
+  await loadPresets(); renderPresets();
+  toast(n ? `Imported ${n} Lightroom preset${n > 1 ? 's' : ''}` : 'No usable presets in those files');
+}
+
 async function backupPreset(p) {
   if (!drive.token()) return;
   try {
@@ -187,7 +227,7 @@ async function restorePresets() {
   for (const f of files) {
     try {
       const p = JSON.parse(await drive.download(f.id));
-      if (!p.stats || !p.id) continue;
+      if ((!p.stats && !p.lr) || !p.id) continue;
       p.driveId = f.id;
       if (!S.presets.find((q) => q.id === p.id)) { await db.putPreset(p); n++; }
     } catch (e) { /* skip */ }
@@ -271,7 +311,7 @@ function solvePhoto(p, { priority = false } = {}) {
   const pr = currentPreset();
   if (!pr) return Promise.resolve();
   p.status = 'solving'; p.presetId = pr.id; rerenderMatchSoon();
-  return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100 }, { priority }).then((r) => {
+  return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100, lrParams: pr.lr ? pr.lrParams : null }, { priority }).then((r) => {
     Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, status: 'done' });
     rerenderMatchSoon();
     return r;
@@ -664,7 +704,7 @@ function renderSettings() {
         <li>Authorized redirect URI: <code>${esc(drive.redirectUri())}</code></li>
         <li>Paste the client ID above.</li></ol></details>
     </div>
-    <div class="card"><h3>About</h3><p class="muted small">Everything runs on this phone. Presets store measured targets, not slider values. Each photo is measured and solved on its own. Workers: ${pool.workers.length}.</p></div>
+    <div class="card"><h3>About</h3><p class="muted small">Everything runs on this phone. Photo presets store measured targets, not slider values. Imported Lightroom presets apply their exact values after each photo's exposure and white balance are normalised. Each photo is measured and solved on its own. Workers: ${pool.workers.length}.</p></div>
   </div>`;
   $('#sDest').value = s.dest; $('#sLRM').value = s.lrMode;
   $('#sDest').onchange = (e) => { s.dest = e.target.value; saveSettings(); };
@@ -714,7 +754,11 @@ function setTab(t) {
   $('#title').textContent = { presets: 'Presets', match: 'Match', settings: 'Settings' }[t];
   const ta = $('#topActions');
   ta.innerHTML = '';
-  if (t === 'presets') { const b = h('<button class="primary">+ New</button>'); b.onclick = () => $('#pickRef').click(); ta.append(b); }
+  if (t === 'presets') {
+    const b = h('<button class="primary">+ New</button>'); b.onclick = () => $('#pickRef').click();
+    const l = h('<button>Import LR</button>'); l.onclick = () => $('#pickLR').click();
+    ta.append(l, b);
+  }
   if (t === 'presets') renderPresets();
   if (t === 'match') renderMatch();
   if (t === 'settings') renderSettings();
@@ -722,6 +766,7 @@ function setTab(t) {
 
 document.querySelectorAll('.tabs button').forEach((b) => (b.onclick = () => setTab(b.dataset.tab)));
 $('#pickRef').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) newPresetFrom(f); };
+$('#pickLR').onchange = (e) => { const fs = [...e.target.files]; e.target.value = ''; if (fs.length) importLightroom(fs); };
 $('#pickPhotos').onchange = (e) => { const fs = [...e.target.files]; e.target.value = ''; if (fs.length) addPhotos(fs); };
 
 (async function boot() {
