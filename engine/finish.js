@@ -21,20 +21,22 @@ export const FINISH_PROFILES = {
     name: 'Cvatik', who: 'Steve Gindler', source: 'cvatik.com/portrait', n: 88,
     p1: 3.2, p99: 87.6, chroma: 11.2, sh: [3.5, 6.5], hi: [-2.9, 0.6], vignette: -30, grain: 15, grainSize: 20,
   },
-  // lightwitch.com portfolio galleries, 120 images, 2026-09-27: matte blacks (53/120 lift above L* 8)
+  // www.lightwitch.com, 10 galleries (latest, portrait clients, couples, fashion, musicians, commercial, personal,
+  // humanless, strange fusions, archive), 659 images, 2026-09-27: matte blacks (269/659 lift above L* 8), dim whites
   courtney: {
-    name: 'Courtney Brooke', who: 'Courtney Brooke (Light Witch)', source: 'lightwitch.com', n: 120,
-    p1: 6.4, p99: 85.8, chroma: 11.5, sh: [3.7, 4.5], hi: [-1.2, 3.5], vignette: -28, grain: 25, grainSize: 30, matte: true,
+    name: 'Courtney Brooke', who: 'Courtney Brooke (Light Witch)', source: 'lightwitch.com', n: 659,
+    p1: 6.8, p99: 76.6, chroma: 12.2, sh: [3.5, 6.2], hi: [0.2, 1.9], vignette: -28, grain: 25, grainSize: 30, matte: true,
   },
   // xenichez.com/en/portfolio, 185 images (30 black and white), 2026-09-27: low-key, deepest blacks, strongest falloff
   xenie: {
     name: 'Xenie Zasetskaya', who: 'Xenie Zasetskaya', source: 'xenichez.com/en/portfolio', n: 185,
     p1: 1.6, p99: 86.1, chroma: 11.7, sh: [1.5, 3.6], hi: [1.3, 5.6], vignette: -40, grain: 10, grainSize: 15,
   },
-  // Behance: 8 Playboy editorials + Fine Art set, 104 images (15 black and white), 2026-09-27: bright, colourful, soft blacks, no vignette
+  // Behance: 8 Playboy editorials, Fine Art and print-collection sets, 125 images (16 black and white), 2026-09-27
+  // (read in a signed-in Chrome): bright, colourful, soft blacks, no vignette
   anadias: {
-    name: 'Ana Dias', who: 'Ana Dias', source: 'behance.net/anadiasphotography', n: 104,
-    p1: 5.3, p99: 95.8, chroma: 20.4, sh: [7.6, 8.9], hi: [0.8, 4.7], vignette: 0, grain: 5, grainSize: 10, matte: true,
+    name: 'Ana Dias', who: 'Ana Dias', source: 'behance.net/anadiasphotography', n: 125,
+    p1: 4.3, p99: 96.2, chroma: 18.5, sh: [6.6, 7.4], hi: [0.6, 4.0], vignette: 0, grain: 5, grainSize: 10, matte: true,
   },
   // 35photo.pro/dimm122 (@borisov_photo), 60 images (8 black and white), 2026-09-27: low-key, muted, warm shadows and highlights
   borisov: {
