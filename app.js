@@ -1,5 +1,6 @@
 import { SLIDERS, defaultParams, compile } from './engine/pipeline.js';
 import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
+import { FINISH_PROFILES } from './engine/finish.js';
 import { srgbToLinear, linearToSrgb } from './engine/color.js';
 import { PCTS } from './engine/measure.js';
 import { hsvToRgb } from './engine/color.js';
@@ -123,6 +124,7 @@ function renderPresets() {
         <button data-a="rename">Rename</button>
         <button data-a="dup">Duplicate</button>
         <button data-a="strength">Strength</button>
+        <button data-a="finish">Finish: ${esc(FINISH_PROFILES[p.finish || 'off']?.name || 'Off')}</button>
         <button class="danger" data-a="del">Delete</button>
       </div></div>`);
     el.onclick = async (e) => {
@@ -140,6 +142,14 @@ function renderPresets() {
       if (a === 'strength') {
         const s = await ask('Default match strength (0–100)', String(p.strength), 'number');
         if (s !== null && s !== '') { p.strength = Math.max(0, Math.min(100, Math.round(+s))); await db.putPreset(p); backupPreset(p); renderPresets(); }
+      }
+      if (a === 'finish') {
+        const keys = Object.keys(FINISH_PROFILES);
+        p.finish = keys[(keys.indexOf(p.finish || 'off') + 1) % keys.length];
+        await db.putPreset(p); backupPreset(p); renderPresets();
+        for (const ph of S.photos) if (ph.presetId === p.id && (ph.status === 'done' || ph.status === 'exported')) ph.status = 'ready';
+        runQueue();
+        toast(`Finish: ${FINISH_PROFILES[p.finish].name}`);
       }
       if (a === 'del') {
         if (await confirmSheet(`Delete “${p.name}”?`, 'Photos already exported are not affected.', 'Delete')) {
@@ -311,7 +321,7 @@ function solvePhoto(p, { priority = false } = {}) {
   const pr = currentPreset();
   if (!pr) return Promise.resolve();
   p.status = 'solving'; p.presetId = pr.id; rerenderMatchSoon();
-  return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100, lrParams: pr.lr ? pr.lrParams : null }, { priority }).then((r) => {
+  return pool.call(p.worker, 'solve', { id: p.id, refStats: pr.stats, strength: p.strength / 100, lrParams: pr.lr ? pr.lrParams : null, finish: pr.finish || 'off' }, { priority }).then((r) => {
     Object.assign(p, { params: r.params, solved: { ...r.params }, targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, status: 'done' });
     rerenderMatchSoon();
     return r;

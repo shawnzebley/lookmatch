@@ -1,7 +1,8 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
 import { prepare, measure } from './engine/measure.js';
 import { solve, solvePreset } from './engine/solver.js';
-import { buildLUT, applyLUT, processPixelSet, SLIDERS } from './engine/pipeline.js';
+import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
+import { buildLUT, applyLUT, applyFinish, hasSpatialFinish, processPixelSet, SLIDERS } from './engine/pipeline.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
 import { exifSegment, xmpSegment, insertSegments, isJpeg } from './engine/jpegmeta.js';
@@ -96,6 +97,7 @@ function renderInto(src, params) {
   const lut = buildLUT(params, 33);
   const out = new Uint8ClampedArray(src.width * src.height * 4);
   applyLUT(lut, src.data, out, src.width * src.height, 4, 4);
+  if (hasSpatialFinish(params)) applyFinish(out, src.width, src.height, params);
   return { width: src.width, height: src.height, data: out };
 }
 
@@ -142,12 +144,13 @@ const handlers = {
     return { stats: measure(e.ps), thumb, width: e.fullW, height: e.fullH, scene: e.scene, faces: e.faces ? e.faces.length : null };
   },
 
-  async solve({ id, refStats, strength, lrParams = null }) {
+  async solve({ id, refStats, strength, lrParams = null, finish = 'off' }) {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
     const res = lrParams
       ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene })
       : solve(e.ps, o, refStats, { strength, scene: e.scene });
+    if (finish && finish !== 'off' && FINISH_PROFILES[finish]) res.params = fitFinish(e.ps, res.params, FINISH_PROFILES[finish]);
     const cur = processPixelSet(e.ps, res.params);
     const after = measure(e.ps, cur);
     const loss = lossReport(e.ps, cur, res.params);
@@ -196,7 +199,9 @@ const handlers = {
       x.clearRect(0, 0, W, tileH);
       x.drawImage(bmp, 0, y, W, h, 0, 0, W, h);
       const d = x.getImageData(0, 0, W, h).data;
-      applyLUT(lut, d, rgba.subarray(y * W * 4, (y + h) * W * 4), W * h, 4, 4, 1 + y);
+      const band = rgba.subarray(y * W * 4, (y + h) * W * 4);
+      applyLUT(lut, d, band, W * h, 4, 4, 1 + y);
+      if (hasSpatialFinish(params)) applyFinish(band, W, h, params, y, W, H);
       postMessage({ progress: { id, phase: 'render', f: (y + h) / H } });
     }
     bmp.close();
