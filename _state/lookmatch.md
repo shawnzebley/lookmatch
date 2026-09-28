@@ -41,6 +41,7 @@ CONSTRAINTS
 - Shawn's replies: shawn-voice skill, short, no sugar-coating, no banned AI phrasing.
 - Never commit Shawn's photos (testdata/, out/, scratch/ are gitignored) — repo is public.
 - Pass lines used in report: tone ≤ 3 L*, neutral cast ≤ 2 Lab, zone ≤ 4 Lab, new clipping ≤ 0.1%, skin hue 35–65 with lit chroma ≥ 0.6×.
+- Deploys: Shawn (2026-09-28): "Just force push the updates instead of asking me every time." After a change to web/ is tested, run tools/build-web.sh, `git subtree split --prefix web -b gh-pages-deploy`, and `git push --force-with-lease=gh-pages:<current origin/gh-pages sha> origin gh-pages-deploy:gh-pages` without asking first. Live site is https://shawnzebley.github.io/lookmatch/ (a phone that shows the old build needs the app closed and reopened).
 - Commit trailer: Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 ARTIFACTS
