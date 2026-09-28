@@ -13,7 +13,7 @@ function landmarker() {
     lmP = (async () => {
       return createTask(FaceLandmarker, {
         baseOptions: { modelAssetPath: new URL('./models/face_landmarker.task', import.meta.url).href, delegate: 'CPU' },
-        runningMode: 'IMAGE', numFaces: 8, minFaceDetectionConfidence: 0.45, minFacePresenceConfidence: 0.45,
+        runningMode: 'IMAGE', numFaces: 8, minFaceDetectionConfidence: 0.45, minFacePresenceConfidence: 0.45, outputFaceBlendshapes: true,
       });
     })().catch((e) => { console.warn('face model unavailable:', e); return null; });
   }
@@ -28,9 +28,18 @@ function draw(src, sx, sy, sw, sh, dw, dh) {
   return x.getImageData(0, 0, dw, dh);
 }
 
+// each outline also carries .blink = [left, right] (0 open .. 1 closed) when the model gives blendshapes
 function run(lm, imgData) {
   const r = lm.detect(imgData);
-  return (r.faceLandmarks || []).map((pts) => OVAL.map((i) => [pts[i].x, pts[i].y]));
+  return (r.faceLandmarks || []).map((pts, f) => {
+    const poly = OVAL.map((i) => [pts[i].x, pts[i].y]);
+    const cats = r.faceBlendshapes && r.faceBlendshapes[f] && r.faceBlendshapes[f].categories;
+    if (cats) {
+      const get = (n) => { const c = cats.find((q) => q.categoryName === n); return c ? c.score : null; };
+      poly.blink = [get('eyeBlinkLeft'), get('eyeBlinkRight')];
+    }
+    return poly;
+  });
 }
 
 const center = (poly) => poly.reduce((a, [x, y]) => [a[0] + x / poly.length, a[1] + y / poly.length], [0, 0]);
@@ -53,6 +62,7 @@ export async function detectFaces(src) {
       const found = run(lm, draw(src, x0, y0, tw, th, Math.round(tw * ts), Math.round(th * ts)));
       for (const poly of found) {
         const g = poly.map(([x, y]) => [(x0 + x * tw) / W, (y0 + y * th) / H]);
+        g.blink = poly.blink;
         const [cx, cy] = center(g), wd = width(g);
         if (!faces.some((f) => { const [fx, fy] = center(f); return Math.hypot(fx - cx, fy - cy) < 0.6 * Math.max(wd, width(f)); })) faces.push(g);
       }

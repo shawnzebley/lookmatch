@@ -110,6 +110,11 @@ export const TONE_REG = {
   exposure: [0.5, 0.5], contrast: [2, 1], highlights: [1, 1], shadows: [1, 2.5],
   whites: [1.5, 1], blacks: [1, 1.5], fadeBlacks: [1, 2], fadeWhites: [1, 1],
 };
+// Brightening with Highlights pushed up blows out skin and sky; the usual portrait move is the
+// opposite: pull Highlights down, then raise Exposure, for an even tone. Cost of exposure+ x highlights+.
+export const BRIGHTEN_HI_UP = 3;
+// Saturation cut that may pair with Vibrance up at no extra cost.
+export const SAT_DOWN_FREE = 15;
 
 export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNESS_PULL, scene = null, toneShape = TONE_SHAPE, zoneMove = ZONE_MOVE, bandMove = BAND_MOVE, endAbs = END_ABS, chromaCap = CHROMA_CAP, ownModel = OWN_MODEL } = {}) {
   const s = Math.min(1, Math.max(0, strength));
@@ -297,6 +302,7 @@ export function solve(ps, o, ref, opts = {}) {
       } else r.push(0, 0, 0);
       r.push(Math.max(0, nearWhite(p) - origNearWhite - 0.004) * 600);
       TONE_KEYS.forEach((k, i) => { const c = capRange(k), w = toneReg[k] || [1, 1]; r.push(1.8 * reg * w[x[i] < 0 ? 0 : 1] * x[i] / (c[1] - c[0])); });
+      r.push((opts.brightenHiUp ?? BRIGHTEN_HI_UP) * reg * Math.max(0, x[0]) * Math.max(0, x[2]) / 100);
       return r;
     };
     const res = lm(fn, TONE_KEYS.map((k) => params[k]), lo, hi, { iters: 40 });
@@ -378,8 +384,11 @@ export function solve(ps, o, ref, opts = {}) {
       r.push((st.wb.a - T.wb.a) / 0.8 * T.wb.weight, (st.wb.b - T.wb.b) / 0.8 * T.wb.weight);
       r.push(...skinResiduals(st, T));
       r.push(Math.max(0, st.tone.clipHi - T.clip.hi) * 3000, Math.max(0, st.tone.clipLo - T.clip.lo) * 3000);
-      // saturation and vibrance pulling opposite ways is the same look with worse skin; discourage it
-      r.push(3 * reg * Math.max(0, -x[0] * x[1]) / 2500);
+      // Saturation up with Vibrance down pushes skin harder than the muted colours: discourage it.
+      // The reverse (Saturation a little down, Vibrance up) is the usual portrait move: it lifts muted
+      // colours and keeps skin natural, so it costs nothing extra.
+      // Past a slight cut (SAT_DOWN_FREE) the pair is a chroma reshaper, not that move: back to full cost.
+      r.push(3 * reg * Math.max(0, x[0]) * Math.max(0, -x[1]) / 2500, 8 * reg * Math.max(0, -x[0] - SAT_DOWN_FREE) * Math.max(0, x[1]) / 2500);
       // neighbouring HSL bands must not diverge (that is what makes skin blotchy)
       for (let g = 0; g < 3; g++) for (let bnd = 0; bnd < 8; bnd++) {
         const i1 = 8 + g * 8 + bnd, i2 = 8 + g * 8 + ((bnd + 1) % 8);

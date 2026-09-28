@@ -5,7 +5,9 @@ import { srgbToLinear, linearToSrgb } from './engine/color.js';
 import { PCTS } from './engine/measure.js';
 import { hsvToRgb, wheelHueToAB, abToWheelHue, labToLin } from './engine/color.js';
 import { profileSummary } from './engine/style.js';
-import { isIdentityGeom, maxRect, towardValid, fitAfterTurn, validRect } from './engine/geom.js';
+import { isIdentityGeom, maxRect, towardValid, fitAfterTurn, validRect, geomSize } from './engine/geom.js';
+import { SKIN_SMOOTH_DEFAULT, photoToOut } from './engine/retouch.js';
+import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
@@ -359,9 +361,18 @@ function statusLabel(p) {
   return { loading: 'reading', ready: 'queued', solving: 'styling', done: 'done', error: 'error', exporting: 'exporting', exported: 'exported' }[p.status] || p.status;
 }
 
+// Narrative-style dots: top = eyes (green open, red closed), bottom = focus (green 8+, amber 5-8, red under 5)
+function cullDots(c) {
+  if (!c) return '';
+  const eye = c.eyes ? `<i class="${c.eyes === 'open' ? 'ok' : 'bad'}" title="Eyes ${c.eyes}"></i>` : '<i class="none"></i>';
+  const f = c.focus == null ? '<i class="none"></i>' : `<i class="${c.focus >= 8 ? 'ok' : c.focus >= 5 ? 'mid' : 'bad'}" title="Focus ${c.focus.toFixed(1)} / 10"></i>`;
+  return `<span class="cdots">${eye}${f}</span>`;
+}
+const isKeeper = (p) => p.cull && p.cull.eyes !== 'closed' && (p.cull.focus == null || p.cull.focus >= 8);
+
 function photoTile(p) {
   const busy = ['loading', 'solving', 'exporting'].includes(p.status);
-  const t = h(`<button class="tile" data-id="${p.id}">${p.thumbURL ? `<img src="${p.thumbURL}" alt="">` : ''}
+  const t = h(`<button class="tile ${p.picked ? 'picked' : ''}" data-id="${p.id}">${p.thumbURL ? `<img src="${p.thumbURL}" alt="">` : ''}${cullDots(p.cull)}${p.picked ? '<span class="pick">★</span>' : ''}
     ${busy ? '<div class="spin"></div>' : ''}${p.loss && p.loss.worst !== 'ok' && !busy ? `<span class="wbadge ${p.loss.worst}" title="${esc(p.loss.issues.map((i) => i.text).join(', '))}">!</span>` : ''}<span class="st ${p.status === 'done' || p.status === 'exported' ? 'done' : p.status === 'error' ? 'err' : ''}">${statusLabel(p)}</span></button>`);
   t.onclick = () => {
     if (p.params) return openDetail(p);
@@ -370,6 +381,47 @@ function photoTile(p) {
     $('#pRemove', s).onclick = () => { pool.call(p.worker, 'unload', { id: p.id }).catch(() => {}); S.photos = S.photos.filter((q) => q !== p); closeSheet(); renderMatch(); };
   };
   return t;
+}
+
+// ---------------------------------------------------------------- culling
+// Scenes = runs of near-identical frames (in the order picked). Filters narrow what the strip shows and
+// what Export all sends. "Pick the best of each scene" stars the frame with eyes open and the best focus.
+function sceneOf() {
+  const key = S.photos.map((p) => p.id + (p.cull ? '+' : '-')).join(',');
+  if (S.scenesKey !== key) {
+    const withSig = S.photos.filter((p) => p.cull && p.cull.sig);
+    const g = groupScenes(withSig.map((p) => p.cull.sig));
+    S.scenes = new Map(withSig.map((p, i) => [p, g[i]]));
+    S.scenesKey = key;
+  }
+  return S.scenes;
+}
+function visiblePhotos() {
+  const f = S.cullFilter || 'all';
+  if (f === 'picks') return S.photos.filter((p) => p.picked);
+  if (f === 'keepers') return S.photos.filter(isKeeper);
+  return S.photos;
+}
+function cullBar() {
+  const f = S.cullFilter || 'all', n = S.photos.length;
+  const np = S.photos.filter((p) => p.picked).length, nk = S.photos.filter(isKeeper).length;
+  const nScenes = new Set(sceneOf().values()).size;
+  const bar = h(`<div class="cullbar"><div class="chips-row" id="cullF">
+      <button data-f="all" class="${f === 'all' ? 'on' : ''}">All ${n}</button>
+      <button data-f="keepers" class="${f === 'keepers' ? 'on' : ''}">Eyes open, sharp ${nk}</button>
+      <button data-f="picks" class="${f === 'picks' ? 'on' : ''}">★ Picks ${np}</button></div>
+    <div class="row" style="margin-top:6px"><button class="small" id="cullBest">★ Best of each scene${nScenes > 1 ? ` (${nScenes})` : ''}</button>${np ? '<button class="ghost small" id="cullClear">Clear picks</button>' : ''}</div>
+    <p class="muted small" style="margin:4px 0 0">Dots on each photo: top = eyes (red closed), bottom = focus (green 8+ of 10). Star a photo in its editor.</p></div>`);
+  $('#cullF', bar).onclick = (e) => { const v = e.target.closest('button')?.dataset.f; if (!v) return; S.cullFilter = v; renderMatch(); setTopActions(); };
+  $('#cullBest', bar).onclick = () => {
+    const best = new Map();
+    for (const [p, g] of sceneOf()) { const b = best.get(g); if (!b || keeperScore(p.cull) > keeperScore(b.cull)) best.set(g, p); }
+    for (const p of best.values()) p.picked = true;
+    toast(`Starred ${best.size} photo${best.size > 1 ? 's' : ''}`, 2000);
+    renderMatch(); setTopActions();
+  };
+  if ($('#cullClear', bar)) $('#cullClear', bar).onclick = () => { for (const p of S.photos) p.picked = false; renderMatch(); setTopActions(); };
+  return bar;
 }
 
 function photographerCards(current, onPick) {
@@ -426,8 +478,16 @@ function renderMatch() {
   } else {
     const strip = h('<div class="strip"></div>');
     strip.append(h('<button class="tile add" id="addPhotos" aria-label="Add photos"><span>+</span></button>'));
-    for (const p of S.photos) strip.append(photoTile(p));
+    const shown = visiblePhotos(), scenes = sceneOf();
+    let last = -1;
+    for (const p of shown) {
+      const sc = scenes.get(p);
+      if (total > 1 && sc !== last && S.photos.length > 2) strip.append(h(`<span class="scene">${sc + 1}</span>`));
+      last = sc;
+      strip.append(photoTile(p));
+    }
     photos.append(strip);
+    if (total > 1) photos.append(cullBar());
     const line = !look ? 'Now pick a style below.'
       : done < total ? `Styling like ${esc(lookName(look))}… ${done} of ${total}`
         : `${total === 1 ? 'Done.' : `All ${total} done.`} Tap a photo to fine-tune, crop or export.`;
@@ -479,7 +539,7 @@ async function addPhotos(files) {
     const p = { id: uid(), file, name: file.name || 'photo.jpg', status: 'loading', strength: pr ? pr.strength : 100, worker: pool.assign() };
     S.photos.push(p);
     pool.call(p.worker, 'load', { id: p.id, file }).then((r) => {
-      p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask;
+      p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask; p.cull = r.cull; S.scenesKey = null;
       p.status = 'ready'; rerenderMatchSoon(); runQueue();
     }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('add photo: read', e, file); rerenderMatchSoon(); });
   }
@@ -510,11 +570,16 @@ function ensurePresetRegions(pr) {
   return upgrading.get(pr.id);
 }
 
+// hand edits the style doesn't solve: they survive Redo and a style change
+const KEEP_KEYS = ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points'];
+const keptEdits = (params) => Object.fromEntries(KEEP_KEYS.filter((k) => params && params[k] != null).map((k) => [k, structuredClone(params[k])]));
+
 function solvePhoto(p, { priority = false } = {}) {
   if (!solveArgs(p)) return Promise.resolve();
   const look = lookOf(p);
   p.status = 'solving'; p.solvedLook = look; rerenderMatchSoon();
   return ensurePresetRegions(presetOf(p)).then(() => pool.call(p.worker, 'solve', { id: p.id, ...solveArgs(p) }, { priority })).then((r) => {
+    Object.assign(r.params, keptEdits(p.params));
     Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, style: r.style, regions: r.regions, mask: r.mask || p.mask, status: 'done' });
     rerenderMatchSoon();
     // one photo in, style picked: go straight to the editor
@@ -680,7 +745,7 @@ function renderRegionCard() {
   };
   const M = p.mask;
   if (!M) return;
-  const pick = (mode) => { D.pick = D.pick === mode ? null : mode; renderRegionCard(); requestPreview(false); };
+  const pick = (mode) => { D.pick = D.pick === mode ? null : mode; if (D.pick && D.tool) setTool(null); renderRegionCard(); requestPreview(false); };
   $('#mAdd', box).onclick = () => pick('add');
   $('#mRem', box).onclick = () => pick('remove');
   $('#mUndo', box).onclick = () => maskOp({ op: 'undo' });
@@ -691,6 +756,229 @@ function renderRegionCard() {
     renderRegionCard();
     await solvePhoto(p, { priority: true });
     if (D && D.p === p) { D.userEdited = false; refreshDetail(); }
+  };
+}
+
+// ---------------------------------------------------------------- retouch: skin + heal
+// Skin: a People mask on facial + body skin with Texture and Clarity turned down a little (-8 to -10 reads
+// as retouched without looking waxy), plus a skin-only saturation slider (tanned <-> paler) that leaves the
+// background alone. Heal: tap a spot; 100% removes it, 50-60% softens creases and under-eye bags.
+const SKIN_SLIDERS = [
+  { key: 'skinTexture', label: 'Texture', ui: [-100, 100] },
+  { key: 'skinClarity', label: 'Clarity', ui: [-100, 100] },
+  { key: 'skinTone', label: 'Paler ↔ Tanned', ui: [-100, 100] },
+];
+const HEAL_KINDS = [['Spot', 1], ['Crease', 0.6]];
+
+function retouchCard(p) {
+  const P = p.params, M = p.mask, skin = M && M.skin >= 0.0005;
+  const smooth = !!(P.skinTexture || P.skinClarity);
+  const heals = P.heals || [], sel = heals[D.healSel];
+  const tool = D.tool;
+  const skinPart = !M ? '<p class="muted small">Looking for skin…</p>'
+    : !skin ? '<p class="muted small">No skin found, so skin smoothing and skin tone are off for this photo.</p>'
+    : `<label class="chk"><input type="checkbox" id="skOn" ${smooth ? 'checked' : ''}> Smooth skin (faces and bodies only)</label>
+      <div id="skSl">${SKIN_SLIDERS.map((s) => sliderRow(s, P[s.key] || 0)).join('')}</div>
+      <p class="muted small" style="margin:4px 0 0">Keep Texture and Clarity near −10. Much lower and skin looks waxy. Skin tone only touches skin, not the background.</p>`;
+  const status = tool === 'heal' ? 'Tap a blemish or crease. Tap Heal again when done.'
+    : tool === 'source' ? 'Tap where the spot should copy from. Below the spot usually works best.'
+    : heals.length ? `${heals.length} spot${heals.length > 1 ? 's' : ''} healed.` : 'No spots healed.';
+  return `<h3>Retouch</h3>${skinPart}
+    <div class="mtools"><button id="hlOn" class="${tool === 'heal' ? 'on' : ''}">Heal</button><button id="hlSrc" class="${tool === 'source' ? 'on' : ''}" ${sel ? '' : 'disabled'}>Move source</button><button id="hlUndo" ${heals.length ? '' : 'disabled'}>Undo</button><div class="grow"></div><button id="hlClear" ${heals.length ? '' : 'disabled'}>Clear</button></div>
+    <p class="muted small" style="margin:6px 0 0">${status}</p>
+    <div class="chips-row" id="hlKind">${HEAL_KINDS.map(([l, v]) => `<button data-o="${v}" class="${Math.abs(D.healOp - v) < 1e-6 ? 'on' : ''}">${l} ${Math.round(v * 100)}%</button>`).join('')}</div>
+    <div id="hlSl">${sliderRow({ key: 'hlSize', label: 'Spot size', ui: [0.4, 6], step: 0.1 }, +(D.healSize * 100).toFixed(1))}
+    ${sliderRow({ key: 'hlOp', label: sel ? 'Opacity (this spot)' : 'Opacity', ui: [0, 100] }, Math.round((sel ? sel.op : D.healOp) * 100))}</div>`;
+}
+
+function renderRetouchCard() {
+  if (!D) return;
+  const p = D.p, box = $('#retouchCard');
+  box.innerHTML = retouchCard(p);
+  const P = p.params;
+  const after = () => { D.userEdited = true; requestPreview(false); scheduleMeasure(); };
+  if ($('#skOn', box)) $('#skOn', box).onchange = (e) => {
+    Object.assign(P, e.target.checked ? SKIN_SMOOTH_DEFAULT : { skinTexture: 0, skinClarity: 0 });
+    renderRetouchCard(); after();
+  };
+  bindRows(box.querySelectorAll('#skSl .sl'), (k, v) => { P[k] = v; const on = !!(P.skinTexture || P.skinClarity); if ($('#skOn', box)) $('#skOn', box).checked = on; after(); });
+  bindRows(box.querySelectorAll('#hlSl .sl'), (k, v) => {
+    if (k === 'hlSize') { D.healSize = v / 100; const h = (P.heals || [])[D.healSel]; if (h) { h.r = D.healSize; after(); } draw(); return; }
+    const h = (P.heals || [])[D.healSel];
+    if (h) { h.op = v / 100; after(); } else D.healOp = v / 100;
+  });
+  $('#hlKind', box).onclick = (e) => {
+    const o = e.target.closest('button')?.dataset.o;
+    if (o == null) return;
+    D.healOp = +o;
+    const h = (P.heals || [])[D.healSel];
+    if (h) { h.op = +o; after(); }
+    renderRetouchCard();
+  };
+  $('#hlOn', box).onclick = () => { setTool(D.tool === 'heal' ? null : 'heal'); };
+  $('#hlSrc', box).onclick = () => { setTool(D.tool === 'source' ? null : 'source'); };
+  $('#hlUndo', box).onclick = () => { (P.heals || []).pop(); D.healSel = (P.heals || []).length - 1; renderRetouchCard(); after(); draw(); };
+  $('#hlClear', box).onclick = () => { P.heals = []; D.healSel = -1; setTool(null); after(); };
+}
+
+// slider rows outside #sliders: range + number kept in step, onSet(key, value)
+function bindRows(rows, onSet) {
+  rows.forEach((row) => {
+    const k = row.dataset.k;
+    const [range, num] = row.querySelectorAll('input');
+    const lo = +range.min, hi = +range.max, step = +range.step || 1;
+    const set = (v, from) => {
+      v = Math.max(lo, Math.min(hi, +v || 0));
+      if (from !== range) range.value = v;
+      if (from !== num) num.value = step < 1 ? v.toFixed(1) : Math.round(v);
+      row.classList.toggle('changed', Math.abs(v) > 1e-9);
+      onSet(k, v);
+    };
+    range.oninput = () => set(range.value, range);
+    num.onchange = () => set(num.value, num);
+  });
+}
+
+// tap tools on the photo: 'heal', 'source', 'point'. Taps edit instead of moving the split line.
+function setTool(t) {
+  D.tool = t;
+  if (t) { D.pick = null; if (D.mode === 'before') { D.mode = 'after'; [...$('#mode').children].forEach((b) => b.classList.toggle('on', b.dataset.m === 'after')); } }
+  renderRetouchCard();
+  renderRegionCard();
+  renderPointCard();
+  draw();
+}
+
+async function toolTap(x, y) {
+  const p = D.p, P = p.params;
+  if (D.tool === 'heal') {
+    // tapping an existing spot selects it
+    const hit = healHit(x, y);
+    if (hit >= 0) { D.healSel = hit; renderRetouchCard(); draw(); return; }
+    try {
+      const r = await pool.call(p.worker, 'heal', { id: p.id, op: 'add', x, y, size: D.healSize, opacity: D.healOp, side: previewSide() }, { priority: true });
+      if (!D || D.p !== p) return;
+      (P.heals ||= []).push(r.heal);
+      D.healSel = P.heals.length - 1;
+      D.userEdited = true;
+      renderRetouchCard(); requestPreview(false); scheduleMeasure();
+    } catch (e) { toast(e.message, 3000); }
+  } else if (D.tool === 'source') {
+    const h = (P.heals || [])[D.healSel];
+    if (!h) return;
+    try {
+      const r = await pool.call(p.worker, 'heal', { id: p.id, op: 'source', x, y, heal: h }, { priority: true });
+      if (!D || D.p !== p) return;
+      P.heals[D.healSel] = r.heal;
+      D.userEdited = true;
+      setTool('heal'); requestPreview(false);
+    } catch (e) { toast(e.message, 3000); }
+  } else if (D.tool === 'point') pointTap(x, y);
+}
+
+// heal spots in canvas px
+function healsOnCanvas(cv) {
+  const p = D.p, P = p.params;
+  if (!P.heals || !P.heals.length || !p.w) return [];
+  const g = p.geom && !isIdentityGeom(p.geom) ? p.geom : null;
+  const k = cv.width / geomSize(p.w, p.h, g)[0], L = Math.max(p.w, p.h);
+  const T = photoToOut(p.w, p.h, g, k);
+  return P.heals.map((h) => { const [cx, cy] = T(h.x * p.w, h.y * p.h), [sx, sy] = T(h.sx * p.w, h.sy * p.h); return { cx, cy, sx, sy, r: h.r * L * k }; });
+}
+function healHit(x, y) {
+  const cv = $('#cv'), X = x * cv.width, Y = y * cv.height;
+  return healsOnCanvas(cv).findIndex((s) => Math.hypot(X - s.cx, Y - s.cy) < s.r);
+}
+function drawHeals(x, cv) {
+  if (D.tool !== 'heal' && D.tool !== 'source') return;
+  const lw = Math.max(1.5, cv.width / 500);
+  healsOnCanvas(cv).forEach((s, i) => {
+    const on = i === D.healSel;
+    x.lineWidth = lw;
+    x.strokeStyle = on ? 'rgba(255,255,255,.95)' : 'rgba(255,255,255,.55)';
+    x.beginPath(); x.arc(s.cx, s.cy, s.r, 0, 2 * Math.PI); x.stroke();
+    if (on) {
+      x.setLineDash([lw * 3, lw * 3]);
+      x.beginPath(); x.arc(s.sx, s.sy, s.r, 0, 2 * Math.PI); x.stroke();
+      x.beginPath(); x.moveTo(s.cx, s.cy); x.lineTo(s.sx, s.sy); x.stroke();
+      x.setLineDash([]);
+    }
+  });
+}
+
+// ---------------------------------------------------------------- point colour
+// Tap a colour (jeans, sky, skin) and move just that colour: hue, saturation, luminance. Range sets how
+// close a colour has to be to count. Like the Color Mixer's Point Color, similar colours elsewhere move too.
+const POINT_SLIDERS = [
+  { key: 'hue', label: 'Hue', ui: [-100, 100] },
+  { key: 'sat', label: 'Saturation', ui: [-100, 100] },
+  { key: 'lum', label: 'Luminance', ui: [-100, 100] },
+  { key: 'range', label: 'Range', ui: [0, 100] },
+];
+const labCss = (q) => { const o = labToLin(q.L, q.a, q.b, [0, 0, 0]) || [0, 0, 0]; return `rgb(${[0, 1, 2].map((i) => Math.round(255 * linearToSrgb(Math.min(1, Math.max(0, o[i]))))).join(',')})`; };
+
+function renderPointCard() {
+  if (!D) return;
+  const P = D.p.params, pts = P.points || [], sel = pts[D.pointSel];
+  const box = $('#pointCard');
+  box.innerHTML = `<h3>Point color</h3>
+    <div class="mtools"><button id="ptPick" class="${D.tool === 'point' ? 'on' : ''}">Pick a color</button><div class="grow"></div><button id="ptDel" ${sel ? '' : 'disabled'}>Remove</button></div>
+    <p class="muted small" style="margin:6px 0 0">${D.tool === 'point' ? 'Tap the color to change on the photo.' : pts.length ? 'Similar colors elsewhere in the photo move too. Keep it light.' : 'Pick a color on the photo, then move just that color.'}</p>
+    ${pts.length ? `<div class="chips-row" id="ptList">${pts.map((q, i) => `<button data-i="${i}" class="${i === D.pointSel ? 'on' : ''}"><span class="sw" style="display:inline-block;width:16px;height:16px;border-radius:50%;background:${labCss(q)}"></span>${i + 1}</button>`).join('')}</div>` : ''}
+    ${sel ? `<div id="ptSl">${POINT_SLIDERS.map((s) => sliderRow(s, sel[s.key] ?? (s.key === 'range' ? 50 : 0))).join('')}</div>` : ''}`;
+  $('#ptPick', box).onclick = () => setTool(D.tool === 'point' ? null : 'point');
+  $('#ptDel', box).onclick = () => { pts.splice(D.pointSel, 1); D.pointSel = pts.length - 1; D.userEdited = true; renderPointCard(); requestPreview(false); scheduleMeasure(); };
+  if ($('#ptList', box)) $('#ptList', box).onclick = (e) => { const i = e.target.closest('button')?.dataset.i; if (i == null) return; D.pointSel = +i; renderPointCard(); };
+  bindRows(box.querySelectorAll('#ptSl .sl'), (k, v) => { const q = (P.points || [])[D.pointSel]; if (!q) return; q[k] = v; D.userEdited = true; requestPreview(false); scheduleMeasure(); });
+}
+
+async function pointTap(x, y) {
+  const p = D.p;
+  try {
+    const c = await pool.call(p.worker, 'samplePoint', { id: p.id, x, y, params: { ...p.params }, side: previewSide() }, { priority: true });
+    if (!D || D.p !== p) return;
+    const P = p.params;
+    (P.points ||= []).push({ L: c.L, a: c.a, b: c.b, hue: 0, sat: 0, lum: 0, range: 50 });
+    D.pointSel = P.points.length - 1;
+    setTool(null);
+  } catch (e) { toast(e.message, 3000); }
+}
+
+// ---------------------------------------------------------------- sync
+// Lightroom's Sync: copy this photo's settings to the rest of the shoot. Exposure and white balance stay
+// each photo's own by default (light changes between shots); turn them on for a studio with fixed light.
+// Heal spots stay off by default (a spot on one frame isn't on the next). Crop is never copied.
+const SYNC_OWN = ['exposure', 'temp', 'tint'];
+function syncTargets(p) { return S.photos.filter((q) => q !== p && !['loading', 'error', 'solving', 'exporting'].includes(q.status) && q.w); }
+
+function renderSyncCard() {
+  if (!D) return;
+  const p = D.p, box = $('#syncCard'), n = syncTargets(p).length;
+  if (!n) { box.hidden = true; return; }
+  box.hidden = false;
+  const o = (S.syncOpts ||= { light: false, heals: false });
+  box.innerHTML = `<h3>Sync</h3>
+    <p class="muted small" style="margin:0 0 6px">Copy this photo's settings to the other ${n} photo${n > 1 ? 's' : ''}. Crop is not copied.</p>
+    <label class="chk"><input type="checkbox" id="syLight" ${o.light ? 'checked' : ''}> Exposure and white balance too (only when the light didn't change, like a studio)</label>
+    <label class="chk"><input type="checkbox" id="syHeal" ${o.heals ? 'checked' : ''}> Heal spots too</label>
+    <div class="row" style="margin-top:8px"><button id="syGo">Sync to ${n} photo${n > 1 ? 's' : ''}</button></div>`;
+  $('#syLight', box).onchange = (e) => { o.light = e.target.checked; };
+  $('#syHeal', box).onchange = (e) => { o.heals = e.target.checked; };
+  $('#syGo', box).onclick = async () => {
+    const qs = syncTargets(p);
+    $('#syGo', box).disabled = true;
+    for (const q of qs) {
+      const next = structuredClone(p.params);
+      if (!o.light) for (const k of SYNC_OWN) next[k] = q.params ? q.params[k] ?? 0 : 0;
+      if (!o.heals) next.heals = q.params && q.params.heals ? q.params.heals : [];
+      Object.assign(q, { params: next, solved: structuredClone(next), look: p.look, solvedLook: lookOf(p), finish: p.finish, finishStrength: p.finishStrength, strength: p.strength, split: p.split, status: 'done', synced: true });
+    }
+    rerenderMatchSoon();
+    toast(`Synced to ${qs.length} photo${qs.length > 1 ? 's' : ''}`, 2500);
+    // refresh each photo's checks with its new settings
+    await Promise.all(qs.map((q) => pool.call(q.worker, 'measureParams', { id: q.id, params: { ...q.params }, auto: null }).then((r) => { q.after = r.after; q.loss = r.loss; }).catch(() => {})));
+    rerenderMatchSoon();
+    if ($('#syGo')) $('#syGo').disabled = false;
   };
 }
 
@@ -889,7 +1177,7 @@ function openDetail(p) {
   el.classList.remove('cropping');
   document.body.style.overflow = 'hidden';
   el.innerHTML = `<div class="dtop">
-      <div class="dhead"><button class="ghost" id="dBack">‹ Back</button><div class="nm">${esc(p.name)}</div><button class="primary" id="dExport">Export</button></div>
+      <div class="dhead"><button class="ghost" id="dBack">‹ Back</button><div class="nm">${esc(p.name)}${p.cull ? ` <span class="muted small">${p.cull.eyes ? `eyes ${p.cull.eyes}` : ''}${p.cull.eyes && p.cull.focus != null ? ' · ' : ''}${p.cull.focus != null ? `focus ${p.cull.focus.toFixed(1)}` : ''}</span>` : ''}</div><button id="dPick" class="${p.picked ? 'on' : ''}" aria-pressed="${!!p.picked}" aria-label="Pick">★</button><button class="primary" id="dExport">Export</button></div>
       <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
         <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span></div>
       <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
@@ -905,16 +1193,21 @@ function openDetail(p) {
     <div class="dbody" id="dbody">
       <div class="card" id="styleCard"></div>
       <div class="card" id="regionCard"></div>
+      <div class="card" id="retouchCard"></div>
       <div class="card"><h3 id="gradeH">Color grading</h3><div id="grade"></div></div>
+      <div class="card" id="pointCard"></div>
       <div class="card" id="slidersCard"><div id="sliders"></div></div>
+      <div class="card" id="syncCard"></div>
       <div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div>
     </div>`;
-  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null, region: 'all', pick: null, showMask: false, flash: false };
+  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null, region: 'all', pick: null, showMask: false, flash: false,
+    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1 };
   $('#sliders').innerHTML = sliderGroups(p);
   $('#grade').innerHTML = gradeCard(p);
   el.scrollTop = 0;
   $('#dBack').onclick = closeDetail;
   $('#dExport').onclick = () => exportPhotos([p]);
+  $('#dPick').onclick = () => { p.picked = !p.picked; $('#dPick').classList.toggle('on', p.picked); $('#dPick').setAttribute('aria-pressed', String(p.picked)); };
   $('#mode').onclick = (e) => { const m = e.target.dataset.m; if (!m) return; D.mode = m; [...$('#mode').children].forEach((b) => b.classList.toggle('on', b.dataset.m === m)); draw(); };
   $('#clipBtn').onclick = () => setOverlay(!D.overlay);
   $('#cropBtn').onclick = () => enterCrop();
@@ -926,6 +1219,9 @@ function openDetail(p) {
   };
   renderStyleCard();
   renderRegionCard();
+  renderRetouchCard();
+  renderPointCard();
+  renderSyncCard();
   bindCropBar();
   bindSliders();
   bindWheels();
@@ -1037,6 +1333,8 @@ function refreshDetail() {
   $('#nums').innerHTML = numbersTable(D.p);
   renderStyleCard();
   renderRegionCard();
+  renderRetouchCard();
+  renderPointCard();
   rebuildControls();
   requestPreview(false);
   scheduleMeasure(0);
@@ -1103,6 +1401,7 @@ function draw() {
     x.drawImage(D.edit, sx, 0, w - sx, hgt, sx, 0, w - sx, hgt);
     x.fillStyle = 'rgba(255,255,255,.9)'; x.fillRect(sx - 1, 0, 2, hgt);
   }
+  drawHeals(x, cv);
   $('#lblL').hidden = m === 'after'; $('#lblR').hidden = m === 'before';
   $('#lblR').textContent = D.mode === 'after' && !D.holding ? 'After · hold for before' : 'After';
 }
@@ -1114,6 +1413,12 @@ function bindStage() {
   cv.addEventListener('pointerdown', (e) => {
     cv.setPointerCapture(e.pointerId);
     if (D.crop) return cropDown(e);
+    if (D.tool) {
+      const r = cv.getBoundingClientRect();
+      const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+      if (x >= 0 && y >= 0 && x <= 1 && y <= 1) toolTap(x, y);
+      return;
+    }
     if (D.pick) {
       const r = cv.getBoundingClientRect();
       const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
@@ -1570,9 +1875,9 @@ function setTopActions() {
     const l = h('<button>Import LR</button>'); l.onclick = () => $('#pickLR').click();
     ta.append(l, b);
   }
-  if (S.tab === 'match' && S.photos.some((p) => p.params)) {
-    const n = S.photos.filter((p) => p.params).length;
-    const b = h(`<button class="primary">Export${n > 1 ? ` all ${n}` : ''}</button>`); b.onclick = () => exportPhotos(S.photos.filter((p) => p.params));
+  if (S.tab === 'match' && visiblePhotos().some((p) => p.params)) {
+    const list = () => visiblePhotos().filter((p) => p.params), n = list().length;
+    const b = h(`<button class="primary">Export${n > 1 ? ` ${S.cullFilter === 'picks' ? 'picks' : 'all'} ${n}` : ''}</button>`); b.onclick = () => exportPhotos(list());
     ta.append(b);
   }
 }
