@@ -235,3 +235,14 @@ button.small { padding: 6px 10px; font-size: 13px; }
 label.chk { display: flex; gap: 8px; align-items: center; font-size: 13px; margin-top: 8px; color: var(--muted); }
 label.chk input { width: 18px; height: 18px; margin: 0; flex: none; }
 #slidersCard.local { border-color: var(--accent); }
+
+/* culling */
+.tile .cdots { position: absolute; left: 5px; top: 5px; display: flex; flex-direction: column; gap: 3px; }
+.tile .cdots i { width: 8px; height: 8px; border-radius: 50%; border: 1px solid rgba(0,0,0,.5); }
+.tile .cdots i.ok { background: #3ecf6b; } .tile .cdots i.mid { background: #f2b51d; } .tile .cdots i.bad { background: #ff4b4b; }
+.tile .cdots i.none { background: transparent; border-color: transparent; }
+.tile .pick { position: absolute; right: 6px; bottom: 3px; color: #ffd24a; font-size: 16px; text-shadow: 0 1px 2px rgba(0,0,0,.7); }
+.tile.picked { border-color: #ffd24a; }
+.strip .scene { flex: none; align-self: center; font-size: 11px; color: var(--muted); padding: 2px 5px; border-left: 1px solid var(--line); }
+.cullbar { margin-top: 8px; }
+#dPick.on { color: #ffd24a; border-color: #ffd24a; }
