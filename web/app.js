@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-27d';
+const APP_VERSION = '2026-09-28';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -47,6 +47,15 @@ function logError(step, err, file = null) {
 const errorText = (r) => `LookMatch ${r.app} · ${r.at}\nStep: ${r.step}\n${r.file ? `File: ${r.file.name} (${r.file.type || 'no type'}, ${r.file.mb} MB)\n` : ''}Error: ${r.message}\n${r.detail ? `${r.detail}\n` : ''}Browser: ${r.ua}`;
 async function copyText(t) {
   try { await navigator.clipboard.writeText(t); toast('Copied'); } catch (e) { toast('Copy failed; take a screenshot instead'); }
+}
+// The face and people models are a big part of the app. When one can't start on this device, log why (once per reason).
+const visionLogged = new Set();
+function noteVision(r, file) {
+  for (const [what, msg] of [['people finder', r.mask && !r.mask.ok && r.mask.err], ['face finder', r.faceErr]]) {
+    if (!msg || visionLogged.has(what + msg)) continue;
+    visionLogged.add(what + msg);
+    logError(what, new Error(msg), file);
+  }
 }
 function showProblem(title, rec, extraActs = '') {
   const s = openSheet(`<h2>${esc(title)}</h2><p>${esc(rec.message)}</p>
@@ -539,7 +548,7 @@ async function addPhotos(files) {
     const p = { id: uid(), file, name: file.name || 'photo.jpg', status: 'loading', strength: pr ? pr.strength : 100, worker: pool.assign() };
     S.photos.push(p);
     pool.call(p.worker, 'load', { id: p.id, file }).then((r) => {
-      p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask; p.cull = r.cull; S.scenesKey = null;
+      p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask; p.faceErr = r.faceErr; p.cull = r.cull; S.scenesKey = null; noteVision(r, file);
       p.status = 'ready'; rerenderMatchSoon(); runQueue();
     }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('add photo: read', e, file); rerenderMatchSoon(); });
   }
@@ -719,11 +728,12 @@ function regionCard(p) {
   const found = M.frac >= 0.0005, taps = M.picks ? `${M.picks} tap${M.picks > 1 ? 's' : ''}` : '';
   const status = D.pick ? `Tap the photo on what to ${D.pick === 'add' ? 'add to' : 'take out of'} the subject. Tap ${D.pick === 'add' ? '+ Add' : '− Remove'} again when done.`
     : found ? `Subject is ${Math.max(1, Math.round(M.frac * 100))}% of the photo (${[M.people && M.useAuto ? 'people found automatically' : '', taps].filter(Boolean).join(', ')}).`
-    : !M.ok ? "The people finder didn't load. Tap + Add, then the subject."
+    : !M.ok ? `The people finder didn't load${M.err ? `: ${esc(M.err.slice(0, 200))}` : ''}. Tap + Add, then the subject, or try again.`
     : M.people ? 'People turned off. Tap + Add, then the subject.' : 'No people found. Tap + Add, then the subject.';
   return `<h3>Subject and background</h3>${seg}
     <div class="mtools"><button id="mAdd" class="${D.pick === 'add' ? 'on' : ''}">+ Add</button><button id="mRem" class="${D.pick === 'remove' ? 'on' : ''}" ${found ? '' : 'disabled'}>− Remove</button><button id="mUndo" ${M.picks ? '' : 'disabled'}>Undo</button><div class="grow"></div><button id="mShow" class="${D.showMask ? 'on' : ''}" ${found ? '' : 'disabled'}>Show</button></div>
     <p class="muted small" style="margin:6px 0 0">${status}</p>
+    ${M.ok ? '' : '<div class="mtools"><button id="mRetry">Try again</button></div>'}
     ${M.people ? `<label class="chk"><input type="checkbox" id="mAuto" ${M.useAuto ? 'checked' : ''}> People count as the subject</label>` : ''}
     <label class="chk"><input type="checkbox" id="mSplit" ${p.split !== false ? 'checked' : ''}> Style sets the subject apart from the background</label>
     ${p.split !== false ? regionNote(p) : ''}`;
@@ -749,6 +759,7 @@ function renderRegionCard() {
   $('#mAdd', box).onclick = () => pick('add');
   $('#mRem', box).onclick = () => pick('remove');
   $('#mUndo', box).onclick = () => maskOp({ op: 'undo' });
+  if ($('#mRetry', box)) $('#mRetry', box).onclick = () => maskOp({ op: 'retry' });
   $('#mShow', box).onclick = () => { D.showMask = !D.showMask; renderRegionCard(); requestPreview(false); };
   if ($('#mAuto', box)) $('#mAuto', box).onchange = (e) => maskOp({ op: 'auto', on: e.target.checked });
   $('#mSplit', box).onchange = async (e) => {
@@ -776,6 +787,7 @@ function retouchCard(p) {
   const heals = P.heals || [], sel = heals[D.healSel];
   const tool = D.tool;
   const skinPart = !M ? '<p class="muted small">Looking for skin…</p>'
+    : M && !M.ok ? '<p class="muted small">Skin needs the people finder, which didn\'t load on this device. See Subject and background above.</p>'
     : !skin ? '<p class="muted small">No skin found, so skin smoothing and skin tone are off for this photo.</p>'
     : `<label class="chk"><input type="checkbox" id="skOn" ${smooth ? 'checked' : ''}> Smooth skin (faces and bodies only)</label>
       <div id="skSl">${SKIN_SLIDERS.map((s) => sliderRow(s, P[s.key] || 0)).join('')}</div>
@@ -984,14 +996,16 @@ function renderSyncCard() {
 
 async function maskOp(args) {
   const p = D.p;
-  const busy = args.op === 'add' || args.op === 'remove';
-  if (busy) toast(args.op === 'add' ? 'Finding what you tapped…' : 'Taking it out…', 15000);
+  const busy = args.op === 'add' || args.op === 'remove' || args.op === 'retry';
+  if (busy) toast(args.op === 'add' ? 'Finding what you tapped…' : args.op === 'remove' ? 'Taking it out…' : 'Looking for people and faces again…', 30000);
   try {
     const r = await pool.call(p.worker, 'mask', { id: p.id, ...args }, { priority: true });
     if (busy) $('#toast').hidden = true;
     p.mask = r.mask; p.before = r.before;
+    if (args.op === 'retry') { p.faceErr = r.faceErr; noteVision(r, p.file); if (!r.mask.ok) toast("The people finder still won't start. Settings has a check that says why.", 5000); }
     if (!D || D.p !== p) return;
     renderRegionCard();
+    if (args.op === 'retry') renderRetouchCard();
     // a new subject changes what the style does, unless the sliders were already hand-tuned
     if (lookOf(p) && p.split !== false && !D.userEdited) {
       await solvePhoto(p, { priority: true });
@@ -1822,6 +1836,7 @@ function renderSettings() {
         <li>Paste the client ID above.</li></ol></details>
     </div>
     <div class="card"><h3>Recent problems</h3>${errs.length ? `<p class="small">${errs.length} logged on this device. Latest: ${esc(errs[0].step)}, ${esc(errs[0].message)}</p><div class="bar"><button id="sErrCopy">Copy all</button><button class="ghost" id="sErrClear">Clear</button></div>` : '<p class="muted small">None logged.</p>'}</div>
+    <div class="card"><h3>Subject and skin detection</h3><p class="muted small">Runs the face and people models on this phone and lists each step. If subject, background or skin detection isn't working, run it and send me the copied result.</p><div class="bar"><button id="sVis">Run check</button></div><div id="sVisOut"></div></div>
     <div class="card"><h3>About</h3><p class="muted small">Everything runs on this phone. Photo presets store measured targets, not slider values. Imported Lightroom presets apply their exact values after each photo's exposure and white balance are normalised. Each photo is measured and solved on its own. Workers: ${pool.workers.length}.</p></div>
   </div>`;
   $('#sDest').value = s.dest; $('#sLRM').value = s.lrMode;
@@ -1833,6 +1848,20 @@ function renderSettings() {
   $('#sConn').onclick = async () => {
     if (S.photos.length && !(await confirmSheet('Reload to sign in?', 'Photos you added will need to be added again.', 'Continue'))) return;
     drive.connect(s.clientId);
+  };
+  $('#sVis').onclick = async () => {
+    const b = $('#sVis'), out = $('#sVisOut');
+    b.disabled = true;
+    out.innerHTML = '<p class="muted small">Checking. This can take a minute the first time.</p>';
+    let text;
+    try {
+      const r = await pool.call(0, 'visionCheck', {}, { priority: true });
+      text = [`LookMatch ${APP_VERSION}`, `Browser: ${navigator.userAgent}`, `Home-screen app: ${navigator.standalone === true}`, `Workers: ${pool.workers.length}`, '']
+        .concat(r.rows.map((x) => `${x.ok ? 'OK  ' : 'FAIL'} ${x.step} (${x.ms} ms)${x.detail ? `: ${x.detail}` : ''}`)).join('\n');
+    } catch (e) { text = `The check itself failed: ${e.message}`; }
+    out.innerHTML = `<pre class="small" style="white-space:pre-wrap;word-break:break-word;margin:8px 0">${esc(text)}</pre><div class="bar"><button id="sVisCopy">Copy</button></div>`;
+    $('#sVisCopy').onclick = () => copyText(text);
+    b.disabled = false;
   };
   if ($('#sErrCopy')) $('#sErrCopy').onclick = () => copyText(errs.map(errorText).join('\n\n'));
   if ($('#sErrClear')) $('#sErrClear').onclick = () => { localStorage.removeItem(ERR_KEY); renderSettings(); };

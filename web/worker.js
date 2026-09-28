@@ -12,8 +12,9 @@ import { exifSegment, xmpSegment, insertSegments, isJpeg, jpegOrientation } from
 import { isIdentityGeom, geomKey, geomSize, drawTransform, mapPolys, lightroomCrop, autoLevel, toSource } from './engine/geom.js';
 import encodeJpeg from './vendor/jpeg-encoder.js';
 import { parse as parseExif } from './vendor/exifr-lite.mjs';
-import { detectFaces } from './faces.js';
-import { personMask, tapMask, maskCanvasSize } from './segment.js';
+import { detectFaces, landmarker } from './faces.js';
+import { personMask, tapMask, maskCanvasSize, segmenter } from './segment.js';
+import { visionErrors, LOADER, WASM } from './mp.js';
 import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear } from './engine/color.js';
@@ -140,10 +141,11 @@ function touch(id) {
 //            Working size, whole uncropped photo.
 async function ensureMask(e, bmp) {
   if (e.mask !== undefined) return;
-  let m = null;
-  try { m = await personMask(bmp); } catch (err) { console.warn('person mask failed', err); }
+  let m = null, why = null;
+  try { m = await personMask(bmp); } catch (err) { console.warn('person mask failed', err); why = `people finder failed while running: ${(err && err.message) || err}`; }
+  if (!m && !why) why = (visionErrors.person && visionErrors.person.message) || "the people model didn't start";
   const [w, h] = m ? [m.w, m.h] : maskCanvasSize(bmp.width, bmp.height);
-  e.mask = { w, h, person: m ? m.data : new Uint8Array(w * h), personFrac: m ? m.frac : 0, ok: !!m, useAuto: true, picks: [], sub: null, frac: 0, ver: 0,
+  e.mask = { w, h, person: m ? m.data : new Uint8Array(w * h), personFrac: m ? m.frac : 0, ok: !!m, err: m ? null : why, useAuto: true, picks: [], sub: null, frac: 0, ver: 0,
     skin: m && m.skin ? m.skin : new Uint8Array(w * h), skinFrac: m && m.skin ? m.skinFrac : 0, canvases: {} };
   combineMask(e);
 }
@@ -164,10 +166,12 @@ function combineMask(e) {
   M.sub = sub; M.frac = on / 255 / n; M.ver++; M.canvases = {};
 }
 
+const faceError = () => (visionErrors.face && visionErrors.face.message) || null;
+
 const maskInfo = (e) => {
   const M = e.mask;
   if (!M) return null;
-  return { ok: M.ok, people: M.personFrac >= 0.005, personFrac: M.personFrac, useAuto: M.useAuto, picks: M.picks.length, frac: M.frac, ver: M.ver, skin: M.skinFrac || 0 };
+  return { ok: M.ok, err: M.err || null, people: M.personFrac >= 0.005, personFrac: M.personFrac, useAuto: M.useAuto, picks: M.picks.length, frac: M.frac, ver: M.ver, skin: M.skinFrac || 0 };
 };
 
 // key: 'sub' (the subject) or 'skin'
@@ -406,7 +410,7 @@ const handlers = {
     try { cull = cullInfo(e, bmp); } catch (err) { console.warn('cull info failed', err); }
     bmp.close();
     touch(id);
-    return { stats: measure(e.ps), thumb, cull, width: e.fullW, height: e.fullH, scene: e.scene, faces: e.faces ? e.faces.length : null, converted: e.converted || null, mask: maskInfo(e) };
+    return { stats: measure(e.ps), thumb, cull, width: e.fullW, height: e.fullH, scene: e.scene, faces: e.faces ? e.faces.length : null, faceErr: e.faces ? null : faceError(), converted: e.converted || null, mask: maskInfo(e) };
   },
 
   // subject mask edits. op: 'add' / 'remove' (the object under x, y: 0..1 of the photo as shown, after
@@ -416,6 +420,15 @@ const handlers = {
     if (!e) throw new Error('photo not loaded');
     const bmp = await openBitmap(e, id);
     try {
+      if (op === 'retry') {
+        // the models failed to start: give them fresh attempts, then find faces and people again
+        segmenter.retry(); landmarker.retry();
+        if (e.faces === null) e.faces = undefined;
+        if (e.mask && !e.mask.ok) e.mask = undefined;
+        await analyze(e, bmp);
+        touch(id);
+        return { mask: maskInfo(e), before: measure(e.ps), faces: e.faces ? e.faces.length : null, faceErr: e.faces ? null : faceError() };
+      }
       if (e.mask === undefined) await ensureMask(e, bmp);
       const M = e.mask;
       if (op === 'add' || op === 'remove') {
@@ -634,6 +647,59 @@ const handlers = {
       if (origJpeg) out.lrCopy = new Blob([insertSegments(orig, [xmpSegment(xmpPacket(params, lrMode, crop))], { dropXmp: true })], { type: 'image/jpeg' });
     }
     return out;
+  },
+
+  // On-device check of what face, people and skin detection depend on, one row per step, for Settings.
+  async visionCheck() {
+    const rows = [];
+    const step = async (name, fn) => {
+      const t0 = performance.now();
+      try {
+        const d = await fn();
+        rows.push({ step: name, ok: true, ms: Math.round(performance.now() - t0), detail: d == null ? '' : String(d) });
+        return true;
+      } catch (err) {
+        rows.push({ step: name, ok: false, ms: Math.round(performance.now() - t0), detail: String((err && err.message) || err) });
+        return false;
+      }
+    };
+    const simd = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]);
+    await step('worker', () => `OffscreenCanvas ${typeof OffscreenCanvas}, wasm simd ${WebAssembly.validate(simd)}, ${navigator.hardwareConcurrency} cores, memory ${navigator.deviceMemory ?? 'n/a'} GB`);
+    await step('webgl2 in worker', () => {
+      const gl = new OffscreenCanvas(1, 1).getContext('webgl2');
+      if (!gl) throw new Error('no webgl2 context');
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      const ext = ['EXT_color_buffer_float', 'OES_texture_float_linear', 'EXT_float_blend'].filter((n) => gl.getExtension(n));
+      return `${dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'renderer hidden'}; ${ext.join(', ') || 'no float extensions'}`;
+    });
+    await step('download models', async () => {
+      const out = [];
+      for (const f of ['models/face_landmarker.task', 'models/selfie_multiclass_256x256.tflite', 'vendor/mediapipe/wasm/vision_wasm_module_internal.wasm']) {
+        const r = await fetch(new URL('./' + f, import.meta.url));
+        if (!r.ok) throw new Error(`${f}: HTTP ${r.status}`);
+        out.push(`${f.split('/').pop()} ${((await r.arrayBuffer()).byteLength / 1048576).toFixed(1)} MB`);
+      }
+      return out.join(', ');
+    });
+    await step('wasm loader', async () => { const m = await import(LOADER); return `default export is a ${typeof m.default}; ${WASM.split('/').slice(-3).join('/')}`; });
+    const started = async (get, err) => {
+      get.retry();
+      const t = await get();
+      if (!t) throw new Error((visionErrors[err] && `${visionErrors[err].message}${visionErrors[err].stack ? '\n' + visionErrors[err].stack : ''}`) || "didn't start");
+      return t;
+    };
+    const blank = () => { const c = new OffscreenCanvas(256, 256), x = c.getContext('2d'); x.fillStyle = '#887766'; x.fillRect(0, 0, 256, 256); return x.getImageData(0, 0, 256, 256); };
+    let lm = null, seg = null;
+    if (await step('face model starts', async () => { lm = await started(landmarker, 'face'); return 'ok'; })) {
+      await step('face model runs', () => `${lm.detect(blank()).faceLandmarks.length} faces in a blank frame`);
+    }
+    if (await step('people model starts', async () => { seg = await started(segmenter, 'person'); return 'ok'; })) {
+      await step('people model runs', () => {
+        const r = seg.segment(blank());
+        try { const m = r.confidenceMasks[0], a = m.getAsFloat32Array(); return `mask ${m.width}x${m.height}, ${a.length} values read`; } finally { r.close(); }
+      });
+    }
+    return { rows, cores: navigator.hardwareConcurrency };
   },
 
   async unload({ id }) { cache.delete(id); return {}; },

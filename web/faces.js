@@ -2,23 +2,15 @@
 // The model is tuned for faces that fill a good part of the frame, so when the whole-image pass finds
 // nothing, it retries on overlapping zoomed-in tiles to catch small faces in full-body and group shots.
 import { FaceLandmarker } from './vendor/mediapipe/vision_bundle.mjs';
-import { createTask } from './mp.js';
+import { lazyTask } from './mp.js';
 
 // face silhouette, in order around the face (MediaPipe face mesh indices)
 const OVAL = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109];
 
-let lmP = null;
-function landmarker() {
-  if (!lmP) {
-    lmP = (async () => {
-      return createTask(FaceLandmarker, {
-        baseOptions: { modelAssetPath: new URL('./models/face_landmarker.task', import.meta.url).href, delegate: 'CPU' },
-        runningMode: 'IMAGE', numFaces: 8, minFaceDetectionConfidence: 0.45, minFacePresenceConfidence: 0.45, outputFaceBlendshapes: true,
-      });
-    })().catch((e) => { console.warn('face model unavailable:', e); return null; });
-  }
-  return lmP;
-}
+export const landmarker = lazyTask('face', FaceLandmarker, {
+  baseOptions: { modelAssetPath: new URL('./models/face_landmarker.task', import.meta.url).href, delegate: 'CPU' },
+  runningMode: 'IMAGE', numFaces: 8, minFaceDetectionConfidence: 0.45, minFacePresenceConfidence: 0.45, outputFaceBlendshapes: true,
+});
 
 function draw(src, sx, sy, sw, sh, dw, dh) {
   const c = new OffscreenCanvas(dw, dh);
