@@ -14,7 +14,7 @@ import encodeJpeg from './vendor/jpeg-encoder.js';
 import { parse as parseExif } from './vendor/exifr-lite.mjs';
 import { detectFaces, landmarker } from './faces.js';
 import { personMask, tapMask, maskCanvasSize, segmenter } from './segment.js';
-import { visionErrors, LOADER, WASM } from './mp.js';
+import { visionErrors, LOADER, WASM, MP_BUILD } from './mp.js';
 import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear } from './engine/color.js';
@@ -664,7 +664,12 @@ const handlers = {
       }
     };
     const simd = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]);
-    await step('worker', () => `OffscreenCanvas ${typeof OffscreenCanvas}, wasm simd ${WebAssembly.validate(simd)}, ${navigator.hardwareConcurrency} cores, memory ${navigator.deviceMemory ?? 'n/a'} GB`);
+    await step('worker', () => {
+      // the test MediaPipe makes to decide whether it can use OffscreenCanvas (else it reaches for `document`)
+      const ua = navigator.userAgent, safari = ua.includes('Safari') && !ua.includes('Chrome'), ver = (ua.match(/Version\/(\d+).*Safari/) || [])[1];
+      const canvasOk = typeof OffscreenCanvas === 'function' && (!safari || Number(ver) >= 17);
+      return `${MP_BUILD}; importScripts ${typeof importScripts}; OffscreenCanvas ${typeof OffscreenCanvas}; MediaPipe sees ${safari ? `Safari ${ver ?? 'without a version number'}` : 'not Safari'}, so ${canvasOk ? 'uses OffscreenCanvas' : 'falls back to document'}; wasm simd ${WebAssembly.validate(simd)}; ${navigator.hardwareConcurrency} cores; ${ua}`;
+    });
     await step('webgl2 in worker', () => {
       const gl = new OffscreenCanvas(1, 1).getContext('webgl2');
       if (!gl) throw new Error('no webgl2 context');

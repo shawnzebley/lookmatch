@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-28';
+const APP_VERSION = '2026-09-28b';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -1837,7 +1837,7 @@ function renderSettings() {
     </div>
     <div class="card"><h3>Recent problems</h3>${errs.length ? `<p class="small">${errs.length} logged on this device. Latest: ${esc(errs[0].step)}, ${esc(errs[0].message)}</p><div class="bar"><button id="sErrCopy">Copy all</button><button class="ghost" id="sErrClear">Clear</button></div>` : '<p class="muted small">None logged.</p>'}</div>
     <div class="card"><h3>Subject and skin detection</h3><p class="muted small">Runs the face and people models on this phone and lists each step. If subject, background or skin detection isn't working, run it and send me the copied result.</p><div class="bar"><button id="sVis">Run check</button></div><div id="sVisOut"></div></div>
-    <div class="card"><h3>About</h3><p class="muted small">Everything runs on this phone. Photo presets store measured targets, not slider values. Imported Lightroom presets apply their exact values after each photo's exposure and white balance are normalised. Each photo is measured and solved on its own. Workers: ${pool.workers.length}.</p></div>
+    <div class="card"><h3>About</h3><p class="muted small">Everything runs on this phone. Photo presets store measured targets, not slider values. Imported Lightroom presets apply their exact values after each photo's exposure and white balance are normalised. Each photo is measured and solved on its own. Workers: ${pool.workers.length}. Version ${APP_VERSION}.</p></div>
   </div>`;
   $('#sDest').value = s.dest; $('#sLRM').value = s.lrMode;
   $('#sDest').onchange = (e) => { s.dest = e.target.value; saveSettings(); };

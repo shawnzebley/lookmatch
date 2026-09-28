@@ -12,6 +12,19 @@ if (typeof self.importScripts !== 'function' && typeof document === 'undefined')
   self.importScripts = () => { throw new TypeError('importScripts is not available in module workers'); };
 }
 
+// MediaPipe also reaches for `document` to make a canvas when it decides the browser is Safari without a usable
+// OffscreenCanvas. It decides from the user agent (Safari token, no `Version/` number) and iPhones don't always
+// match. A worker has no document, so hand it a stand-in that makes OffscreenCanvases while a task is built.
+const WORKER_DOCUMENT = {
+  createElement(tag) {
+    if (tag === 'canvas' && typeof OffscreenCanvas === 'function') return new OffscreenCanvas(1, 1);
+    throw new Error(`MediaPipe asked the worker for a <${tag}> element`);
+  },
+};
+
+// Shown in Settings > Run check, so a copy of this file that is stale on the phone is obvious.
+export const MP_BUILD = 'mp-2';
+
 export const WASM = new URL('./vendor/mediapipe/wasm', import.meta.url).href;
 export const LOADER = new URL('./vendor/mediapipe/wasm/vision_wasm_module_internal.js', import.meta.url).href;
 let filesP = null;
@@ -23,7 +36,9 @@ export function createTask(Task, options) {
     const files = await filesP;
     const m = await import(LOADER);
     self.ModuleFactory = m.default;
-    return Task.createFromOptions(files, options);
+    const stand = typeof document === 'undefined';
+    if (stand) self.document = WORKER_DOCUMENT;
+    try { return await Task.createFromOptions(files, options); } finally { if (stand) delete self.document; }
   };
   const p = chain.then(run, run);
   chain = p.catch(() => {});
