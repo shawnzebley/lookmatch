@@ -1171,6 +1171,7 @@ function renderStyleCard() {
 }
 
 // ---------------------------------------------------------------- detail view
+const PAGES = [['look', 'Look'], ['subject', 'Subject'], ['light', 'Light'], ['color', 'Color'], ['retouch', 'Retouch'], ['more', 'More']];
 function openDetail(p) {
   const el = $('#detail');
   el.hidden = false;
@@ -1179,7 +1180,7 @@ function openDetail(p) {
   el.innerHTML = `<div class="dtop">
       <div class="dhead"><button class="ghost" id="dBack">‹ Back</button><div class="nm">${esc(p.name)}${p.cull ? ` <span class="muted small">${p.cull.eyes ? `eyes ${p.cull.eyes}` : ''}${p.cull.eyes && p.cull.focus != null ? ' · ' : ''}${p.cull.focus != null ? `focus ${p.cull.focus.toFixed(1)}` : ''}</span>` : ''}</div><button id="dPick" class="${p.picked ? 'on' : ''}" aria-pressed="${!!p.picked}" aria-label="Pick">★</button><button class="primary" id="dExport">Export</button></div>
       <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
-        <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span></div>
+        <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span><button class="zfit" id="zoomFit" aria-label="Fit photo to screen">Fit</button></div>
       <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
         <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><div class="grow"></div><button id="reMatch">Redo</button></div>
       <div class="cropbar" id="cropbar" hidden>
@@ -1189,22 +1190,22 @@ function openDetail(p) {
       </div>
       <div class="lossbar" id="loss"></div>
     </div>
-    <div id="dspace"></div>
-    <div class="dbody" id="dbody">
-      <div class="card" id="styleCard"></div>
-      <div class="card" id="regionCard"></div>
-      <div class="card" id="retouchCard"></div>
-      <div class="card"><h3 id="gradeH">Color grading</h3><div id="grade"></div></div>
-      <div class="card" id="pointCard"></div>
-      <div class="card" id="slidersCard"><div id="sliders"></div></div>
-      <div class="card" id="syncCard"></div>
-      <div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div>
+    <div class="dpanel" id="dbody">
+      <div class="ptabs" id="ptabs">${PAGES.map(([k, l]) => `<button data-p="${k}">${l}</button>`).join('')}</div>
+      <div class="pager" id="pager">
+        <div class="page" data-p="look"><div class="card" id="styleCard"></div></div>
+        <div class="page" data-p="subject"><div class="card" id="regionCard"></div></div>
+        <div class="page" data-p="light"><div class="card" id="slidersCard"><div id="sliders"></div></div></div>
+        <div class="page" data-p="color"><div class="card"><h3 id="gradeH">Color grading</h3><div id="grade"></div></div><div class="card" id="pointCard"></div></div>
+        <div class="page" data-p="retouch"><div class="card" id="retouchCard"></div></div>
+        <div class="page" data-p="more"><div class="card" id="syncCard"></div><div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div></div>
+      </div>
     </div>`;
   D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null, region: 'all', pick: null, showMask: false, flash: false,
-    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1 };
+    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1, view: { s: 1, x: 0, y: 0 }, hi: false, page: 'look' };
   $('#sliders').innerHTML = sliderGroups(p);
   $('#grade').innerHTML = gradeCard(p);
-  el.scrollTop = 0;
+  bindPager();
   $('#dBack').onclick = closeDetail;
   $('#dExport').onclick = () => exportPhotos([p]);
   $('#dPick').onclick = () => { p.picked = !p.picked; $('#dPick').classList.toggle('on', p.picked); $('#dPick').setAttribute('aria-pressed', String(p.picked)); };
@@ -1226,32 +1227,58 @@ function openDetail(p) {
   bindSliders();
   bindWheels();
   bindStage();
-  el.onscroll = () => requestAnimationFrame(applyShrink);
-  applyShrink();
   renderLoss();
   requestPreview(true);
   scheduleMeasure(0);
 }
 
-// ---------------------------------------------------------------- photo shrinks while scrolling
-// The stage starts at 40% of the screen height (62% in landscape) and gives up height as the
-// controls scroll, down to STAGE_MIN of that. A spacer takes the height it gave up, so the
-// sliders track the finger instead of jumping.
-const STAGE_MIN = 0.5;
-function stageMax() { return Math.round(window.innerHeight * (window.innerWidth > window.innerHeight ? 0.62 : 0.4)); }
-function applyShrink() {
-  if (!D) return;
-  const st = $('#stage'), sp = $('#dspace'), det = $('#detail');
-  if (!st || !sp) return;
-  if (D.crop) { st.style.height = ''; sp.style.height = '0px'; return; }
-  const mx = stageMax(), mn = Math.round(mx * STAGE_MIN);
-  const d = Math.max(0, Math.min(mx - mn, det.scrollTop));
-  st.style.height = `${mx - d}px`;
-  sp.style.height = `${d}px`;
-  const small = d > (mx - mn) * 0.6;
-  $('#refthumb')?.classList.toggle('mini', small);
+// ---------------------------------------------------------------- bottom panel: swipe left/right between pages
+function bindPager() {
+  const pager = $('#pager'), tabs = $('#ptabs');
+  const mark = (k) => { D.page = k; tabs.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.p === k)); tabs.querySelector('button.on')?.scrollIntoView({ inline: 'center', block: 'nearest' }); };
+  const pageEl = (k) => pager.querySelector(`.page[data-p="${k}"]`);
+  D.goPage = (k, smooth = true) => { const el = pageEl(k); if (!el) return; mark(k); pager.scrollTo({ left: el.offsetLeft, behavior: smooth ? 'smooth' : 'auto' }); };
+  tabs.onclick = (e) => { const k = e.target.closest('button')?.dataset.p; if (k) D.goPage(k); };
+  let t;
+  pager.onscroll = () => { clearTimeout(t); t = setTimeout(() => { const i = Math.round(pager.scrollLeft / Math.max(1, pager.clientWidth)); const k = pager.children[i]?.dataset.p; if (k && k !== D?.page) mark(k); }, 60); };
+  mark('look');
 }
-window.addEventListener('resize', () => { if (D) { applyShrink(); if (D.crop) drawCrop(); } });
+
+// ---------------------------------------------------------------- pinch / wheel zoom on the photo
+const ZMAX = 8;
+function applyView() {
+  const cv = $('#cv'), st = $('#stage');
+  if (!cv || !st) return;
+  const v = D.view;
+  const w = cv.offsetWidth * v.s, h = cv.offsetHeight * v.s;
+  const mx = Math.max(0, (w - st.clientWidth) / 2), my = Math.max(0, (h - st.clientHeight) / 2);
+  v.x = Math.max(-mx, Math.min(mx, v.x)); v.y = Math.max(-my, Math.min(my, v.y));
+  cv.style.transform = v.s === 1 && !v.x && !v.y ? '' : `translate(${v.x}px, ${v.y}px) scale(${v.s})`;
+  st.classList.toggle('zoomed', v.s > 1.01);
+}
+// zoom to scale s keeping the content point under (cx, cy) (client coords) fixed
+function zoomAt(s, cx, cy) {
+  const st = $('#stage').getBoundingClientRect(), v = D.view;
+  s = Math.max(1, Math.min(ZMAX, s));
+  const px = cx - (st.left + st.width / 2), py = cy - (st.top + st.height / 2);
+  const k = s / v.s;
+  v.x = px - (px - v.x) * k; v.y = py - (py - v.y) * k; v.s = s;
+  if (s === 1) { v.x = 0; v.y = 0; }
+  applyView(); zoomSettled();
+}
+function resetView() { if (D) { D.view = { s: 1, x: 0, y: 0 }; applyView(); zoomSettled(); } }
+// render bigger once zoomed in, back to screen size when zoomed out
+let zoomT;
+function zoomSettled() {
+  clearTimeout(zoomT);
+  zoomT = setTimeout(() => {
+    if (!D || D.crop) return;
+    const hi = D.view.s > 1.4;
+    if (hi === D.hi) return;
+    D.hi = hi; D.orig = null; requestPreview(true);
+  }, 250);
+}
+window.addEventListener('resize', () => { if (D) { applyView(); if (D.crop) drawCrop(); } });
 
 function finishButtons(p, pr) {
   const cur = p.finish || pr?.finish || 'off';
@@ -1303,10 +1330,9 @@ function jumpToSlider(k) {
   if (D.region !== want) { D.region = want; renderRegionCard(); rebuildControls(); requestPreview(false); }
   const row = controlFor(k);
   if (!row) return;
-  const det = $('#detail');
   const dt = row.closest('details'); if (dt) dt.open = true;
-  const top = $('.dtop').getBoundingClientRect().height;
-  det.scrollTo({ top: det.scrollTop + row.getBoundingClientRect().top - top - 12, behavior: 'smooth' });
+  const pg = row.closest('.page');
+  if (pg) { D.goPage(pg.dataset.p); pg.scrollTo({ top: Math.max(0, row.offsetTop - pg.offsetTop - 12), behavior: 'smooth' }); }
   row.classList.remove('flash'); void row.offsetWidth; row.classList.add('flash');
 }
 
@@ -1362,7 +1388,7 @@ function bindSliders() {
   });
 }
 
-const previewSide = () => Math.min(1600, Math.round(Math.max(window.innerWidth, 400) * Math.min(2, devicePixelRatio || 1)));
+const previewSide = () => (D && D.hi && !D.crop ? 2400 : Math.min(1600, Math.round(Math.max(window.innerWidth, 400) * Math.min(2, devicePixelRatio || 1))));
 
 async function requestPreview(withOriginal) {
   if (!D) return;
@@ -1407,45 +1433,73 @@ function draw() {
 }
 
 function bindStage() {
-  const cv = $('#cv');
-  let dragging = false;
-  const pos = (e) => { const r = cv.getBoundingClientRect(); return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)); };
+  const cv = $('#cv'), st = $('#stage');
+  const ptrs = new Map(); // active pointers, client coords
+  let mode = null, pinch = null, pan = null, tap = null;
+  const rel = (e) => { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height, r]; };
+  const inside = (x, y) => x >= 0 && y >= 0 && x <= 1 && y <= 1;
+  const two = () => { const [a, b] = [...ptrs.values()]; return { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; };
+  const setSplit = (e) => { const [x] = rel(e); D.split = Math.max(0, Math.min(1, x)); draw(); };
   cv.addEventListener('pointerdown', (e) => {
     cv.setPointerCapture(e.pointerId);
     if (D.crop) return cropDown(e);
-    if (D.tool) {
-      const r = cv.getBoundingClientRect();
-      const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
-      if (x >= 0 && y >= 0 && x <= 1 && y <= 1) toolTap(x, y);
+    ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (ptrs.size === 2) { // second finger: pinch, and drop whatever the first one started
+      mode = 'pinch'; tap = null;
+      if (D.holding) { D.holding = false; draw(); }
+      const t = two(); pinch = { d: t.d, s: D.view.s, x: D.view.x, y: D.view.y, cx: t.x, cy: t.y };
       return;
     }
-    if (D.pick) {
-      const r = cv.getBoundingClientRect();
-      const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
-      if (x >= 0 && y >= 0 && x <= 1 && y <= 1) maskOp({ op: D.pick, x, y });
-      return;
-    }
-    if (D.mode === 'split') { dragging = true; D.split = pos(e); }
-    else if (D.mode === 'after') D.holding = true;
+    if (ptrs.size > 2) return;
+    if (D.tool || D.pick) { mode = 'tap'; tap = { x: e.clientX, y: e.clientY }; return; } // taps fire on release so a pinch never lands one
+    const r = cv.getBoundingClientRect();
+    const nearLine = D.mode === 'split' && Math.abs(e.clientX - (r.left + r.width * D.split)) < 32;
+    if (D.view.s > 1.01 && !nearLine) { mode = 'pan'; pan = { x: e.clientX, y: e.clientY, vx: D.view.x, vy: D.view.y }; return; }
+    if (D.mode === 'split') { mode = 'split'; setSplit(e); return; }
+    if (D.mode === 'after') { mode = 'hold'; D.holding = true; }
     draw();
   });
   cv.addEventListener('pointermove', (e) => {
     if (D.crop) return cropMove(e);
-    if (dragging) { D.split = pos(e); draw(); }
+    if (ptrs.has(e.pointerId)) ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (mode === 'pinch' && ptrs.size >= 2) {
+      const t = two();
+      // scale about the start midpoint, then follow the fingers' midpoint
+      D.view = { s: pinch.s, x: pinch.x, y: pinch.y };
+      zoomAt(pinch.s * t.d / pinch.d, pinch.cx, pinch.cy);
+      D.view.x += t.x - pinch.cx; D.view.y += t.y - pinch.cy;
+      applyView();
+    } else if (mode === 'pan') { D.view.x = pan.vx + e.clientX - pan.x; D.view.y = pan.vy + e.clientY - pan.y; applyView(); }
+    else if (mode === 'split') setSplit(e);
+    else if (mode === 'tap' && tap && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) > 10) tap = null;
   });
   const up = (e) => {
     if (D && D.crop) return cropUp(e);
-    dragging = false; if (D && D.holding) { D.holding = false; draw(); }
+    ptrs.delete(e.pointerId);
+    if (mode === 'tap' && tap && D) {
+      const [x, y] = rel(e);
+      tap = null;
+      if (inside(x, y)) { if (D.tool) toolTap(x, y); else if (D.pick) maskOp({ op: D.pick, x, y }); }
+    }
+    if (D && D.holding) { D.holding = false; draw(); }
+    if (ptrs.size === 0) { mode = null; tap = null; }
+    else if (mode === 'pinch' && ptrs.size === 1) { // one finger left: carry on panning from where it is
+      const [p] = [...ptrs.values()]; mode = D.view.s > 1.01 ? 'pan' : null; pan = { x: p.x, y: p.y, vx: D.view.x, vy: D.view.y };
+    }
   };
   cv.addEventListener('pointerup', up);
-  cv.addEventListener('pointercancel', up);
+  cv.addEventListener('pointercancel', (e) => { tap = null; up(e); });
   cv.addEventListener('contextmenu', (e) => e.preventDefault());
+  // desktop: wheel / trackpad pinch zooms about the cursor, double-click toggles 3x
+  st.addEventListener('wheel', (e) => { if (D.crop) return; e.preventDefault(); zoomAt(D.view.s * Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0025)), e.clientX, e.clientY); }, { passive: false });
+  st.addEventListener('dblclick', (e) => { if (D.crop || D.tool || D.pick || e.pointerType === 'touch') return; if (D.view.s > 1.01) resetView(); else zoomAt(3, e.clientX, e.clientY); });
+  $('#zoomFit').onclick = resetView;
 }
 
 function closeDetail() {
   clearTimeout(measureT);
   const el = $('#detail');
-  el.onscroll = null; el.classList.remove('cropping');
+  el.classList.remove('cropping');
   el.hidden = true; el.innerHTML = '';
   document.body.style.overflow = '';
   D = null;
@@ -1468,10 +1522,9 @@ async function enterCrop() {
     aspect: g ? null : W / H, auto: !g, prev: g ? { ...g } : null, img: null, drag: null,
   };
   const det = $('#detail');
-  det.scrollTop = 0; det.classList.add('cropping');
+  resetView(); D.hi = false; D.orig = null; det.classList.add('cropping');
   $('#dctl').hidden = true; $('#cropbar').hidden = false; $('#loss').hidden = true; $('#dbody').hidden = true;
   $('#lblL').hidden = true; $('#lblR').hidden = true;
-  applyShrink();
   syncCropBar();
   try {
     const r = await pool.call(p.worker, 'preview', { id: p.id, params: { ...p.params }, side: previewSide(), plain: true }, { priority: true });
@@ -1487,7 +1540,6 @@ function exitCrop() {
   const det = $('#detail');
   det.classList.remove('cropping');
   $('#dctl').hidden = false; $('#cropbar').hidden = true; $('#loss').hidden = false; $('#dbody').hidden = false;
-  applyShrink();
   $('#cropBtn').classList.toggle('on', !!D.p.geom);
 }
 
