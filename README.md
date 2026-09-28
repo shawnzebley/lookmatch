@@ -37,6 +37,7 @@ python3 tools/style_records.py cvatik=scratch/pub/cvatik ...     # per-image num
 tools/with-server.sh node tools/e2e_edit.mjs scratch/e2e_edit     # HEIF upload, photographer finish + wheels, shrink, crop, export
 tools/with-server.sh node tools/e2e_retouch.mjs scratch/e2e_retouch portrait.jpg same_scene.jpg other.jpg   # cull dots, skin, heal, point colour, sync, export
 tools/with-server.sh node tools/e2e_subject.mjs scratch/e2e_subject ref.jpg photo.jpg cvatik   # people mask, split fit, Subject tab, tap add/undo, export
+tools/with-server.sh node tools/e2e_worker_no_importscripts.mjs portrait.jpg   # Safari's workers have no importScripts: face + people models must still start
 node tools/measure.mjs photo.jpg
 node tools/match.mjs ref.jpg a.jpg b.jpg --out out [--strength 0.8] [--full]
 tools/with-server.sh node tools/faces.mjs testdata/in/*   # cache face outlines for match.mjs

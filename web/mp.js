@@ -4,6 +4,14 @@
 // nothing: put the factory back before each create, one create at a time.
 import { FilesetResolver } from './vendor/mediapipe/vision_bundle.mjs';
 
+// Safari's module workers have no importScripts at all (Chrome has one that throws TypeError). MediaPipe's
+// loader checks for it and, when it's missing, assumes it is on a page and reaches for `document`, which a
+// worker doesn't have: "Can't find variable: document". A stub that throws TypeError sends it down its
+// import() path instead.
+if (typeof self.importScripts !== 'function' && typeof document === 'undefined') {
+  self.importScripts = () => { throw new TypeError('importScripts is not available in module workers'); };
+}
+
 export const WASM = new URL('./vendor/mediapipe/wasm', import.meta.url).href;
 export const LOADER = new URL('./vendor/mediapipe/wasm/vision_wasm_module_internal.js', import.meta.url).href;
 let filesP = null;
