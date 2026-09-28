@@ -278,6 +278,15 @@ export function compile(p) {
   const lumS = BANDS.map((b) => p[`lum_${b}`] / 100 * 18);
   const anyHsl = hueS.some((v) => v) || satS.some((v) => v) || lumS.some((v) => v);
 
+  // point colour (Lightroom's Color Mixer > Point Color): each point = a sampled Lab colour and how to move
+  // colours near it. params.points = [{ L, a, b, hue: -100..100 (+-30 deg), sat: -100..100, lum: -100..100,
+  // range: 0..100 (how far from the sample a colour still counts; 50 default) }]
+  const pts = (p.points || []).filter((q) => q && (q.hue || q.sat || q.lum)).map((q) => {
+    const rg = q.range ?? 50, Cs = Math.hypot(q.a, q.b);
+    return { L: q.L, h: Math.atan2(q.b, q.a), Cs, hw: (12 + 0.35 * rg) * Math.PI / 180, cw: 0.6 * Cs + 12 + 0.2 * rg, lw: 22 + 0.4 * rg,
+      dh: (q.hue || 0) / 100 * 30 * Math.PI / 180, ds: (q.sat || 0) / 100, dl: (q.lum || 0) / 100 * 20 };
+  });
+
   const cal = calibrationMatrix(p);
   const shTint = (p.calShadowTint || 0) / 100;
   const cM = !isIdentityCurve(p.curve) ? curveLUT(p.curve) : null;
@@ -364,6 +373,20 @@ export function compile(p) {
       const f = Math.max(0, 1 + ds * col);
       A *= f; B *= f;
       L += dl * col;
+    }
+
+    if (pts.length) {
+      for (const q of pts) {
+        const Cp = Math.hypot(A, B);
+        if (Cp < 1) continue;
+        let dh = Math.atan2(B, A) - q.h;
+        if (dh > Math.PI) dh -= 2 * Math.PI; else if (dh < -Math.PI) dh += 2 * Math.PI;
+        const w = Math.exp(-((dh / q.hw) ** 2)) * Math.exp(-(((Cp - q.Cs) / q.cw) ** 2)) * Math.exp(-(((L - q.L) / q.lw) ** 2)) * smoothstep(1, 6, Cp);
+        if (w < 1e-3) continue;
+        if (q.dh) { const a = q.dh * w, cs = Math.cos(a), sn = Math.sin(a); const a2 = A * cs - B * sn; B = A * sn + B * cs; A = a2; }
+        if (q.ds) { const f = Math.max(0, 1 + q.ds * w); A *= f; B *= f; }
+        if (q.dl) L += q.dl * w;
+      }
     }
 
     if (anyGrade) {

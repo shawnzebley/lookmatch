@@ -4,7 +4,8 @@ import { solve, solvePreset } from './engine/solver.js';
 import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
 import { fitRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
 import { signature, nearestRegions } from './engine/style.js';
-import { buildLUTs, applyLUTs, applyFinish, hasSpatialFinish, hasLocal, processPixelSet, SLIDERS, LOCAL_SLIDERS, REGIONS } from './engine/pipeline.js';
+import { compile, buildLUTs, applyLUTs, applyFinish, hasSpatialFinish, hasLocal, processPixelSet, SLIDERS, LOCAL_SLIDERS, REGIONS } from './engine/pipeline.js';
+import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
 import { exifSegment, xmpSegment, insertSegments, isJpeg, jpegOrientation } from './engine/jpegmeta.js';
@@ -14,6 +15,8 @@ import { parse as parseExif } from './vendor/exifr-lite.mjs';
 import { detectFaces } from './faces.js';
 import { personMask, tapMask, maskCanvasSize } from './segment.js';
 import { sceneFromExif } from './engine/scene.js';
+import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
+import { srgbToLinear } from './engine/color.js';
 
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
@@ -127,19 +130,21 @@ function touch(id) {
   if (e) e.lastUse = performance.now();
   // keep at most 3 prepared photos per worker; stats/params live in the main thread
   const entries = [...cache.entries()].filter(([, v]) => v.ps).sort((a, b) => b[1].lastUse - a[1].lastUse);
-  for (const [, v] of entries.slice(3)) { v.ps = null; v.display = null; v.gdisplay = null; v.sample = null; if (v.mask) v.mask.canvas = null; }
+  for (const [, v] of entries.slice(3)) { v.ps = null; v.display = null; v.gdisplay = null; v.sample = null; if (v.mask) v.mask.canvases = {}; }
   return e;
 }
 
 // ---------------------------------------------------------------- subject mask
 // e.mask = { w, h, person (0..255 people found by the model), personFrac, useAuto, picks: [{ add, x, y, data }],
-//            sub (the combined subject), frac, ver, ok }. Working size, whole uncropped photo.
+//            sub (the combined subject), frac, ver, ok, skin (0..255 facial + body skin), skinFrac }.
+//            Working size, whole uncropped photo.
 async function ensureMask(e, bmp) {
   if (e.mask !== undefined) return;
   let m = null;
   try { m = await personMask(bmp); } catch (err) { console.warn('person mask failed', err); }
   const [w, h] = m ? [m.w, m.h] : maskCanvasSize(bmp.width, bmp.height);
-  e.mask = { w, h, person: m ? m.data : new Uint8Array(w * h), personFrac: m ? m.frac : 0, ok: !!m, useAuto: true, picks: [], sub: null, frac: 0, ver: 0 };
+  e.mask = { w, h, person: m ? m.data : new Uint8Array(w * h), personFrac: m ? m.frac : 0, ok: !!m, useAuto: true, picks: [], sub: null, frac: 0, ver: 0,
+    skin: m && m.skin ? m.skin : new Uint8Array(w * h), skinFrac: m && m.skin ? m.skinFrac : 0, canvases: {} };
   combineMask(e);
 }
 
@@ -156,33 +161,36 @@ function combineMask(e) {
     }
   }
   let on = 0; for (let i = 0; i < n; i++) on += sub[i];
-  M.sub = sub; M.frac = on / 255 / n; M.ver++; M.canvas = null;
+  M.sub = sub; M.frac = on / 255 / n; M.ver++; M.canvases = {};
 }
 
 const maskInfo = (e) => {
   const M = e.mask;
   if (!M) return null;
-  return { ok: M.ok, people: M.personFrac >= 0.005, personFrac: M.personFrac, useAuto: M.useAuto, picks: M.picks.length, frac: M.frac, ver: M.ver };
+  return { ok: M.ok, people: M.personFrac >= 0.005, personFrac: M.personFrac, useAuto: M.useAuto, picks: M.picks.length, frac: M.frac, ver: M.ver, skin: M.skinFrac || 0 };
 };
 
-function maskCanvas(M) {
-  if (!M.canvas) {
+// key: 'sub' (the subject) or 'skin'
+function maskCanvas(M, key = 'sub') {
+  M.canvases ||= {};
+  if (!M.canvases[key]) {
+    const src = M[key];
     const [c, x] = canvas(M.w, M.h);
     const d = new ImageData(M.w, M.h);
-    for (let i = 0, j = 0; i < M.sub.length; i++, j += 4) { const v = M.sub[i]; d.data[j] = d.data[j + 1] = d.data[j + 2] = v; d.data[j + 3] = 255; }
+    for (let i = 0, j = 0; i < src.length; i++, j += 4) { const v = src[i]; d.data[j] = d.data[j + 1] = d.data[j + 2] = v; d.data[j + 3] = 255; }
     x.putImageData(d, 0, 0);
-    M.canvas = c;
+    M.canvases[key] = c;
   }
-  return M.canvas;
+  return M.canvases[key];
 }
 
 /**
  * The subject mask (0..255) for an output ow x oh showing the photo with geometry g. photoScale = output px
  * per photo px (default: the output is the whole geometry at ow wide); oy = first row, for export tiles.
  */
-function maskFor(e, ow, oh, g, oy = 0, photoScale = null) {
+function maskFor(e, ow, oh, g, oy = 0, photoScale = null, key = 'sub') {
   const M = e.mask;
-  if (!M || !M.sub || M.frac < 0.0005) return null;
+  if (!M || !M[key] || (key === 'sub' ? M.frac : M.skinFrac) < 0.0005) return null;
   const W = e.fullW, H = e.fullH;
   const s = photoScale ?? ow / geomSize(W, H, g)[0];
   const k = (s * W) / M.w; // output px per mask px
@@ -191,7 +199,7 @@ function maskFor(e, ow, oh, g, oy = 0, photoScale = null) {
   x.fillStyle = '#000'; x.fillRect(0, 0, ow, oh);
   if (isIdentityGeom(g)) x.setTransform(k, 0, 0, (s * H) / M.h, 0, -oy);
   else x.setTransform(...drawTransform(M.w, M.h, g, k, oy));
-  x.drawImage(maskCanvas(M), 0, 0);
+  x.drawImage(maskCanvas(M, key), 0, 0);
   const d = x.getImageData(0, 0, ow, oh).data;
   const out = new Uint8Array(ow * oh);
   for (let i = 0, j = 0; i < out.length; i++, j += 4) out[i] = d[j];
@@ -248,12 +256,26 @@ async function ensureDisplay(id, side, plain) {
   return e[slot];
 }
 
-function renderInto(src, params, mask = null) {
+// skin: the skin mask at src's size (for the skin pass); heals: spots in src px (healed before the LUT,
+// like Lightroom's spot removal, which works on the photo before the develop settings)
+function renderInto(src, params, mask = null, skin = null, heals = null) {
   const luts = buildLUTs(params, 33);
   const out = new Uint8ClampedArray(src.width * src.height * 4);
-  applyLUTs(luts, mask, src.data, out, src.width * src.height, 4, 4);
+  let data = src.data;
+  if (heals && heals.length) { data = Uint8ClampedArray.from(src.data); healBuffer(data, src.width, src.height, heals); }
+  applyLUTs(luts, mask, data, out, src.width * src.height, 4, 4);
+  if (skin && hasSkinPass(params)) applySkinPass(out, src.width, src.height, params, skin, Math.max(src.width, src.height));
   if (hasSpatialFinish(params)) applyFinish(out, src.width, src.height, params);
   return { width: src.width, height: src.height, data: out };
+}
+
+// output px per photo px for a display of the photo's geometry g that is dw wide
+const dispScale = (e, dw, g) => dw / geomSize(e.fullW, e.fullH, g)[0];
+// a point given as 0..1 of the output (after crop/level) -> photo px
+function outToPhoto(e, x, y, g) {
+  const W = e.fullW, H = e.fullH;
+  if (isIdentityGeom(g)) return [x * W, y * H];
+  return toSource((g.x + x * g.w) * W, (g.y + y * g.h) * H, W, H, g.angle || 0);
 }
 
 // Clipping overlay, same classes as engine/loss.js. Bright = caused by the edit, dim = already in the original.
@@ -275,6 +297,92 @@ function paintClipping(orig, out) {
   }
 }
 
+// rows [ya, ya + hh) of the output (the photo with geometry g, at full size) into canvas context x
+function drawBand(x, bmp, g, OW, ch, ya, hh, xa = 0) {
+  const W = bmp.width, H = bmp.height;
+  x.setTransform(1, 0, 0, 1, 0, 0);
+  x.clearRect(0, 0, OW, ch);
+  if (isIdentityGeom(g)) x.drawImage(bmp, xa, ya, OW, hh, 0, 0, OW, hh);
+  else {
+    x.fillStyle = '#000'; x.fillRect(0, 0, OW, ch);
+    const m = drawTransform(W, H, g, 1, ya);
+    m[4] -= xa;
+    x.setTransform(...m);
+    x.drawImage(bmp, 0, 0);
+  }
+}
+
+// Heal spots are healed once at full size, in patches that hold both the spot and its source, then
+// pasted into each band before the LUT (bands are too short to hold a spot's source).
+function healPatches(bmp, g, OW, OH, spots) {
+  const boxes = spots.map((s) => healBox(s, 3));
+  const union = boxes.reduce((u, b) => [Math.min(u[0], b[0]), Math.min(u[1], b[1]), Math.max(u[2], b[2]), Math.max(u[3], b[3])]);
+  const clip = (b) => [Math.max(0, b[0]), Math.max(0, b[1]), Math.min(OW, b[2]), Math.min(OH, b[3])];
+  const area = (b) => (b[2] - b[0]) * (b[3] - b[1]);
+  // one patch for all spots when that's small enough (spots on one face), else one per spot
+  const groups = area(clip(union)) <= 8_000_000 ? [[clip(union), spots]] : spots.map((s, i) => [clip(boxes[i]), [s]]);
+  const out = [];
+  for (const [[bx0, by0, bx1, by1], ss] of groups) {
+    const bw = bx1 - bx0, bh = by1 - by0;
+    if (bw <= 0 || bh <= 0) continue;
+    const [, x] = canvas(bw, bh);
+    x.imageSmoothingQuality = 'high';
+    drawBand(x, bmp, g, bw, bh, by0, bh, bx0);
+    const buf = x.getImageData(0, 0, bw, bh).data;
+    const local = ss.map((s) => ({ ...s, cx: s.cx - bx0, cy: s.cy - by0 }));
+    healBuffer(buf, bw, bh, local);
+    // only the spots themselves get pasted
+    const rects = local.map((s) => [Math.max(0, Math.floor(s.cx - s.r - 1)), Math.max(0, Math.floor(s.cy - s.r - 1)), Math.min(bw, Math.ceil(s.cx + s.r + 1)), Math.min(bh, Math.ceil(s.cy + s.r + 1))]);
+    out.push({ bx: bx0, by: by0, bw, buf, rects });
+  }
+  return out;
+}
+function pasteHealed(d, OW, hh, ya, patches) {
+  for (const P of patches) for (const [x0, y0, x1, y1] of P.rects) {
+    const r0 = Math.max(y0, ya - P.by), r1 = Math.min(y1, ya + hh - P.by);
+    for (let r = r0; r < r1; r++) {
+      const src = (r * P.bw + x0) * 4, dst = ((P.by + r - ya) * OW + P.bx + x0) * 4;
+      d.set(P.buf.subarray(src, src + (x1 - x0) * 4), dst);
+    }
+  }
+}
+
+// ---------------------------------------------------------------- culling
+// Per face: eyes closed? and a focus score (0-10, 8+ sharp) on the middle of the face (eyes, nose,
+// mouth). No face: focus on the sharpest part of a 3 x 3 grid. Plus a scene signature for grouping.
+function grayCrop(bmp, x0, y0, w, h) {
+  const tw = Math.max(8, Math.round(Math.min(FOCUS_SIDE, w))), th = Math.max(8, Math.round((h * tw) / w));
+  const [, x] = canvas(tw, th);
+  x.imageSmoothingQuality = 'high';
+  x.drawImage(bmp, x0, y0, w, h, 0, 0, tw, th);
+  const d = x.getImageData(0, 0, tw, th).data, g = new Float32Array(tw * th);
+  for (let i = 0; i < g.length; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+  return [g, tw, th];
+}
+function cullInfo(e, bmp) {
+  const W = bmp.width, H = bmp.height;
+  const faces = (e.faces || []).map((poly) => {
+    const xs = poly.map((q) => q[0] * W), ys = poly.map((q) => q[1] * H);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    const fw = x1 - x0, fh = y1 - y0;
+    const f = focusScore(edgeSharpness(...grayCrop(bmp, x0 + 0.2 * fw, y0 + 0.25 * fh, 0.6 * fw, 0.5 * fh)));
+    const closed = poly.blink ? eyesClosed(poly.blink[0], poly.blink[1]) : null;
+    return { size: fw / W, focus: f, closed };
+  }).sort((a, b) => b.size - a.size);
+  let focus = null;
+  if (faces.length) focus = faces[0].focus;
+  else {
+    for (let gy = 0; gy < 3; gy++) for (let gx = 0; gx < 3; gx++) {
+      const v = focusScore(edgeSharpness(...grayCrop(bmp, (gx * W) / 3, (gy * H) / 3, W / 3, H / 3)));
+      if (v != null && (focus == null || v > focus)) focus = v;
+    }
+  }
+  const known = faces.filter((f) => f.closed != null);
+  const eyes = !known.length ? null : known.some((f) => f.closed) ? 'closed' : 'open';
+  const small = scaledData(bmp, 96);
+  return { faces, focus, eyes, sig: sceneSig(small.data, small.width, small.height) };
+}
+
 const handlers = {
   async measureRef({ file }) {
     const e = { file };
@@ -294,9 +402,11 @@ const handlers = {
     const bmp = await openBitmap(e, id);
     await analyze(e, bmp);
     const thumb = await toJpegBlob(scaledData(bmp, 320), 0.8);
+    let cull = null;
+    try { cull = cullInfo(e, bmp); } catch (err) { console.warn('cull info failed', err); }
     bmp.close();
     touch(id);
-    return { stats: measure(e.ps), thumb, width: e.fullW, height: e.fullH, scene: e.scene, faces: e.faces ? e.faces.length : null, converted: e.converted || null, mask: maskInfo(e) };
+    return { stats: measure(e.ps), thumb, cull, width: e.fullW, height: e.fullH, scene: e.scene, faces: e.faces ? e.faces.length : null, converted: e.converted || null, mask: maskInfo(e) };
   },
 
   // subject mask edits. op: 'add' / 'remove' (the object under x, y: 0..1 of the photo as shown, after
@@ -329,6 +439,43 @@ const handlers = {
     } finally { bmp.close(); }
     touch(id);
     return { mask: maskInfo(e), before: measure(e.ps) };
+  },
+
+  // Heal spots. op 'add': a new spot at (x, y) (0..1 of the photo as shown) with radius `size` (fraction of
+  // the photo's long side), source picked automatically. op 'source': move spot `heal`'s source to (x, y).
+  // Returns the spot in whole-photo coordinates; the app keeps the list in params.heals.
+  async heal({ id, op, x, y, size = 0.015, opacity = 0.6, heal = null, side = 1200 }) {
+    const e = await ensurePrepared(id);
+    const g = e.geom, W = e.fullW, H = e.fullH;
+    const [px, py] = outToPhoto(e, x, y, g);
+    if (px < 0 || py < 0 || px > W || py > H) throw new Error('That spot is outside the photo');
+    if (op === 'source') return { heal: { ...heal, sx: px / W, sy: py / H } };
+    const d = await ensureDisplay(id, side, false); // same size as the preview, so its cached copy is reused
+    const k = dispScale(e, d.width, g);
+    const r = size * Math.max(W, H) * k;
+    const skin = e.mask && e.mask.skinFrac >= 0.0005 ? maskFor(e, d.width, d.height, g, 0, null, 'skin') : null;
+    const [sxd, syd] = pickHealSource(d.data, d.width, d.height, x * d.width, y * d.height, r, 4, skin);
+    const [sx, sy] = outToPhoto(e, sxd / d.width, syd / d.height, g);
+    return { heal: { x: px / W, y: py / H, r: size, sx: sx / W, sy: sy / H, op: opacity } };
+  },
+
+  // Point colour: the colour under (x, y) (0..1 of the photo as shown), as it comes out of the current
+  // edit without point colours, in Lab.
+  async samplePoint({ id, x, y, params, side = 1200 }) {
+    const d = await ensureDisplay(id, side, false);
+    const X = Math.round(x * (d.width - 1)), Y = Math.round(y * (d.height - 1)), rad = Math.max(2, Math.round(d.width / 250));
+    const proc = compile({ ...params, points: [] });
+    const res = new Float64Array(6), acc = [0, 0, 0];
+    let n = 0;
+    for (let j = -rad; j <= rad; j++) for (let i = -rad; i <= rad; i++) {
+      const u = X + i, v = Y + j;
+      if (u < 0 || v < 0 || u >= d.width || v >= d.height) continue;
+      const o = (v * d.width + u) * 4;
+      proc(srgbToLinear(d.data[o] / 255), srgbToLinear(d.data[o + 1] / 255), srgbToLinear(d.data[o + 2] / 255), res);
+      acc[0] += res[3]; acc[1] += res[4]; acc[2] += res[5]; n++;
+    }
+    if (!n) throw new Error('That spot is outside the photo');
+    return { L: acc[0] / n, a: acc[1] / n, b: acc[2] / n };
   },
 
   // crop/level for one photo; everything measured afterwards (solve, loss checks) sees only the crop
@@ -416,7 +563,14 @@ const handlers = {
       if (d.maskKey !== key) { d.mask = maskFor(e, d.width, d.height, plain ? null : e.geom); d.maskKey = key; }
       mask = d.mask;
     }
-    const out = renderInto(d, params, mask);
+    let skin = null, heals = null;
+    if (hasSkinPass(params) && e.mask) {
+      const key = `${e.mask.ver}`;
+      if (d.skinKey !== key) { d.skin = maskFor(e, d.width, d.height, plain ? null : e.geom, 0, null, 'skin'); d.skinKey = key; }
+      skin = d.skin;
+    }
+    if (hasHeals(params)) { const g = plain ? null : e.geom; heals = healsToOut(params.heals, e.fullW, e.fullH, g, dispScale(e, d.width, g)); }
+    const out = renderInto(d, params, mask, skin, heals);
     if (overlay) paintClipping(d.data, out.data);
     if (showMask && mask) paintMask(out.data, mask, showMask);
     const edited = await createImageBitmap(new ImageData(out.data, out.width, out.height));
@@ -436,23 +590,29 @@ const handlers = {
     const luts = buildLUTs(params, 33);
     const masked = !luts.lut && e.mask && e.mask.frac >= 0.0005;
     const rgba = new Uint8ClampedArray(OW * OH * 4);
+    // the skin pass blurs, so each band is rendered with `halo` rows of context above and below
+    const long = Math.max(OW, OH);
+    const skinOn = hasSkinPass(params) && e.mask && e.mask.skinFrac >= 0.0005;
+    const halo = skinOn ? skinHalo(long) : 0;
     // tiles keep each canvas well under iOS Safari's ~16.7 MP canvas limit
-    const tileH = Math.max(64, Math.min(OH, Math.floor(4_000_000 / OW)));
-    const [c, x] = canvas(OW, tileH);
+    const tileH = Math.max(64, Math.min(OH, Math.floor(4_000_000 / OW) - 2 * halo));
+    const [c, x] = canvas(OW, Math.min(OH, tileH + 2 * halo));
     x.imageSmoothingQuality = 'high';
+    const healed = hasHeals(params) ? healPatches(bmp, g, OW, OH, healsToOut(params.heals, W, H, g, 1, 0)) : null;
     for (let y = 0; y < OH; y += tileH) {
       const h = Math.min(tileH, OH - y);
-      x.setTransform(1, 0, 0, 1, 0, 0);
-      x.clearRect(0, 0, OW, tileH);
-      if (isIdentityGeom(g)) x.drawImage(bmp, 0, y, W, h, 0, 0, W, h);
-      else {
-        x.fillStyle = '#000'; x.fillRect(0, 0, OW, tileH);
-        x.setTransform(...drawTransform(W, H, g, 1, y));
-        x.drawImage(bmp, 0, 0);
-      }
-      const d = x.getImageData(0, 0, OW, h).data;
+      const ya = Math.max(0, y - halo), hh = Math.min(OH, y + h + halo) - ya;
+      drawBand(x, bmp, g, OW, c.height, ya, hh);
+      const d = x.getImageData(0, 0, OW, hh).data;
+      if (healed) pasteHealed(d, OW, hh, ya, healed);
       const band = rgba.subarray(y * OW * 4, (y + h) * OW * 4);
-      applyLUTs(luts, masked ? maskFor(e, OW, h, g, y, 1) : null, d, band, OW * h, 4, 4, 1 + y);
+      if (!halo) applyLUTs(luts, masked ? maskFor(e, OW, h, g, y, 1) : null, d, band, OW * h, 4, 4, 1 + y);
+      else {
+        const tmp = new Uint8ClampedArray(OW * hh * 4);
+        applyLUTs(luts, masked ? maskFor(e, OW, hh, g, ya, 1) : null, d, tmp, OW * hh, 4, 4, 1 + ya);
+        applySkinPass(tmp, OW, hh, params, maskFor(e, OW, hh, g, ya, 1, 'skin'), long, 4, y - ya, y - ya + h);
+        band.set(tmp.subarray((y - ya) * OW * 4, (y - ya + h) * OW * 4));
+      }
       if (hasSpatialFinish(params)) applyFinish(band, OW, h, params, y, OW, OH);
       postMessage({ progress: { id, phase: 'render', f: (y + h) / OH } });
     }

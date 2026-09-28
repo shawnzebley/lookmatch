@@ -111,13 +111,15 @@ function refine(prob, pw, ph, guide, w, h) {
   return m;
 }
 
+// person = not background; skin = body skin + face skin (Selfie Multiclass categories 2 and 3)
 function personProb(seg, img) {
   const r = seg.segment(img);
   try {
-    const bg = r.confidenceMasks[0].getAsFloat32Array();
-    const p = new Float32Array(bg.length);
-    for (let i = 0; i < p.length; i++) p[i] = 1 - bg[i];
-    return p;
+    const cm = r.confidenceMasks, bg = cm[0].getAsFloat32Array();
+    const body = cm[2] && cm[2].getAsFloat32Array(), face = cm[3] && cm[3].getAsFloat32Array();
+    const p = new Float32Array(bg.length), sk = new Float32Array(bg.length);
+    for (let i = 0; i < p.length; i++) { p[i] = 1 - bg[i]; sk[i] = body && face ? Math.min(1, body[i] + face[i]) : 0; }
+    return { p, sk };
   } finally { r.close(); }
 }
 
@@ -129,7 +131,7 @@ export function maskCanvasSize(W, H) {
 
 /**
  * People in the photo. bmp: ImageBitmap/canvas of the whole photo.
- * Returns { w, h, data: Uint8Array (0..255), frac } or null when the model failed; data is all zeros when nobody is there.
+ * Returns { w, h, data: Uint8Array (0..255), frac, skin: Uint8Array (0..255 facial + body skin), skinFrac } or null when the model failed; data is all zeros when nobody is there.
  */
 export async function personMask(bmp) {
   const seg = await segmenter();
@@ -142,12 +144,12 @@ export async function personMask(bmp) {
   const s1 = Math.min(1, MODEL_SIDE / Math.max(W, H));
   const pw = Math.max(1, Math.round(W * s1)), ph = Math.max(1, Math.round(H * s1));
   const p1 = personProb(seg, draw(bmp, 0, 0, W, H, pw, ph));
-  let prob = resample(p1, pw, ph, w, h);
+  let prob = resample(p1.p, pw, ph, w, h), skin = resample(p1.sk, pw, ph, w, h);
   // bounding box of what was found
   let x0 = w, y0 = h, x1 = -1, y1 = -1, cnt = 0;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (prob[y * w + x] > 0.5) { cnt++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
   const frac0 = cnt / (w * h);
-  if (frac0 < 0.002) return { w, h, data: new Uint8Array(w * h), frac: 0 };
+  if (frac0 < 0.002) return { w, h, data: new Uint8Array(w * h), frac: 0, skin: new Uint8Array(w * h), skinFrac: 0 };
   // pass 2: people small in the frame (full-length, groups) get a closer look at the model's resolution
   const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
   if ((bw * bh) / (w * h) < 0.45) {
@@ -158,7 +160,8 @@ export async function personMask(bmp) {
     const k = W / w; // working px -> photo px
     const s2 = Math.min(1, MODEL_SIDE / Math.max(cw * k, chh * k));
     const qw = Math.max(1, Math.round(cw * k * s2)), qh = Math.max(1, Math.round(chh * k * s2));
-    const p2 = resample(personProb(seg, draw(bmp, cx0 * k, cy0 * k, cw * k, chh * k, qw, qh)), qw, qh, cw, chh);
+    const q2 = personProb(seg, draw(bmp, cx0 * k, cy0 * k, cw * k, chh * k, qw, qh));
+    const p2 = resample(q2.p, qw, qh, cw, chh), sk2 = resample(q2.sk, qw, qh, cw, chh);
     // blend the close look in, fading to the whole-frame pass over the crop's outer band
     const fade = Math.max(2, Math.round(0.08 * Math.min(cw, chh)));
     // sides of the crop that sit on the photo's border need no fade
@@ -169,12 +172,16 @@ export async function personMask(bmp) {
         const t = Math.min(1, edge / fade);
         const i = (cy0 + y) * w + cx0 + x;
         prob[i] = prob[i] + (p2[y * cw + x] - prob[i]) * t;
+        skin[i] = skin[i] + (sk2[y * cw + x] - skin[i]) * t;
       }
     }
   }
   const data = refine(prob, w, h, guide, w, h);
   let on = 0; for (let i = 0; i < data.length; i++) on += data[i];
-  return { w, h, data, frac: on / 255 / data.length };
+  // skin: same edge refinement, then kept inside the person (the skin classes bleed onto warm backgrounds)
+  const sk = refine(skin, w, h, guide, w, h);
+  let son = 0; for (let i = 0; i < sk.length; i++) { sk[i] = (sk[i] * data[i]) / 255; son += sk[i]; }
+  return { w, h, data, frac: on / 255 / data.length, skin: sk, skinFrac: son / 255 / sk.length };
 }
 
 /**
