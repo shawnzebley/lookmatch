@@ -1,5 +1,5 @@
 // Headless test of: HEIF/HIF upload (libheif fallback in Chromium), photographer finish + colour wheels,
-// stage shrinking on scroll, crop + level, export size and Lightroom crop fields.
+// photo stage + swipeable panel, crop + level, export size and Lightroom crop fields.
 // usage: tools/with-server.sh node tools/e2e_edit.mjs scratch/e2e_edit
 import { chromium } from 'playwright';
 import fs from 'fs';
@@ -37,15 +37,9 @@ await page.waitForTimeout(800);
 console.log('style:', JSON.stringify(await page.evaluate(() => { const s = window.__lm.S.photos[0].style; return { basis: s.basis, k: s.k, n: s.n, wheels: s.wheels, sat: s.sat, blacks: s.blacks, vig: s.vignette }; })));
 console.log('note:', await page.$eval('#finNote', (e) => e.innerText));
 await page.screenshot({ path: `${shots}/02_detail_top.png` });
-const h0 = await page.$eval('#stage', (e) => e.getBoundingClientRect().height);
-await page.evaluate(() => document.querySelector('#detail').scrollTo(0, 260));
-await page.waitForTimeout(250);
-const h1 = await page.$eval('#stage', (e) => e.getBoundingClientRect().height);
-await page.evaluate(() => document.querySelector('#detail').scrollTo(0, 2000));
-await page.waitForTimeout(250);
-const h2 = await page.$eval('#stage', (e) => e.getBoundingClientRect().height);
-console.log(`stage height: top ${h0}, scrolled 260 -> ${h1}, scrolled far -> ${h2}`);
-await page.evaluate(() => { const det = document.querySelector('#detail'); det.scrollTop += document.querySelector('#grade').getBoundingClientRect().top - document.querySelector('.dtop').getBoundingClientRect().bottom - 60; });
+const sh = await page.$eval('#stage', (e) => [e.getBoundingClientRect().height, innerHeight]);
+console.log(`stage height ${sh[0]} of ${sh[1]}`);
+await page.click('#ptabs button[data-p=color]');
 await page.waitForTimeout(250);
 await page.screenshot({ path: `${shots}/03_wheels.png` });
 
