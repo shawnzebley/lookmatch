@@ -1,6 +1,7 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
 import { prepare, measure, regionStats, regionUsable } from './engine/measure.js';
 import { solve, solvePreset } from './engine/solver.js';
+import { guardSkinLight } from './engine/skinlight.js';
 import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
 import { fitRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
 import { signature, nearestRegions } from './engine/style.js';
@@ -527,10 +528,13 @@ const handlers = {
         if (r) { res.params = r.params; regions = { ...r.regions, from }; }
       }
     }
+    // last word on skin lightness: the passes above can still lift faces past the reference's
+    const sg = guardSkinLight(e.ps, res.params, o, lrParams ? null : refStats, strength);
+    res.params = sg.params;
     const cur = processPixelSet(e.ps, res.params);
     const after = measure(e.ps, cur);
     const loss = lossReport(e.ps, cur, res.params);
-    return { params: res.params, targets: res.targets, before: o, after, loss, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
+    return { skinGuard: sg.skin || null, params: res.params, targets: res.targets, before: o, after, loss, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
   },
 
   async measureParams({ id, params, auto = null }) {

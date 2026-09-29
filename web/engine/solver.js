@@ -121,6 +121,16 @@ export const SKIN_L_DOWN = -10;
 // Half-width of the accepted window around the skin lightness target (L*).
 export const SKIN_L_TOL = 2;
 
+// Skin lightness follows the reference's, not the frame's median: a bright reference used to lift faces
+// by whatever the global tone match asked for (up to +14 L*). litDelta is null when the reference (an old
+// preset) has no skin lightness, or there is no reference (Lightroom presets, photographer finishes).
+export function skinLightDelta(o, ref, s = 1) {
+  const active = o.skin.source === 'faces' ? o.skin.frac > 0.0004 : o.skin.frac > 0.005;
+  const refHas = ref && ref.skin && ref.skin.litL > 0 && (ref.skin.source === 'faces' ? ref.skin.frac > 0.0004 : ref.skin.frac > 0.005);
+  const litDelta = active && refHas ? Math.max(SKIN_L_DOWN, Math.min(SKIN_L_UP, s * (ref.skin.litL - o.skin.litL))) : null;
+  return { active, litDelta };
+}
+
 export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNESS_PULL, scene = null, toneShape = TONE_SHAPE, zoneMove = ZONE_MOVE, bandMove = BAND_MOVE, endAbs = END_ABS, chromaCap = CHROMA_CAP, ownModel = OWN_MODEL } = {}) {
   const s = Math.min(1, Math.max(0, strength));
   const o50 = o.tone.pct[50], r50 = ref.tone.pct[50];
@@ -202,12 +212,8 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNE
     hi: Math.max(o.tone.clipHi, ref.tone.clipHi) + 0.001,
     lo: Math.max(o.tone.clipLo, ref.tone.clipLo) + 0.001,
   };
-  // Skin lightness follows the reference's, not the frame's median: a bright reference used to lift faces
-  // by whatever the global tone match asked for (up to +14 L*). Null when the preset predates skin L.
-  const active = o.skin.source === 'faces' ? o.skin.frac > 0.0004 : o.skin.frac > 0.005;
-  const refHas = ref.skin && ref.skin.litL > 0 && (ref.skin.source === 'faces' ? ref.skin.frac > 0.0004 : ref.skin.frac > 0.005);
-  const litDelta = active && refHas ? Math.max(SKIN_L_DOWN, Math.min(SKIN_L_UP, s * (ref.skin.litL - o.skin.litL))) : null;
-  const skin = { litL: litDelta == null ? null : o.skin.litL + litDelta, litDelta, hue: o.skin.hue, chroma: o.skin.chroma, spread: o.skin.hueSpread, litHue: o.skin.litHue, litChroma: o.skin.litChroma, active: o.skin.source === 'faces' ? o.skin.frac > 0.0004 : o.skin.frac > 0.005 };
+  const { active, litDelta } = skinLightDelta(o, ref, s);
+  const skin = { litL: litDelta == null ? null : o.skin.litL + litDelta, litDelta, hue: o.skin.hue, chroma: o.skin.chroma, spread: o.skin.hueSpread, litHue: o.skin.litHue, litChroma: o.skin.litChroma, active };
   return { tone: { pct }, wb, zones, bands, color, clip, skin, strength: s, anchor };
 }
 
