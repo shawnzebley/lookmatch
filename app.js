@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-29b';
+const APP_VERSION = '2026-09-29c';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -366,7 +366,8 @@ function toneDots(s) {
 // ---------------------------------------------------------------- edit view: 1 photos, 2 style
 function statusLabel(p) {
   if (p.status === 'loading' && p.phase === 'heif') return 'converting HEIF';
-  if (p.status === 'ready' && !lookOf(p)) return 'pick a style';
+  if (p.params && !lookOf(p)) return 'edit';
+  if (p.status === 'ready' && !lookOf(p)) return 'open to edit';
   return { loading: 'reading', ready: 'queued', solving: 'styling', done: 'done', error: 'error', exporting: 'exporting', exported: 'exported' }[p.status] || p.status;
 }
 
@@ -384,7 +385,7 @@ function photoTile(p) {
   const t = h(`<button class="tile ${p.picked ? 'picked' : ''}" data-id="${p.id}">${p.thumbURL ? `<img src="${p.thumbURL}" alt="">` : ''}${cullDots(p.cull)}${p.picked ? '<span class="pick">★</span>' : ''}
     ${busy ? '<div class="spin"></div>' : ''}${p.loss && p.loss.worst !== 'ok' && !busy ? `<span class="wbadge ${p.loss.worst}" title="${esc(p.loss.issues.map((i) => i.text).join(', '))}">!</span>` : ''}<span class="st ${p.status === 'done' || p.status === 'exported' ? 'done' : p.status === 'error' ? 'err' : ''}">${statusLabel(p)}</span></button>`);
   t.onclick = () => {
-    if (p.params) return openDetail(p);
+    if (p.params || (p.status === 'ready' && !lookOf(p))) return openDetail(p);
     if (p.status !== 'error') { if (!lookOf(p)) $('#stepStyle')?.scrollIntoView({ behavior: 'smooth' }); return; }
     const s = showProblem(`Couldn't use ${p.name}`, p.errRec || logError('photo', p.error, p.file), '<button class="danger" id="pRemove">Remove</button>');
     $('#pRemove', s).onclick = () => { pool.call(p.worker, 'unload', { id: p.id }).catch(() => {}); S.photos = S.photos.filter((q) => q !== p); closeSheet(); renderMatch(); };
@@ -497,7 +498,7 @@ function renderMatch() {
     }
     photos.append(strip);
     if (total > 1) photos.append(cullBar());
-    const line = !look ? 'Now pick a style below.'
+    const line = !look ? 'Tap a photo to edit without a reference, or pick a style below.'
       : done < total ? `Styling like ${esc(lookName(look))}… ${done} of ${total}`
         : `${total === 1 ? 'Done.' : `All ${total} done.`} Tap a photo to fine-tune, crop or export.`;
     photos.append(h(`<p class="muted small step-note">${line}</p>`));
@@ -549,7 +550,10 @@ async function addPhotos(files) {
     S.photos.push(p);
     pool.call(p.worker, 'load', { id: p.id, file }).then((r) => {
       p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask; p.faceErr = r.faceErr; p.cull = r.cull; S.scenesKey = null; noteVision(r, file);
-      p.status = 'ready'; rerenderMatchSoon(); runQueue();
+      p.status = 'ready'; rerenderMatchSoon();
+      if (S.autoOpen && S.photos.length === 1 && !lookOf(p) && !D && S.tab === 'match') {
+        S.autoOpen = false; p.params = defaultParams(); openDetail(p);
+      } else runQueue();
     }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('add photo: read', e, file); rerenderMatchSoon(); });
   }
   setTab('match');
@@ -1311,6 +1315,7 @@ function renderStyleCard() {
 // ---------------------------------------------------------------- detail view
 const PAGES = [['look', 'Look'], ['subject', 'Subject'], ['light', 'Light'], ['color', 'Color'], ['retouch', 'Retouch'], ['more', 'More']];
 function openDetail(p) {
+  p.params ||= defaultParams();
   const el = $('#detail');
   el.hidden = false;
   el.classList.remove('cropping');
@@ -1362,8 +1367,14 @@ function openDetail(p) {
     try {
       const r = await pool.call(p.worker, 'autoAdjust', { id: p.id }, { priority: true });
       if (!D || D.p !== p) return;
-      Object.assign(p.params, r); D.userEdited = true;
-      refreshDetail(); toast('Auto Adjust applied to exposure and tone.');
+      Object.assign(p.params ||= defaultParams(), r);
+      p.solved = structuredClone(p.params); p.status = 'done'; D.userEdited = true;
+      refreshDetail(); D.goPage('light');
+      const visible = new Set(['Tone', 'Tone curve', 'Presence', 'HSL hue', 'HSL saturation', 'HSL luminance']);
+      $('#sliders').querySelectorAll('details.group').forEach((group) => {
+        if (visible.has($('summary', group)?.textContent.trim())) group.open = true;
+      });
+      toast('Auto Adjust applied. Tone curve and HSL controls are open.');
     } catch (e) { toast(e.message, 4500); logError('auto adjust', e, p.file); }
     finally { if ($('#autoAdjust')) { $('#autoAdjust').disabled = false; $('#autoAdjust').textContent = 'Auto Adjust'; } }
   };

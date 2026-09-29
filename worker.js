@@ -541,20 +541,33 @@ const handlers = {
     return autoLevel(gray, d.width, d.height);
   },
 
-  // A conservative, repeatable tone-only starting point from this photo's original luminance range.
+  // A conservative starting point from this photo's own tone and color measurements. It follows a
+  // common high-dynamic-range workflow: soften the basic sliders, then restore shape with an S curve.
   async autoAdjust({ id }) {
     const e = await ensurePrepared(id);
     const s = measure(e.ps), t = s.tone, p = t.pct;
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
     const lowLight = Number.isFinite(e.scene?.ev) && e.scene.ev < 8;
     const targetMid = lowLight ? 38 : 48;
+    const spread = p[95] - p[5];
     const exposure = clamp(Math.log2(lToY(targetMid) / Math.max(0.0001, lToY(p[50]))) * 0.45, -0.55, 0.55);
-    const highlights = clamp(-Math.max(0, p[99] - 94) * 1.1 - (t.clipHi > 0.002 ? 10 : 0), -38, 0);
-    const shadows = clamp(Math.max(0, 5 - p[5]) * 0.85 + (t.clipLo > 0.002 ? 12 : 0), 0, 28);
-    const contrast = clamp((82 - (p[95] - p[5])) * 0.25, -14, 18);
-    const whites = clamp((96 - p[99]) * 0.3, -12, 10);
-    const blacks = clamp((p[1] - 3) * 0.35, -8, 8);
-    return { exposure, contrast, highlights, shadows, whites, blacks };
+    const highlights = clamp(-10 - Math.max(0, p[99] - 94) * 1.1 - (t.clipHi > 0.002 ? 10 : 0), -42, -5);
+    const shadows = clamp(8 + Math.max(0, 5 - p[5]) * 0.85 + (t.clipLo > 0.002 ? 10 : 0), 5, 30);
+    const contrast = clamp(-10 + (82 - spread) * 0.25, -22, 10);
+    const whites = clamp(-7 + (96 - p[99]) * 0.3, -20, -3);
+    const blacks = clamp(7 + (p[1] - 3) * 0.35, 3, 13);
+    const vibrance = clamp((27 - s.color.meanChroma) * 0.35, -2, 8);
+    const out = {
+      exposure, contrast, highlights, shadows, whites, blacks, vibrance,
+      curve: [[0, 5], [64, 57], [128, 128], [192, 199], [255, 250]],
+    };
+    // Bring existing colors toward a restrained mid-range saturation. Skip near-neutral bands so
+    // small sensor noise or gray surfaces do not acquire arbitrary color.
+    for (const [band, stats] of Object.entries(s.bands)) {
+      if (stats.weight < 0.025 || stats.chroma < 7) continue;
+      out[`sat_${band}`] = Math.round(clamp((22 - stats.chroma) * 0.3, -5, 5));
+    }
+    return out;
   },
 
   async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true }) {
