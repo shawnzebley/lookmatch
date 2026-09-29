@@ -48,6 +48,15 @@ const errorText = (r) => `LookMatch ${r.app} · ${r.at}\nStep: ${r.step}\n${r.fi
 async function copyText(t) {
   try { await navigator.clipboard.writeText(t); toast('Copied'); } catch (e) { toast('Copy failed; take a screenshot instead'); }
 }
+// The face and people models are a big part of the app. When one can't start on this device, log why (once per reason).
+const visionLogged = new Set();
+function noteVision(r, file) {
+  for (const [what, msg] of [['people finder', r.mask && !r.mask.ok && r.mask.err], ['face finder', r.faceErr]]) {
+    if (!msg || visionLogged.has(what + msg)) continue;
+    visionLogged.add(what + msg);
+    logError(what, new Error(msg), file);
+  }
+}
 function showProblem(title, rec, extraActs = '') {
   const s = openSheet(`<h2>${esc(title)}</h2><p>${esc(rec.message)}</p>
     ${rec.file ? `<p class="muted small">${esc(rec.file.name)} · ${esc(rec.file.type || 'no type')} · ${rec.file.mb} MB</p>` : ''}
@@ -539,7 +548,7 @@ async function addPhotos(files) {
     const p = { id: uid(), file, name: file.name || 'photo.jpg', status: 'loading', strength: pr ? pr.strength : 100, worker: pool.assign() };
     S.photos.push(p);
     pool.call(p.worker, 'load', { id: p.id, file }).then((r) => {
-      p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask; p.cull = r.cull; S.scenesKey = null;
+      p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask; p.faceErr = r.faceErr; p.cull = r.cull; S.scenesKey = null; noteVision(r, file);
       p.status = 'ready'; rerenderMatchSoon(); runQueue();
     }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('add photo: read', e, file); rerenderMatchSoon(); });
   }
@@ -825,11 +834,12 @@ function regionCard(p) {
   const found = M.frac >= 0.0005, taps = M.picks ? `${M.picks} tap${M.picks > 1 ? 's' : ''}` : '';
   const status = D.pick ? `Tap the photo on what to ${D.pick === 'add' ? 'add to' : 'take out of'} the subject. Tap ${D.pick === 'add' ? '+ Add' : '− Remove'} again when done.`
     : found ? `Subject is ${Math.max(1, Math.round(M.frac * 100))}% of the photo (${[M.people && M.useAuto ? 'people found automatically' : '', taps].filter(Boolean).join(', ')}).`
-    : !M.ok ? "The people finder didn't load. Tap + Add, then the subject."
+    : !M.ok ? `The people finder didn't load${M.err ? `: ${esc(M.err.slice(0, 200))}` : ''}. Tap + Add, then the subject, or try again.`
     : M.people ? 'People turned off. Tap + Add, then the subject.' : 'No people found. Tap + Add, then the subject.';
   return `<h3>Subject and background</h3>${seg}
     <div class="mtools"><button id="mAdd" class="${D.pick === 'add' ? 'on' : ''}">+ Add</button><button id="mRem" class="${D.pick === 'remove' ? 'on' : ''}" ${found ? '' : 'disabled'}>− Remove</button><button id="mUndo" ${M.picks ? '' : 'disabled'}>Undo</button><div class="grow"></div><button id="mShow" class="${D.showMask ? 'on' : ''}" ${found ? '' : 'disabled'}>Show</button></div>
     <p class="muted small" style="margin:6px 0 0">${status}</p>
+    ${M.ok ? '' : '<div class="mtools"><button id="mRetry">Try again</button></div>'}
     <p class="muted small" style="margin:4px 0 0">To edit a sky or another object, use + Add and tap it. Turn off people detection first if you want only that object in the mask.</p>
     ${M.people ? `<label class="chk"><input type="checkbox" id="mAuto" ${M.useAuto ? 'checked' : ''}> People count as the subject</label>` : ''}
     <label class="chk"><input type="checkbox" id="mSplit" ${p.split !== false ? 'checked' : ''}> Style sets the subject apart from the background</label>
@@ -856,6 +866,7 @@ function renderRegionCard() {
   $('#mAdd', box).onclick = () => pick('add');
   $('#mRem', box).onclick = () => pick('remove');
   $('#mUndo', box).onclick = () => maskOp({ op: 'undo' });
+  if ($('#mRetry', box)) $('#mRetry', box).onclick = () => maskOp({ op: 'retry' });
   $('#mShow', box).onclick = () => { D.showMask = !D.showMask; renderRegionCard(); requestPreview(false); };
   if ($('#mAuto', box)) $('#mAuto', box).onchange = (e) => maskOp({ op: 'auto', on: e.target.checked });
   $('#mSplit', box).onchange = async (e) => {
@@ -883,6 +894,7 @@ function retouchCard(p) {
   const heals = P.heals || [], sel = heals[D.healSel];
   const tool = D.tool;
   const skinPart = !M ? '<p class="muted small">Looking for skin…</p>'
+    : M && !M.ok ? '<p class="muted small">Skin needs the people finder, which didn\'t load on this device. See Subject and background above.</p>'
     : !skin ? '<p class="muted small">No skin found, so skin smoothing and skin tone are off for this photo.</p>'
     : `<label class="chk"><input type="checkbox" id="skOn" ${smooth ? 'checked' : ''}> Smooth skin (faces and bodies only)</label>
       <div id="skSl">${SKIN_SLIDERS.map((s) => sliderRow(s, P[s.key] || 0)).join('')}</div>
@@ -1107,14 +1119,16 @@ function renderSyncCard() {
 
 async function maskOp(args) {
   const p = D.p;
-  const busy = args.op === 'add' || args.op === 'remove';
-  if (busy) toast(args.op === 'add' ? 'Finding what you tapped…' : 'Taking it out…', 15000);
+  const busy = args.op === 'add' || args.op === 'remove' || args.op === 'retry';
+  if (busy) toast(args.op === 'add' ? 'Finding what you tapped…' : args.op === 'remove' ? 'Taking it out…' : 'Looking for people and faces again…', 30000);
   try {
     const r = await pool.call(p.worker, 'mask', { id: p.id, ...args }, { priority: true });
     if (busy) $('#toast').hidden = true;
     p.mask = r.mask; p.before = r.before;
+    if (args.op === 'retry') { p.faceErr = r.faceErr; noteVision(r, p.file); if (!r.mask.ok) toast("The people finder still won't start. Settings has a check that says why.", 5000); }
     if (!D || D.p !== p) return;
     renderRegionCard();
+    if (args.op === 'retry') renderRetouchCard();
     // a new subject changes what the style does, unless the sliders were already hand-tuned
     if (lookOf(p) && p.split !== false && !D.userEdited) {
       await solvePhoto(p, { priority: true });
@@ -1295,7 +1309,6 @@ function renderStyleCard() {
 }
 
 // ---------------------------------------------------------------- detail view
-const PAGES = [['look', 'Look'], ['subject', 'Subject'], ['light', 'Light'], ['color', 'Color'], ['retouch', 'Retouch'], ['more', 'More']];
 function openDetail(p) {
   const el = $('#detail');
   el.hidden = false;
@@ -1304,7 +1317,7 @@ function openDetail(p) {
   el.innerHTML = `<div class="dtop">
       <div class="dhead"><button class="ghost" id="dBack">‹ Back</button><div class="nm">${esc(p.name)}${p.cull ? ` <span class="muted small">${p.cull.eyes ? `eyes ${p.cull.eyes}` : ''}${p.cull.eyes && p.cull.focus != null ? ' · ' : ''}${p.cull.focus != null ? `focus ${p.cull.focus.toFixed(1)}` : ''}</span>` : ''}</div><button id="dPick" class="${p.picked ? 'on' : ''}" aria-pressed="${!!p.picked}" aria-label="Pick">★</button><button class="primary" id="dExport">Export</button></div>
       <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
-        <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span><button class="zfit" id="zoomFit" aria-label="Fit photo to screen">Fit</button></div>
+        <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span></div>
       <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
         <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Set exposure and tone from this photo's brightness range">Auto Adjust</button><div class="grow"></div><button id="reMatch">Redo</button></div>
       <div class="cropbar" id="cropbar" hidden>
@@ -1329,7 +1342,7 @@ function openDetail(p) {
     tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1, curveChannel: 'curve', curveDrag: null, view: { s: 1, x: 0, y: 0 }, hi: false, page: 'look' };
   $('#sliders').innerHTML = sliderGroups(p);
   $('#grade').innerHTML = gradeCard(p);
-  bindPager();
+  el.scrollTop = 0;
   $('#dBack').onclick = closeDetail;
   $('#dExport').onclick = () => exportPhotos([p]);
   $('#dPick').onclick = () => { p.picked = !p.picked; $('#dPick').classList.toggle('on', p.picked); $('#dPick').setAttribute('aria-pressed', String(p.picked)); };
@@ -1362,58 +1375,32 @@ function openDetail(p) {
   bindSliders();
   bindWheels();
   bindStage();
+  el.onscroll = () => requestAnimationFrame(applyShrink);
+  applyShrink();
   renderLoss();
   requestPreview(true);
   scheduleMeasure(0);
 }
 
-// ---------------------------------------------------------------- bottom panel: swipe left/right between pages
-function bindPager() {
-  const pager = $('#pager'), tabs = $('#ptabs');
-  const mark = (k) => { D.page = k; tabs.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.p === k)); tabs.querySelector('button.on')?.scrollIntoView({ inline: 'center', block: 'nearest' }); };
-  const pageEl = (k) => pager.querySelector(`.page[data-p="${k}"]`);
-  D.goPage = (k, smooth = true) => { const el = pageEl(k); if (!el) return; mark(k); pager.scrollTo({ left: el.offsetLeft, behavior: smooth ? 'smooth' : 'auto' }); };
-  tabs.onclick = (e) => { const k = e.target.closest('button')?.dataset.p; if (k) D.goPage(k); };
-  let t;
-  pager.onscroll = () => { clearTimeout(t); t = setTimeout(() => { const i = Math.round(pager.scrollLeft / Math.max(1, pager.clientWidth)); const k = pager.children[i]?.dataset.p; if (k && k !== D?.page) mark(k); }, 60); };
-  mark('look');
+// ---------------------------------------------------------------- photo shrinks while scrolling
+// The stage starts at 40% of the screen height (62% in landscape) and gives up height as the
+// controls scroll, down to STAGE_MIN of that. A spacer takes the height it gave up, so the
+// sliders track the finger instead of jumping.
+const STAGE_MIN = 0.5;
+function stageMax() { return Math.round(window.innerHeight * (window.innerWidth > window.innerHeight ? 0.62 : 0.4)); }
+function applyShrink() {
+  if (!D) return;
+  const st = $('#stage'), sp = $('#dspace'), det = $('#detail');
+  if (!st || !sp) return;
+  if (D.crop) { st.style.height = ''; sp.style.height = '0px'; return; }
+  const mx = stageMax(), mn = Math.round(mx * STAGE_MIN);
+  const d = Math.max(0, Math.min(mx - mn, det.scrollTop));
+  st.style.height = `${mx - d}px`;
+  sp.style.height = `${d}px`;
+  const small = d > (mx - mn) * 0.6;
+  $('#refthumb')?.classList.toggle('mini', small);
 }
-
-// ---------------------------------------------------------------- pinch / wheel zoom on the photo
-const ZMAX = 8;
-function applyView() {
-  const cv = $('#cv'), st = $('#stage');
-  if (!cv || !st) return;
-  const v = D.view;
-  const w = cv.offsetWidth * v.s, h = cv.offsetHeight * v.s;
-  const mx = Math.max(0, (w - st.clientWidth) / 2), my = Math.max(0, (h - st.clientHeight) / 2);
-  v.x = Math.max(-mx, Math.min(mx, v.x)); v.y = Math.max(-my, Math.min(my, v.y));
-  cv.style.transform = v.s === 1 && !v.x && !v.y ? '' : `translate(${v.x}px, ${v.y}px) scale(${v.s})`;
-  st.classList.toggle('zoomed', v.s > 1.01);
-}
-// zoom to scale s keeping the content point under (cx, cy) (client coords) fixed
-function zoomAt(s, cx, cy) {
-  const st = $('#stage').getBoundingClientRect(), v = D.view;
-  s = Math.max(1, Math.min(ZMAX, s));
-  const px = cx - (st.left + st.width / 2), py = cy - (st.top + st.height / 2);
-  const k = s / v.s;
-  v.x = px - (px - v.x) * k; v.y = py - (py - v.y) * k; v.s = s;
-  if (s === 1) { v.x = 0; v.y = 0; }
-  applyView(); zoomSettled();
-}
-function resetView() { if (D) { D.view = { s: 1, x: 0, y: 0 }; applyView(); zoomSettled(); } }
-// render bigger once zoomed in, back to screen size when zoomed out
-let zoomT;
-function zoomSettled() {
-  clearTimeout(zoomT);
-  zoomT = setTimeout(() => {
-    if (!D || D.crop) return;
-    const hi = D.view.s > 1.4;
-    if (hi === D.hi) return;
-    D.hi = hi; D.orig = null; requestPreview(true);
-  }, 250);
-}
-window.addEventListener('resize', () => { if (D) { applyView(); if (D.crop) drawCrop(); } });
+window.addEventListener('resize', () => { if (D) { applyShrink(); if (D.crop) drawCrop(); } });
 
 function finishButtons(p, pr) {
   const cur = p.finish || pr?.finish || 'off';
@@ -1465,9 +1452,10 @@ function jumpToSlider(k) {
   if (D.region !== want) { D.region = want; renderRegionCard(); rebuildControls(); requestPreview(false); }
   const row = controlFor(k);
   if (!row) return;
+  const det = $('#detail');
   const dt = row.closest('details'); if (dt) dt.open = true;
-  const pg = row.closest('.page');
-  if (pg) { D.goPage(pg.dataset.p); pg.scrollTo({ top: Math.max(0, row.offsetTop - pg.offsetTop - 12), behavior: 'smooth' }); }
+  const top = $('.dtop').getBoundingClientRect().height;
+  det.scrollTo({ top: det.scrollTop + row.getBoundingClientRect().top - top - 12, behavior: 'smooth' });
   row.classList.remove('flash'); void row.offsetWidth; row.classList.add('flash');
 }
 
@@ -1523,7 +1511,7 @@ function bindSliders() {
   });
 }
 
-const previewSide = () => (D && D.hi && !D.crop ? 2400 : Math.min(1600, Math.round(Math.max(window.innerWidth, 400) * Math.min(2, devicePixelRatio || 1))));
+const previewSide = () => Math.min(1600, Math.round(Math.max(window.innerWidth, 400) * Math.min(2, devicePixelRatio || 1)));
 
 async function requestPreview(withOriginal) {
   if (!D) return;
@@ -1568,73 +1556,45 @@ function draw() {
 }
 
 function bindStage() {
-  const cv = $('#cv'), st = $('#stage');
-  const ptrs = new Map(); // active pointers, client coords
-  let mode = null, pinch = null, pan = null, tap = null;
-  const rel = (e) => { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height, r]; };
-  const inside = (x, y) => x >= 0 && y >= 0 && x <= 1 && y <= 1;
-  const two = () => { const [a, b] = [...ptrs.values()]; return { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }; };
-  const setSplit = (e) => { const [x] = rel(e); D.split = Math.max(0, Math.min(1, x)); draw(); };
+  const cv = $('#cv');
+  let dragging = false;
+  const pos = (e) => { const r = cv.getBoundingClientRect(); return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)); };
   cv.addEventListener('pointerdown', (e) => {
     cv.setPointerCapture(e.pointerId);
     if (D.crop) return cropDown(e);
-    ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (ptrs.size === 2) { // second finger: pinch, and drop whatever the first one started
-      mode = 'pinch'; tap = null;
-      if (D.holding) { D.holding = false; draw(); }
-      const t = two(); pinch = { d: t.d, s: D.view.s, x: D.view.x, y: D.view.y, cx: t.x, cy: t.y };
+    if (D.tool) {
+      const r = cv.getBoundingClientRect();
+      const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+      if (x >= 0 && y >= 0 && x <= 1 && y <= 1) toolTap(x, y);
       return;
     }
-    if (ptrs.size > 2) return;
-    if (D.tool || D.pick) { mode = 'tap'; tap = { x: e.clientX, y: e.clientY }; return; } // taps fire on release so a pinch never lands one
-    const r = cv.getBoundingClientRect();
-    const nearLine = D.mode === 'split' && Math.abs(e.clientX - (r.left + r.width * D.split)) < 32;
-    if (D.view.s > 1.01 && !nearLine) { mode = 'pan'; pan = { x: e.clientX, y: e.clientY, vx: D.view.x, vy: D.view.y }; return; }
-    if (D.mode === 'split') { mode = 'split'; setSplit(e); return; }
-    if (D.mode === 'after') { mode = 'hold'; D.holding = true; }
+    if (D.pick) {
+      const r = cv.getBoundingClientRect();
+      const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+      if (x >= 0 && y >= 0 && x <= 1 && y <= 1) maskOp({ op: D.pick, x, y });
+      return;
+    }
+    if (D.mode === 'split') { dragging = true; D.split = pos(e); }
+    else if (D.mode === 'after') D.holding = true;
     draw();
   });
   cv.addEventListener('pointermove', (e) => {
     if (D.crop) return cropMove(e);
-    if (ptrs.has(e.pointerId)) ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
-    if (mode === 'pinch' && ptrs.size >= 2) {
-      const t = two();
-      // scale about the start midpoint, then follow the fingers' midpoint
-      D.view = { s: pinch.s, x: pinch.x, y: pinch.y };
-      zoomAt(pinch.s * t.d / pinch.d, pinch.cx, pinch.cy);
-      D.view.x += t.x - pinch.cx; D.view.y += t.y - pinch.cy;
-      applyView();
-    } else if (mode === 'pan') { D.view.x = pan.vx + e.clientX - pan.x; D.view.y = pan.vy + e.clientY - pan.y; applyView(); }
-    else if (mode === 'split') setSplit(e);
-    else if (mode === 'tap' && tap && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) > 10) tap = null;
+    if (dragging) { D.split = pos(e); draw(); }
   });
   const up = (e) => {
     if (D && D.crop) return cropUp(e);
-    ptrs.delete(e.pointerId);
-    if (mode === 'tap' && tap && D) {
-      const [x, y] = rel(e);
-      tap = null;
-      if (inside(x, y)) { if (D.tool) toolTap(x, y); else if (D.pick) maskOp({ op: D.pick, x, y }); }
-    }
-    if (D && D.holding) { D.holding = false; draw(); }
-    if (ptrs.size === 0) { mode = null; tap = null; }
-    else if (mode === 'pinch' && ptrs.size === 1) { // one finger left: carry on panning from where it is
-      const [p] = [...ptrs.values()]; mode = D.view.s > 1.01 ? 'pan' : null; pan = { x: p.x, y: p.y, vx: D.view.x, vy: D.view.y };
-    }
+    dragging = false; if (D && D.holding) { D.holding = false; draw(); }
   };
   cv.addEventListener('pointerup', up);
-  cv.addEventListener('pointercancel', (e) => { tap = null; up(e); });
+  cv.addEventListener('pointercancel', up);
   cv.addEventListener('contextmenu', (e) => e.preventDefault());
-  // desktop: wheel / trackpad pinch zooms about the cursor, double-click toggles 3x
-  st.addEventListener('wheel', (e) => { if (D.crop) return; e.preventDefault(); zoomAt(D.view.s * Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0025)), e.clientX, e.clientY); }, { passive: false });
-  st.addEventListener('dblclick', (e) => { if (D.crop || D.tool || D.pick || e.pointerType === 'touch') return; if (D.view.s > 1.01) resetView(); else zoomAt(3, e.clientX, e.clientY); });
-  $('#zoomFit').onclick = resetView;
 }
 
 function closeDetail() {
   clearTimeout(measureT);
   const el = $('#detail');
-  el.classList.remove('cropping');
+  el.onscroll = null; el.classList.remove('cropping');
   el.hidden = true; el.innerHTML = '';
   document.body.style.overflow = '';
   D = null;
@@ -1657,9 +1617,10 @@ async function enterCrop() {
     aspect: g ? null : W / H, auto: !g, prev: g ? { ...g } : null, img: null, drag: null,
   };
   const det = $('#detail');
-  resetView(); D.hi = false; D.orig = null; det.classList.add('cropping');
+  det.scrollTop = 0; det.classList.add('cropping');
   $('#dctl').hidden = true; $('#cropbar').hidden = false; $('#loss').hidden = true; $('#dbody').hidden = true;
   $('#lblL').hidden = true; $('#lblR').hidden = true;
+  applyShrink();
   syncCropBar();
   try {
     const r = await pool.call(p.worker, 'preview', { id: p.id, params: { ...p.params }, side: previewSide(), plain: true }, { priority: true });
@@ -1675,6 +1636,7 @@ function exitCrop() {
   const det = $('#detail');
   det.classList.remove('cropping');
   $('#dctl').hidden = false; $('#cropbar').hidden = true; $('#loss').hidden = false; $('#dbody').hidden = false;
+  applyShrink();
   $('#cropBtn').classList.toggle('on', !!D.p.geom);
 }
 
@@ -2009,7 +1971,8 @@ function renderSettings() {
         <li>Paste the client ID above.</li></ol></details>
     </div>
     <div class="card"><h3>Recent problems</h3>${errs.length ? `<p class="small">${errs.length} logged on this device. Latest: ${esc(errs[0].step)}, ${esc(errs[0].message)}</p><div class="bar"><button id="sErrCopy">Copy all</button><button class="ghost" id="sErrClear">Clear</button></div>` : '<p class="muted small">None logged.</p>'}</div>
-    <div class="card"><h3>About</h3><p class="muted small">Everything runs on this phone. Photo presets store measured targets, not slider values. Imported Lightroom presets apply their exact values after each photo's exposure and white balance are normalised. Each photo is measured and solved on its own. Workers: ${pool.workers.length}.</p></div>
+    <div class="card"><h3>Subject and skin detection</h3><p class="muted small">Runs the face and people models on this phone and lists each step. If subject, background or skin detection isn't working, run it and send me the copied result.</p><div class="bar"><button id="sVis">Run check</button></div><div id="sVisOut"></div></div>
+    <div class="card"><h3>About</h3><p class="muted small">Everything runs on this phone. Photo presets store measured targets, not slider values. Imported Lightroom presets apply their exact values after each photo's exposure and white balance are normalised. Each photo is measured and solved on its own. Workers: ${pool.workers.length}. Version ${APP_VERSION}.</p></div>
   </div>`;
   $('#sDest').value = s.dest; $('#sLRM').value = s.lrMode;
   $('#sDest').onchange = (e) => { s.dest = e.target.value; saveSettings(); };
@@ -2020,6 +1983,20 @@ function renderSettings() {
   $('#sConn').onclick = async () => {
     if (S.photos.length && !(await confirmSheet('Reload to sign in?', 'Photos you added will need to be added again.', 'Continue'))) return;
     drive.connect(s.clientId);
+  };
+  $('#sVis').onclick = async () => {
+    const b = $('#sVis'), out = $('#sVisOut');
+    b.disabled = true;
+    out.innerHTML = '<p class="muted small">Checking. This can take a minute the first time.</p>';
+    let text;
+    try {
+      const r = await pool.call(0, 'visionCheck', {}, { priority: true });
+      text = [`LookMatch ${APP_VERSION}`, `Browser: ${navigator.userAgent}`, `Home-screen app: ${navigator.standalone === true}`, `Workers: ${pool.workers.length}`, '']
+        .concat(r.rows.map((x) => `${x.ok ? 'OK  ' : 'FAIL'} ${x.step} (${x.ms} ms)${x.detail ? `: ${x.detail}` : ''}`)).join('\n');
+    } catch (e) { text = `The check itself failed: ${e.message}`; }
+    out.innerHTML = `<pre class="small" style="white-space:pre-wrap;word-break:break-word;margin:8px 0">${esc(text)}</pre><div class="bar"><button id="sVisCopy">Copy</button></div>`;
+    $('#sVisCopy').onclick = () => copyText(text);
+    b.disabled = false;
   };
   if ($('#sErrCopy')) $('#sErrCopy').onclick = () => copyText(errs.map(errorText).join('\n\n'));
   if ($('#sErrClear')) $('#sErrClear').onclick = () => { localStorage.removeItem(ERR_KEY); renderSettings(); };

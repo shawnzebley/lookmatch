@@ -4,26 +4,19 @@
 // Masks live at MASK_SIDE on the long side, in the coordinates of the whole, uncropped photo, and are
 // refined against the photo's own edges with a guided filter so hair and shoulders follow the image.
 import { ImageSegmenter, InteractiveSegmenterLegacy } from './vendor/mediapipe/vision_bundle.mjs';
-import { createTask } from './mp.js';
+import { lazyTask } from './mp.js';
 
 export const MASK_SIDE = 1024;
 const MODEL_SIDE = 512; // what the models are fed (they resample to 256 / 512 themselves)
 
-let segP = null, tapP = null;
-function segmenter() {
-  segP ||= createTask(ImageSegmenter, {
-    baseOptions: { modelAssetPath: new URL('./models/selfie_multiclass_256x256.tflite', import.meta.url).href, delegate: 'CPU' },
-    runningMode: 'IMAGE', outputConfidenceMasks: true, outputCategoryMask: false,
-  }).catch((e) => { console.warn('person model unavailable:', e); return null; });
-  return segP;
-}
-function tapper() {
-  tapP ||= createTask(InteractiveSegmenterLegacy, {
-    baseOptions: { modelAssetPath: new URL('./models/magic_touch.tflite', import.meta.url).href, delegate: 'CPU' },
-    outputConfidenceMasks: true, outputCategoryMask: false,
-  }).catch((e) => { console.warn('tap model unavailable:', e); return null; });
-  return tapP;
-}
+export const segmenter = lazyTask('person', ImageSegmenter, {
+  baseOptions: { modelAssetPath: new URL('./models/selfie_multiclass_256x256.tflite', import.meta.url).href, delegate: 'CPU' },
+  runningMode: 'IMAGE', outputConfidenceMasks: true, outputCategoryMask: false,
+});
+const tapper = lazyTask('tap', InteractiveSegmenterLegacy, {
+  baseOptions: { modelAssetPath: new URL('./models/magic_touch.tflite', import.meta.url).href, delegate: 'CPU' },
+  outputConfidenceMasks: true, outputCategoryMask: false,
+});
 
 // ---------------------------------------------------------------- image helpers
 function draw(src, sx, sy, sw, sh, dw, dh) {
