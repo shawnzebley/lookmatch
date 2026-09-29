@@ -1,4 +1,4 @@
-import { SLIDERS, defaultParams, compile, LOCAL_SLIDERS, REGIONS } from './engine/pipeline.js';
+import { SLIDERS, defaultParams, compile, LOCAL_SLIDERS, REGIONS, CURVE_KEYS, curveLUT, isIdentityCurve } from './engine/pipeline.js';
 import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
 import { FINISH_PROFILES } from './engine/finish.js';
 import { srgbToLinear, linearToSrgb } from './engine/color.js';
@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-27d';
+const APP_VERSION = '2026-09-29a';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -641,6 +641,112 @@ function sliderRow(s, v) {
     <input type="number" min="${s.ui[0]}" max="${s.ui[1]}" step="${step}" value="${step < 1 ? (+v).toFixed(2) : Math.round(v)}"></div>`;
 }
 
+// Lightroom-style master and RGB tone curves. Local curves are applied after the whole-photo curve,
+// through the current subject/background mask.
+const CURVE_CHANNELS = [
+  ['curve', 'Master', '#f3f1eb'], ['curveR', 'Red', '#ff7d73'],
+  ['curveG', 'Green', '#83d69b'], ['curveB', 'Blue', '#77b9ff'],
+];
+const IDENTITY_CURVE = [[0, 0], [255, 255]];
+function currentCurvePoints(key = D.curveChannel) {
+  return D.region === 'all' ? D.p.params[key] || IDENTITY_CURVE : localOf(D.p, D.region)[key] || IDENTITY_CURVE;
+}
+function curveValueAt(points, value) {
+  const lut = curveLUT(points, 256);
+  return lut[Math.max(0, Math.min(255, Math.round(value)))] * 255;
+}
+function curvePath(points) {
+  const lut = curveLUT(points, 256);
+  return Array.from(lut, (v, i) => `${i ? 'L' : 'M'}${i} ${255 - v * 255}`).join(' ');
+}
+function curveCardMarkup(p) {
+  const local = D.region !== 'all';
+  const points = currentCurvePoints();
+  const color = CURVE_CHANNELS.find(([k]) => k === D.curveChannel)?.[2] || '#f3f1eb';
+  const grid = [0, 64, 128, 192, 255].map((v) => `<path d="M${v} 0V255 M0 ${v}H255"/>`).join('');
+  const dots = points.map(([x, y], i) => `<circle class="curve-dot" data-i="${i}" cx="${x}" cy="${255 - y}" r="4.5"/>`).join('');
+  const target = local ? (D.region === 'subject' ? 'Subject mask' : 'Background mask') : 'Whole photo';
+  const status = D.tool === 'curve' ? 'Tap a tone in the photo to place a control point.' : 'Tap the graph to add a point, or pick a tone from the photo.';
+  const localCurves = local ? `<div id="curveAmountRow">${sliderRow({ key: 'curveAmount', label: 'Mask curve amount', ui: [0, 100] }, localOf(p, D.region).curveAmount ?? 100)}</div>` : '';
+  const exportNote = local && CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, D.region)[k]))
+    ? '<p class="muted small" style="margin:5px 0 0">Local curves are baked into the exported photo. Lightroom sidecars do not store local tone curves yet.</p>' : '';
+  return `<h3>Tone curve · ${target}</h3>
+    <div class="seg curve-channels" id="curveChannels">${CURVE_CHANNELS.map(([k, label]) => `<button data-c="${k}" class="${D.curveChannel === k ? 'on' : ''}">${label}</button>`).join('')}</div>
+    <svg class="curve-graph" id="curveGraph" viewBox="0 0 255 255" role="img" aria-label="${target} ${CURVE_CHANNELS.find(([k]) => k === D.curveChannel)?.[1]} tone curve" style="--curve-color:${color}">
+      <g class="curve-grid">${grid}</g><path class="curve-diagonal" d="M0 255L255 0"/><path class="curve-line" d="${curvePath(points)}"/>${dots}
+    </svg>
+    <div class="row curve-actions"><button id="curvePick" class="${D.tool === 'curve' ? 'on' : ''}">Pick from photo</button><button id="curveS">Gentle S</button><button id="curveReset">Reset</button></div>
+    ${localCurves}<p class="muted small" id="curveHelp" style="margin:5px 0 0">${status}</p>${exportNote}`;
+}
+function drawCurve() {
+  const svg = $('#curveGraph');
+  if (!svg || !D) return;
+  const pts = currentCurvePoints();
+  svg.querySelector('.curve-line').setAttribute('d', curvePath(pts));
+  svg.querySelectorAll('.curve-dot').forEach((dot) => dot.remove());
+  for (let i = 0; i < pts.length; i++) {
+    const [x, y] = pts[i], dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    dot.setAttribute('class', 'curve-dot'); dot.dataset.i = String(i); dot.setAttribute('cx', String(x));
+    dot.setAttribute('cy', String(255 - y)); dot.setAttribute('r', '4.5'); svg.append(dot);
+  }
+}
+function writeCurvePoints(points) {
+  points.sort((a, b) => a[0] - b[0]);
+  const p = D.p.params;
+  if (D.region === 'all') p[D.curveChannel] = points;
+  else {
+    p.local ||= {};
+    p.local[D.region] = { ...(p.local[D.region] || {}), [D.curveChannel]: points };
+  }
+  D.userEdited = true;
+  drawCurve(); requestPreview(false); scheduleMeasure();
+}
+function renderCurveCard() {
+  if (!D || !$('#curveCard')) return;
+  const box = $('#curveCard'); box.innerHTML = curveCardMarkup(D.p);
+  $('#curveChannels', box).onclick = (e) => {
+    const key = e.target.closest('button')?.dataset.c;
+    if (!key) return;
+    D.curveChannel = key; renderCurveCard();
+  };
+  $('#curvePick', box).onclick = () => setTool(D.tool === 'curve' ? null : 'curve');
+  $('#curveS', box).onclick = () => writeCurvePoints([[0, 0], [64, 54], [128, 128], [192, 201], [255, 255]]);
+  $('#curveReset', box).onclick = () => {
+    if (D.region === 'all') delete D.p.params[D.curveChannel];
+    else if (D.p.params.local && D.p.params.local[D.region]) delete D.p.params.local[D.region][D.curveChannel];
+    D.userEdited = true; renderCurveCard(); requestPreview(false); scheduleMeasure();
+  };
+  if ($('#curveAmountRow', box)) bindRows(box.querySelectorAll('#curveAmountRow .sl'), (_k, value) => {
+    D.p.params.local ||= {};
+    D.p.params.local[D.region] = { ...(D.p.params.local[D.region] || {}), curveAmount: value };
+    D.userEdited = true; requestPreview(false); scheduleMeasure();
+  });
+  const svg = $('#curveGraph', box);
+  const xy = (e) => {
+    const r = svg.getBoundingClientRect();
+    return [Math.max(0, Math.min(255, (e.clientX - r.left) / r.width * 255)), Math.max(0, Math.min(255, 255 - (e.clientY - r.top) / r.height * 255))];
+  };
+  svg.addEventListener('pointerdown', (e) => {
+    e.preventDefault(); svg.setPointerCapture(e.pointerId);
+    const dot = e.target.closest('.curve-dot');
+    if (dot) { D.curveDrag = +dot.dataset.i; return; }
+    const [x] = xy(e), points = currentCurvePoints().map((q) => [...q]);
+    const xi = Math.round(x);
+    if (points.some(([px]) => Math.abs(px - xi) < 3)) return;
+    points.push([xi, Math.round(curveValueAt(points, xi))]); writeCurvePoints(points);
+  });
+  svg.addEventListener('pointermove', (e) => {
+    if (D.curveDrag == null) return;
+    const points = currentCurvePoints().map((q) => [...q]), i = D.curveDrag, [rawX, rawY] = xy(e);
+    const x = i === 0 ? 0 : i === points.length - 1 ? 255 : Math.round(Math.max(points[i - 1][0] + 2, Math.min(points[i + 1][0] - 2, rawX)));
+    const lo = i === 0 ? 0 : points[i - 1][1], hi = i === points.length - 1 ? 255 : points[i + 1][1];
+    points[i] = [x, Math.round(Math.max(lo, Math.min(hi, rawY)))];
+    writeCurvePoints(points);
+  });
+  const endDrag = () => { D.curveDrag = null; };
+  svg.addEventListener('pointerup', endDrag); svg.addEventListener('pointercancel', endDrag);
+}
+
 // colour grading lives on the wheels card; everything else stays in the slider groups
 function sliderGroups(p) {
   if (D && D.region !== 'all') return localGroups(p, D.region);
@@ -724,6 +830,7 @@ function regionCard(p) {
   return `<h3>Subject and background</h3>${seg}
     <div class="mtools"><button id="mAdd" class="${D.pick === 'add' ? 'on' : ''}">+ Add</button><button id="mRem" class="${D.pick === 'remove' ? 'on' : ''}" ${found ? '' : 'disabled'}>− Remove</button><button id="mUndo" ${M.picks ? '' : 'disabled'}>Undo</button><div class="grow"></div><button id="mShow" class="${D.showMask ? 'on' : ''}" ${found ? '' : 'disabled'}>Show</button></div>
     <p class="muted small" style="margin:6px 0 0">${status}</p>
+    <p class="muted small" style="margin:4px 0 0">To edit a sky or another object, use + Add and tap it. Turn off people detection first if you want only that object in the mask.</p>
     ${M.people ? `<label class="chk"><input type="checkbox" id="mAuto" ${M.useAuto ? 'checked' : ''}> People count as the subject</label>` : ''}
     <label class="chk"><input type="checkbox" id="mSplit" ${p.split !== false ? 'checked' : ''}> Style sets the subject apart from the background</label>
     ${p.split !== false ? regionNote(p) : ''}`;
@@ -846,6 +953,7 @@ function setTool(t) {
   renderRetouchCard();
   renderRegionCard();
   renderPointCard();
+  renderCurveCard();
   draw();
 }
 
@@ -874,6 +982,7 @@ async function toolTap(x, y) {
       setTool('heal'); requestPreview(false);
     } catch (e) { toast(e.message, 3000); }
   } else if (D.tool === 'point') pointTap(x, y);
+  else if (D.tool === 'curve') curveTap(x, y);
 }
 
 // heal spots in canvas px
@@ -944,6 +1053,20 @@ async function pointTap(x, y) {
   } catch (e) { toast(e.message, 3000); }
 }
 
+async function curveTap(x, y) {
+  const p = D.p, key = D.curveChannel, region = D.region;
+  try {
+    const r = await pool.call(p.worker, 'sampleCurve', { id: p.id, x, y, params: structuredClone(p.params), curveKey: key, region, side: previewSide() }, { priority: true });
+    if (!D || D.p !== p) return;
+    const points = currentCurvePoints(key).map((q) => [...q]);
+    const xi = r.value;
+    const close = points.findIndex(([px]) => Math.abs(px - xi) < 8);
+    if (close >= 0) points[close][1] = Math.round(curveValueAt(points, points[close][0]));
+    else points.push([xi, Math.round(curveValueAt(points, xi))]);
+    writeCurvePoints(points); setTool(null); toast('Tone point added. Drag it on the curve to adjust.');
+  } catch (e) { toast(e.message, 3000); }
+}
+
 // ---------------------------------------------------------------- sync
 // Lightroom's Sync: copy this photo's settings to the rest of the shoot. Exposure and white balance stay
 // each photo's own by default (light changes between shots); turn them on for a studio with fixed light.
@@ -1008,6 +1131,7 @@ function rebuildControls() {
   $('#grade').innerHTML = gradeCard(D.p);
   $('#gradeH').textContent = D.region === 'all' ? 'Color grading' : `Color grading · ${D.region === 'subject' ? 'Subject' : 'Background'}`;
   $('#slidersCard').classList.toggle('local', D.region !== 'all');
+  renderCurveCard();
   bindSliders();
   bindWheels();
   renderLoss();
@@ -1182,7 +1306,7 @@ function openDetail(p) {
       <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
         <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span><button class="zfit" id="zoomFit" aria-label="Fit photo to screen">Fit</button></div>
       <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
-        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><div class="grow"></div><button id="reMatch">Redo</button></div>
+        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Set exposure and tone from this photo's brightness range">Auto Adjust</button><div class="grow"></div><button id="reMatch">Redo</button></div>
       <div class="cropbar" id="cropbar" hidden>
         <div class="aspects" id="aspects"><button data-a="free">Free</button><button data-a="orig">Original</button><button data-a="1">1:1</button><button data-a="0.8">4:5</button><button data-a="1.5">3:2</button><button data-a="1.7778">16:9</button><button data-a="flip" aria-label="Swap width and height">⇄</button></div>
         <div class="level"><label for="lvl">Level</label><input type="range" id="lvl" min="-45" max="45" step="0.1" value="0"><output id="lvlOut">0.0°</output><button id="lvlAuto">Auto</button></div>
@@ -1195,14 +1319,14 @@ function openDetail(p) {
       <div class="pager" id="pager">
         <div class="page" data-p="look"><div class="card" id="styleCard"></div></div>
         <div class="page" data-p="subject"><div class="card" id="regionCard"></div></div>
-        <div class="page" data-p="light"><div class="card" id="slidersCard"><div id="sliders"></div></div></div>
+        <div class="page" data-p="light"><div class="card" id="slidersCard"><div id="sliders"></div></div><div class="card" id="curveCard"></div></div>
         <div class="page" data-p="color"><div class="card"><h3 id="gradeH">Color grading</h3><div id="grade"></div></div><div class="card" id="pointCard"></div></div>
         <div class="page" data-p="retouch"><div class="card" id="retouchCard"></div></div>
         <div class="page" data-p="more"><div class="card" id="syncCard"></div><div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div></div>
       </div>
     </div>`;
   D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null, region: 'all', pick: null, showMask: false, flash: false,
-    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1, view: { s: 1, x: 0, y: 0 }, hi: false, page: 'look' };
+    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1, curveChannel: 'curve', curveDrag: null, view: { s: 1, x: 0, y: 0 }, hi: false, page: 'look' };
   $('#sliders').innerHTML = sliderGroups(p);
   $('#grade').innerHTML = gradeCard(p);
   bindPager();
@@ -1218,10 +1342,21 @@ function openDetail(p) {
     D && (D.userEdited = false);
     refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Redo';
   };
+  $('#autoAdjust').onclick = async () => {
+    const btn = $('#autoAdjust'); btn.disabled = true; btn.textContent = 'Adjusting…';
+    try {
+      const r = await pool.call(p.worker, 'autoAdjust', { id: p.id }, { priority: true });
+      if (!D || D.p !== p) return;
+      Object.assign(p.params, r); D.userEdited = true;
+      refreshDetail(); toast('Auto Adjust applied to exposure and tone.');
+    } catch (e) { toast(e.message, 4500); logError('auto adjust', e, p.file); }
+    finally { if ($('#autoAdjust')) { $('#autoAdjust').disabled = false; $('#autoAdjust').textContent = 'Auto Adjust'; } }
+  };
   renderStyleCard();
   renderRegionCard();
   renderRetouchCard();
   renderPointCard();
+  renderCurveCard();
   renderSyncCard();
   bindCropBar();
   bindSliders();

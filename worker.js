@@ -4,7 +4,7 @@ import { solve, solvePreset } from './engine/solver.js';
 import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
 import { fitRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
 import { signature, nearestRegions } from './engine/style.js';
-import { compile, buildLUTs, applyLUTs, applyFinish, hasSpatialFinish, hasLocal, processPixelSet, SLIDERS, LOCAL_SLIDERS, REGIONS } from './engine/pipeline.js';
+import { compile, buildLUTs, applyLUTs, applyFinish, hasSpatialFinish, hasLocal, processPixelSet, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
 import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
@@ -16,7 +16,7 @@ import { detectFaces } from './faces.js';
 import { personMask, tapMask, maskCanvasSize } from './segment.js';
 import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
-import { srgbToLinear } from './engine/color.js';
+import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
 
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
@@ -478,6 +478,35 @@ const handlers = {
     return { L: acc[0] / n, a: acc[1] / n, b: acc[2] / n };
   },
 
+  // Tone-curve picker: sample the displayed point after the other settings, but before the selected curve.
+  async sampleCurve({ id, x, y, params, curveKey, region = 'all', side = 1200 }) {
+    if (!['curve', 'curveR', 'curveG', 'curveB'].includes(curveKey)) throw new Error('Unknown tone curve');
+    const d = await ensureDisplay(id, side, false);
+    const X = Math.round(x * (d.width - 1)), Y = Math.round(y * (d.height - 1)), rad = Math.max(2, Math.round(d.width / 250));
+    let q;
+    if (region === 'all') {
+      q = { ...params };
+      delete q[curveKey];
+    } else {
+      const loc = { ...((params.local && params.local[region]) || {}) };
+      delete loc[curveKey];
+      q = withLocal(params, loc);
+    }
+    const proc = compile(q), res = new Float64Array(6);
+    let total = 0, n = 0;
+    const ch = curveKey === 'curveR' ? 0 : curveKey === 'curveG' ? 1 : curveKey === 'curveB' ? 2 : -1;
+    for (let j = -rad; j <= rad; j++) for (let i = -rad; i <= rad; i++) {
+      const u = X + i, v = Y + j;
+      if (u < 0 || v < 0 || u >= d.width || v >= d.height) continue;
+      const o = (v * d.width + u) * 4;
+      proc(srgbToLinear(d.data[o] / 255), srgbToLinear(d.data[o + 1] / 255), srgbToLinear(d.data[o + 2] / 255), res);
+      total += ch < 0 ? linearToSrgb(lToY(res[3])) : linearToSrgb(res[ch]);
+      n++;
+    }
+    if (!n) throw new Error('That spot is outside the photo');
+    return { value: Math.round(Math.min(1, Math.max(0, total / n)) * 255) };
+  },
+
   // crop/level for one photo; everything measured afterwards (solve, loss checks) sees only the crop
   async setGeom({ id, geom }) {
     const e = cache.get(id);
@@ -497,6 +526,22 @@ const handlers = {
     const gray = new Float32Array(d.width * d.height);
     for (let i = 0; i < gray.length; i++) gray[i] = (0.299 * d.data[i * 4] + 0.587 * d.data[i * 4 + 1] + 0.114 * d.data[i * 4 + 2]) / 255;
     return autoLevel(gray, d.width, d.height);
+  },
+
+  // A conservative, repeatable tone-only starting point from this photo's original luminance range.
+  async autoAdjust({ id }) {
+    const e = await ensurePrepared(id);
+    const s = measure(e.ps), t = s.tone, p = t.pct;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const lowLight = Number.isFinite(e.scene?.ev) && e.scene.ev < 8;
+    const targetMid = lowLight ? 38 : 48;
+    const exposure = clamp(Math.log2(lToY(targetMid) / Math.max(0.0001, lToY(p[50]))) * 0.45, -0.55, 0.55);
+    const highlights = clamp(-Math.max(0, p[99] - 94) * 1.1 - (t.clipHi > 0.002 ? 10 : 0), -38, 0);
+    const shadows = clamp(Math.max(0, 5 - p[5]) * 0.85 + (t.clipLo > 0.002 ? 12 : 0), 0, 28);
+    const contrast = clamp((82 - (p[95] - p[5])) * 0.25, -14, 18);
+    const whites = clamp((96 - p[99]) * 0.3, -12, 10);
+    const blacks = clamp((p[1] - 3) * 0.35, -8, 8);
+    return { exposure, contrast, highlights, shadows, whites, blacks };
   },
 
   async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true }) {
