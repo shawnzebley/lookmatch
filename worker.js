@@ -541,8 +541,8 @@ const handlers = {
     return autoLevel(gray, d.width, d.height);
   },
 
-  // A conservative starting point from this photo's own tone and color measurements. It follows a
-  // common high-dynamic-range workflow: soften the basic sliders, then restore shape with an S curve.
+  // Correct only measured tonal problems. Keep the curve and color neutral unless this photo's
+  // histogram gives a reason to change them; Auto Adjust is a starting correction, not a look.
   async autoAdjust({ id }) {
     const e = await ensurePrepared(id);
     const s = measure(e.ps), t = s.tone, p = t.pct;
@@ -550,23 +550,17 @@ const handlers = {
     const lowLight = Number.isFinite(e.scene?.ev) && e.scene.ev < 8;
     const targetMid = lowLight ? 38 : 48;
     const spread = p[95] - p[5];
-    const exposure = clamp(Math.log2(lToY(targetMid) / Math.max(0.0001, lToY(p[50]))) * 0.45, -0.55, 0.55);
-    const highlights = clamp(-10 - Math.max(0, p[99] - 94) * 1.1 - (t.clipHi > 0.002 ? 10 : 0), -42, -5);
-    const shadows = clamp(8 + Math.max(0, 5 - p[5]) * 0.85 + (t.clipLo > 0.002 ? 10 : 0), 5, 30);
-    const contrast = clamp(-10 + (82 - spread) * 0.25, -22, 10);
-    const whites = clamp(-7 + (96 - p[99]) * 0.3, -20, -3);
-    const blacks = clamp(7 + (p[1] - 3) * 0.35, 3, 13);
-    const vibrance = clamp((27 - s.color.meanChroma) * 0.35, -2, 8);
-    const out = {
-      exposure, contrast, highlights, shadows, whites, blacks, vibrance,
-      curve: [[0, 5], [64, 57], [128, 128], [192, 199], [255, 250]],
-    };
-    // Bring existing colors toward a restrained mid-range saturation. Skip near-neutral bands so
-    // small sensor noise or gray surfaces do not acquire arbitrary color.
-    for (const [band, stats] of Object.entries(s.bands)) {
-      if (stats.weight < 0.025 || stats.chroma < 7) continue;
-      out[`sat_${band}`] = Math.round(clamp((22 - stats.chroma) * 0.3, -5, 5));
-    }
+    const exposure = clamp(Math.log2(lToY(targetMid) / Math.max(0.0001, lToY(p[50]))) * 0.3, -0.35, 0.35);
+    const highlights = clamp(-Math.max(0, p[99] - 94) * 0.55 - (t.clipHi > 0.002 ? 6 : 0), -22, 0);
+    const shadows = clamp(Math.max(0, 5 - p[5]) * 0.45 + (t.clipLo > 0.002 ? 6 : 0), 0, 18);
+    const contrast = clamp((80 - spread) * 0.12, -8, 8);
+    const whites = clamp((96 - p[99]) * 0.15, -5, 5);
+    const blacks = clamp((p[1] - 3) * 0.15, -4, 4);
+    const out = { exposure, contrast, highlights, shadows, whites, blacks };
+    // A small S curve helps only genuinely flat images. Keep the endpoints fixed so blacks and
+    // whites do not acquire the faded/vintage treatment from the tutorial by default.
+    const curvePush = Math.round(clamp((68 - spread) * 0.12, 0, 4));
+    if (curvePush >= 2) out.curve = [[0, 0], [64, 64 - curvePush], [128, 128], [192, 192 + curvePush], [255, 255]];
     return out;
   },
 
