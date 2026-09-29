@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-29a';
+const APP_VERSION = '2026-09-29b';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -1309,6 +1309,7 @@ function renderStyleCard() {
 }
 
 // ---------------------------------------------------------------- detail view
+const PAGES = [['look', 'Look'], ['subject', 'Subject'], ['light', 'Light'], ['color', 'Color'], ['retouch', 'Retouch'], ['more', 'More']];
 function openDetail(p) {
   const el = $('#detail');
   el.hidden = false;
@@ -1343,6 +1344,7 @@ function openDetail(p) {
   $('#sliders').innerHTML = sliderGroups(p);
   $('#grade').innerHTML = gradeCard(p);
   el.scrollTop = 0;
+  bindPager();
   $('#dBack').onclick = closeDetail;
   $('#dExport').onclick = () => exportPhotos([p]);
   $('#dPick').onclick = () => { p.picked = !p.picked; $('#dPick').classList.toggle('on', p.picked); $('#dPick').setAttribute('aria-pressed', String(p.picked)); };
@@ -1380,6 +1382,38 @@ function openDetail(p) {
   renderLoss();
   requestPreview(true);
   scheduleMeasure(0);
+}
+
+// The bottom panel is a horizontal slider. Keep its section tabs in sync with swipes,
+// and let a tap jump directly to the corresponding group of editing tools.
+function bindPager() {
+  const pager = $('#pager'), tabs = $('#ptabs');
+  const mark = (k) => {
+    D.page = k;
+    tabs.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.p === k));
+    tabs.querySelector('button.on')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+  };
+  const pageEl = (k) => pager.querySelector(`.page[data-p="${k}"]`);
+  D.goPage = (k, smooth = true) => {
+    const el = pageEl(k);
+    if (!el) return;
+    mark(k);
+    pager.scrollTo({ left: el.offsetLeft, behavior: smooth ? 'smooth' : 'auto' });
+  };
+  tabs.onclick = (e) => {
+    const k = e.target.closest('button')?.dataset.p;
+    if (k) D.goPage(k);
+  };
+  let t;
+  pager.onscroll = () => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      const i = Math.round(pager.scrollLeft / Math.max(1, pager.clientWidth));
+      const k = pager.children[i]?.dataset.p;
+      if (k && k !== D?.page) mark(k);
+    }, 60);
+  };
+  mark('look');
 }
 
 // ---------------------------------------------------------------- photo shrinks while scrolling
