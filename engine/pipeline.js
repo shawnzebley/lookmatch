@@ -89,7 +89,7 @@ function wheelAB(hue, sat) {
 export function localActive(loc) {
   if (!loc) return false;
   for (const s of LOCAL_SLIDERS) if (loc[s.key]) return true;
-  return ZONES3.some((z) => loc[`${z}Sat`]);
+  return ZONES3.some((z) => loc[`${z}Sat`]) || CURVE_KEYS.some((k) => !isIdentityCurve(loc[k]));
 }
 /** Does the edit treat subject and background differently? */
 export function hasLocal(p) { return !!(p && p.local && (localActive(p.local.subject) || localActive(p.local.background))); }
@@ -112,6 +112,8 @@ export function withLocal(p, loc) {
       return [a + c, b + d];
     });
   }
+  for (const k of CURVE_KEYS) if (!isIdentityCurve(loc[k])) q[`${k}Local`] = loc[k];
+  q.curveLocalAmount = loc.curveAmount ?? 100;
   return q;
 }
 export function regionParams(p) {
@@ -293,7 +295,12 @@ export function compile(p) {
   const cR = !isIdentityCurve(p.curveR) ? curveLUT(p.curveR) : null;
   const cG = !isIdentityCurve(p.curveG) ? curveLUT(p.curveG) : null;
   const cB = !isIdentityCurve(p.curveB) ? curveLUT(p.curveB) : null;
-  const anyCurve = cM || cR || cG || cB;
+  const lcM = !isIdentityCurve(p.curveLocal) ? curveLUT(p.curveLocal) : null;
+  const lcR = !isIdentityCurve(p.curveRLocal) ? curveLUT(p.curveRLocal) : null;
+  const lcG = !isIdentityCurve(p.curveGLocal) ? curveLUT(p.curveGLocal) : null;
+  const lcB = !isIdentityCurve(p.curveBLocal) ? curveLUT(p.curveBLocal) : null;
+  const localCurveAmount = Math.min(1, Math.max(0, (p.curveLocalAmount ?? 100) / 100));
+  const anyCurve = cM || cR || cG || cB || (localCurveAmount > 0 && (lcM || lcR || lcG || lcB));
 
   const G = 30; // Lab units at 100% grading saturation
   const zones = p._gradeAB ? p._gradeAB.map(([u, v]) => [u * G / 100, v * G / 100]) : ['shadow', 'midtone', 'highlight'].map((z) => {
@@ -353,6 +360,14 @@ export function compile(p) {
       if (cR) sr = lookup(cR, sr);
       if (cG) sg = lookup(cG, sg);
       if (cB) sb = lookup(cB, sb);
+      if (lcM && localCurveAmount) {
+        sr += (lookup(lcM, sr) - sr) * localCurveAmount;
+        sg += (lookup(lcM, sg) - sg) * localCurveAmount;
+        sb += (lookup(lcM, sb) - sb) * localCurveAmount;
+      }
+      if (lcR && localCurveAmount) sr += (lookup(lcR, sr) - sr) * localCurveAmount;
+      if (lcG && localCurveAmount) sg += (lookup(lcG, sg) - sg) * localCurveAmount;
+      if (lcB && localCurveAmount) sb += (lookup(lcB, sb) - sb) * localCurveAmount;
       r = srgbToLinear(sr); g = srgbToLinear(sg); b = srgbToLinear(sb);
     }
 
