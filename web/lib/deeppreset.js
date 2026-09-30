@@ -28,7 +28,11 @@ export async function stylizeRemote(base, photo, ref, { timeoutMs = 120000 } = {
       if (m[1] === 'complete') out = m[2];
       else if (m[1] === 'error') err = m[2];
     }
-    if (!out) throw new Error(`Model server failed${err && err !== 'null' ? `: ${err}` : ''}`);
+    if (!out) {
+      let why = err && err !== 'null' ? err : '';
+      try { why = JSON.parse(why).error || why; } catch (e) { /* plain text */ }
+      throw new Error(`Model server failed${why ? `: ${why}` : ''}`);
+    }
     const data = JSON.parse(out)[0];
     const bin = atob(data), u = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
