@@ -56,6 +56,7 @@ SLIDERS.push({ key: 'finishRolloff', label: 'Roll off highlights', group: 'Finis
 // (finishShA/B, finishHiA/B Lab tints are still honoured by compile() but the photographer fit now uses the colour wheels)
 SLIDERS.push({ key: 'finishSat', label: 'Color intensity', group: 'Finish', ui: [-60, 60], cap: [-60, 60] });
 SLIDERS.push({ key: 'vignette', label: 'Vignette', group: 'Finish', ui: [-100, 100], cap: [-100, 100], lr: 'PostCropVignetteAmount' });
+SLIDERS.push({ key: 'halation', label: 'Halation', group: 'Finish', ui: [0, 100], cap: [0, 60] });
 SLIDERS.push({ key: 'grain', label: 'Grain', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainAmount' });
 SLIDERS.push({ key: 'grainSize', label: 'Grain size', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainSize' });
 SLIDERS.push({ key: 'gradeBalance', label: 'Balance', group: 'Color grading', ui: [-100, 100], cap: [-100, 100] });
@@ -79,6 +80,12 @@ export const LOCAL_SLIDERS = [
   { key: 'saturation', label: 'Saturation', group: 'Color', ui: [-100, 100] },
   { key: 'vibrance', label: 'Vibrance', group: 'Color', ui: [-100, 100] },
 ];
+for (const b of BANDS) {
+  const B = b[0].toUpperCase() + b.slice(1);
+  LOCAL_SLIDERS.push({ key: `hue_${b}`, label: `${B} hue`, group: 'HSL hue', ui: [-50, 50] });
+  LOCAL_SLIDERS.push({ key: `sat_${b}`, label: `${B} sat`, group: 'HSL saturation', ui: [-50, 50] });
+  LOCAL_SLIDERS.push({ key: `lum_${b}`, label: `${B} lum`, group: 'HSL luminance', ui: [-50, 50] });
+}
 export const LOCAL_WHEEL_KEYS = ['shadowHue', 'shadowSat', 'midtoneHue', 'midtoneSat', 'highlightHue', 'highlightSat'];
 const ZONES3 = ['shadow', 'midtone', 'highlight'];
 
@@ -591,7 +598,53 @@ export function applyLUTs(luts, mask, src, dst, count, chIn = 4, chOut = 4, seed
 }
 
 // ---- finish pass (position-dependent) -------------------------------------------------------
-export function hasSpatialFinish(p) { return !!(p.vignette || p.grain); }
+export function halationRadius(width, height) { return Math.max(2, Math.min(64, Math.round(Math.min(width, height) * 0.018))); }
+
+/** Warm light glow from bright sources. The reference matcher supplies a restrained amount only when
+ * its uploaded look contains isolated highlights with a brighter near ring than outer ring. */
+export function applyHalation(buf, width, rows, amount, y0 = 0, fullW = width, fullH = rows, radius = halationRadius(fullW, fullH), ch = 4) {
+  const strength = Math.max(0, Math.min(1, (amount || 0) / 100));
+  if (!strength || width < 1 || rows < 1) return;
+  radius = Math.max(1, Math.min(64, Math.round(radius)));
+  const n = width * rows, bright = new Float32Array(n), horizontal = new Float32Array(n), glow = new Float32Array(n);
+  for (let i = 0, o = 0; i < n; i++, o += ch) {
+    const Y = 0.2126 * S2L[buf[o]] + 0.7152 * S2L[buf[o + 1]] + 0.0722 * S2L[buf[o + 2]];
+    bright[i] = smoothstep(0.58, 0.96, Y);
+  }
+  const win = radius * 2 + 1;
+  for (let y = 0; y < rows; y++) {
+    const row = y * width;
+    let sum = 0;
+    for (let x = 0; x <= radius && x < width; x++) sum += bright[row + x];
+    for (let x = 0; x < width; x++) {
+      horizontal[row + x] = sum / win;
+      if (x - radius >= 0) sum -= bright[row + x - radius];
+      if (x + radius + 1 < width) sum += bright[row + x + radius + 1];
+    }
+  }
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    for (let y = 0; y <= radius && y < rows; y++) sum += horizontal[y * width + x];
+    for (let y = 0; y < rows; y++) {
+      const i = y * width + x;
+      glow[i] = Math.min(0.32, sum / win * radius * radius * 0.9);
+      if (y - radius >= 0) sum -= horizontal[(y - radius) * width + x];
+      if (y + radius + 1 < rows) sum += horizontal[(y + radius + 1) * width + x];
+    }
+  }
+  for (let i = 0, o = 0; i < n; i++, o += ch) {
+    const g = glow[i] * strength;
+    if (g < 1e-5) continue;
+    const r = S2L[buf[o]] + (1 - S2L[buf[o]]) * g * 0.18;
+    const gg = S2L[buf[o + 1]] + (1 - S2L[buf[o + 1]]) * g * 0.055;
+    const b = S2L[buf[o + 2]] + (1 - S2L[buf[o + 2]]) * g * 0.018;
+    buf[o] = Math.round(linearToSrgb(Math.min(1, r)) * 255);
+    buf[o + 1] = Math.round(linearToSrgb(Math.min(1, gg)) * 255);
+    buf[o + 2] = Math.round(linearToSrgb(Math.min(1, b)) * 255);
+  }
+}
+
+export function hasSpatialFinish(p) { return !!(p.vignette || p.grain || p.halation); }
 
 const S2L = new Float32Array(256);
 for (let i = 0; i < 256; i++) S2L[i] = srgbToLinear(i / 255);
@@ -650,6 +703,7 @@ export function renderImage(img, p, N = 33, mask = null) {
   const ch = img.channels || 4;
   const out = new Uint8Array(img.width * img.height * ch);
   applyLUTs(luts, mask, img.data, out, img.width * img.height, ch, ch);
+  if (p.halation) applyHalation(out, img.width, img.height, p.halation, 0, img.width, img.height, undefined, ch);
   if (hasSpatialFinish(p)) applyFinish(out, img.width, img.height, p, 0, img.width, img.height, 7, ch);
   return { width: img.width, height: img.height, channels: ch, data: out };
 }

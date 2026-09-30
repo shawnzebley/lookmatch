@@ -1,10 +1,10 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
-import { prepare, measure, regionStats, regionUsable } from './engine/measure.js';
+import { prepare, measure, regionStats, regionUsable, halationSignature } from './engine/measure.js';
 import { solve, solvePreset } from './engine/solver.js';
 import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
-import { fitRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
+import { fitRegions, fitReferenceRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
 import { signature, nearestRegions } from './engine/style.js';
-import { compile, buildLUTs, applyLUTs, applyFinish, hasSpatialFinish, hasLocal, processPixelSet, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
+import { compile, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
 import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
@@ -269,6 +269,7 @@ function renderInto(src, params, mask = null, skin = null, heals = null) {
   if (heals && heals.length) { data = Uint8ClampedArray.from(src.data); healBuffer(data, src.width, src.height, heals); }
   applyLUTs(luts, mask, data, out, src.width * src.height, 4, 4);
   if (skin && hasSkinPass(params)) applySkinPass(out, src.width, src.height, params, skin, Math.max(src.width, src.height));
+  if (params.halation) applyHalation(out, src.width, src.height, params.halation);
   if (hasSpatialFinish(params)) applyFinish(out, src.width, src.height, params);
   return { width: src.width, height: src.height, data: out };
 }
@@ -395,6 +396,7 @@ const handlers = {
     const stats = measure(e.ps);
     stats.scene = e.scene;
     stats.regions = regionStats(e.ps);
+    stats.signature = { halation: halationSignature(e.ps) };
     const thumb = await toJpegBlob(scaledData(bmp, 480), 0.85);
     bmp.close();
     return { stats, thumb, converted: e.converted || null };
@@ -547,20 +549,19 @@ const handlers = {
     const e = await ensurePrepared(id);
     const s = measure(e.ps), t = s.tone, p = t.pct;
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    const lowLight = Number.isFinite(e.scene?.ev) && e.scene.ev < 8;
-    const targetMid = lowLight ? 38 : 48;
     const spread = p[95] - p[5];
-    const exposure = clamp(Math.log2(lToY(targetMid) / Math.max(0.0001, lToY(p[50]))) * 0.3, -0.35, 0.35);
-    const highlights = clamp(-Math.max(0, p[99] - 94) * 0.55 - (t.clipHi > 0.002 ? 6 : 0), -22, 0);
-    const shadows = clamp(Math.max(0, 5 - p[5]) * 0.45 + (t.clipLo > 0.002 ? 6 : 0), 0, 18);
-    const contrast = clamp((80 - spread) * 0.12, -8, 8);
-    const whites = clamp((96 - p[99]) * 0.15, -5, 5);
-    const blacks = clamp((p[1] - 3) * 0.15, -4, 4);
-    const out = { exposure, contrast, highlights, shadows, whites, blacks };
-    // A small S curve helps only genuinely flat images. Keep the endpoints fixed so blacks and
-    // whites do not acquire the faded/vintage treatment from the tutorial by default.
-    const curvePush = Math.round(clamp((68 - spread) * 0.12, 0, 4));
-    if (curvePush >= 2) out.curve = [[0, 0], [64, 64 - curvePush], [128, 128], [192, 192 + curvePush], [255, 255]];
+    // Exposure handles the photo's overall brightness. Keep the basic controls gentle, then use a
+    // restrained, editable S curve for style. Wide-range scenes get less curve contrast so the
+    // highlights and shadows stay intact; flat scenes get a little more shape.
+    const exposure = clamp(Math.log2(lToY(47) / Math.max(0.0001, lToY(p[50]))) * 0.24, -0.35, 0.35);
+    const highlights = clamp(-(p[99] - 94) * 0.22 - (t.clipHi > 0.002 ? 3 : 0), -10, 0);
+    const shadows = clamp((5 - p[5]) * 0.22 + (t.clipLo > 0.002 ? 3 : 0), 0, 7);
+    const curvePush = Math.round(clamp((68 - spread) * 0.17, 1, 6));
+    const out = {
+      exposure, contrast: 0, highlights, shadows, whites: 0, blacks: 0,
+      curve: [[0, 0], [32, 32 - Math.round(curvePush * 0.6)], [64, 64 - curvePush], [128, 128],
+        [192, 192 + curvePush], [224, 224 + Math.round(curvePush * 0.6)], [255, 255]],
+    };
     return out;
   },
 
@@ -570,6 +571,9 @@ const handlers = {
     const res = lrParams
       ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene, pull })
       : solve(e.ps, o, refStats, { strength, scene: e.scene });
+    if (!lrParams && refStats && refStats.signature && refStats.signature.halation > 0) {
+      res.params.halation = Math.round(Math.min(60, refStats.signature.halation * Math.min(1, strength)));
+    }
     let style = null;
     const prof = finish && finish !== 'off' ? FINISH_PROFILES[finish] : null;
     if (prof) {
@@ -588,7 +592,9 @@ const handlers = {
         want = refStats.regions; move = REF_REGION.move * Math.min(1, strength); from = { kind: 'reference' };
       }
       if (want && move > 0) {
-        const r = fitRegions(e.ps, res.params, want, from && from.kind === 'reference' ? { ...REF_REGION, move } : { move });
+        const r = from && from.kind === 'reference' && want.subject && want.subject.tone && want.background && want.background.bands
+          ? fitReferenceRegions(e.ps, res.params, want, { ...REF_REGION, move })
+          : fitRegions(e.ps, res.params, want, from && from.kind === 'reference' ? { ...REF_REGION, move } : { move });
         if (r) { res.params = r.params; regions = { ...r.regions, from }; }
       }
     }
@@ -658,7 +664,8 @@ const handlers = {
     // the skin pass blurs, so each band is rendered with `halo` rows of context above and below
     const long = Math.max(OW, OH);
     const skinOn = hasSkinPass(params) && e.mask && e.mask.skinFrac >= 0.0005;
-    const halo = skinOn ? skinHalo(long) : 0;
+    const glowHalo = params.halation ? halationRadius(OW, OH) : 0;
+    const halo = Math.max(skinOn ? skinHalo(long) : 0, glowHalo);
     // tiles keep each canvas well under iOS Safari's ~16.7 MP canvas limit
     const tileH = Math.max(64, Math.min(OH, Math.floor(4_000_000 / OW) - 2 * halo));
     const [c, x] = canvas(OW, Math.min(OH, tileH + 2 * halo));
@@ -675,7 +682,8 @@ const handlers = {
       else {
         const tmp = new Uint8ClampedArray(OW * hh * 4);
         applyLUTs(luts, masked ? maskFor(e, OW, hh, g, ya, 1) : null, d, tmp, OW * hh, 4, 4, 1 + ya);
-        applySkinPass(tmp, OW, hh, params, maskFor(e, OW, hh, g, ya, 1, 'skin'), long, 4, y - ya, y - ya + h);
+        if (skinOn) applySkinPass(tmp, OW, hh, params, maskFor(e, OW, hh, g, ya, 1, 'skin'), long, 4, y - ya, y - ya + h);
+        if (params.halation) applyHalation(tmp, OW, hh, params.halation, ya, OW, OH, glowHalo);
         band.set(tmp.subarray((y - ya) * OW * 4, (y - ya + h) * OW * 4));
       }
       if (hasSpatialFinish(params)) applyFinish(band, OW, h, params, y, OW, OH);

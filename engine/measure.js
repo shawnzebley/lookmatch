@@ -3,7 +3,7 @@
 // measure() computes the stats for any (possibly edited) Lab/linear arrays using those fixed masks,
 // so the solver compares like with like while it changes the image.
 
-import { SRGB8_TO_LIN, linToLab, rgbHue, abToWheelHue, labToCctDuv } from './color.js';
+import { SRGB8_TO_LIN, linearToSrgb, linToLab, rgbHue, abToWheelHue, labToCctDuv } from './color.js';
 
 function smoothstep(a, b, x) { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
 export function gradeWeights(L, shift = 0, out = [0, 0, 0]) {
@@ -217,17 +217,62 @@ export const REGION_IN = 191, REGION_OUT = 64;
 // Enough of both to compare them?
 export const regionUsable = (r) => !!r && r.frac >= 0.03 && r.frac <= 0.92 && r.subject.n > 200 && r.background.n > 200;
 
+// Estimate a reference's light halation from bright local peaks. A bright sky or white wall has no
+// isolated peaks and therefore does not request a glow; a source with a brighter near-ring than its
+// outer ring does. This is deliberately a small, capped signature cue, not a flare synthesizer.
+export function halationSignature(ps) {
+  const { width: w, height: h, n, L } = ps;
+  const dim = Math.min(w, h), outer = Math.max(5, Math.round(dim * 0.07));
+  if (!w || !h || dim < 40 || n !== w * h) return 0;
+  const nearR = [Math.max(2, Math.round(dim * 0.018)), Math.max(3, Math.round(dim * 0.032)), Math.max(4, Math.round(dim * 0.048))];
+  const outerR = Math.max(outer, nearR[2] + 2), samples = 16, candidates = [];
+  const atRing = (x, y, radius) => {
+    let sum = 0, count = 0;
+    for (let k = 0; k < samples; k++) {
+      const a = 2 * Math.PI * k / samples, xx = Math.round(x + Math.cos(a) * radius), yy = Math.round(y + Math.sin(a) * radius);
+      if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+      sum += L[yy * w + xx]; count++;
+    }
+    return count ? sum / count : 0;
+  };
+  const step = Math.max(1, Math.floor(dim / 220));
+  for (let y = outerR + 1; y < h - outerR - 1; y += step) for (let x = outerR + 1; x < w - outerR - 1; x += step) {
+    const i = y * w + x, peak = L[i];
+    if (peak < 96) continue;
+    let lower = 0, localMax = true;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      if (!dx && !dy) continue;
+      const v = L[i + dy * w + dx];
+      if (v > peak + 0.1) localMax = false;
+      if (v < peak - 1.5) lower++;
+    }
+    if (!localMax || lower < 4) continue;
+    const near = nearR.reduce((sum, r) => sum + atRing(x, y, r), 0) / nearR.length;
+    const far = atRing(x, y, outerR);
+    const score = Math.max(0, Math.min(1, (near - far - 0.5) / 8));
+    if (score > 0) { candidates.push(score); if (candidates.length > 256) { candidates.sort((a, b) => b - a); candidates.length = 128; } }
+  }
+  if (!candidates.length) return 0;
+  candidates.sort((a, b) => b - a);
+  const top = candidates.slice(0, 12), mean = top.reduce((a, b) => a + b, 0) / top.length;
+  return Math.round(mean * 60);
+}
+
 /**
  * Subject vs background: median L*, mean chroma and tint (mean a*, b* of the lower-chroma half) of each,
  * and the differences the style works with: sep = subject L* - background L*, dA / dB tint difference,
  * logC = ln(subject chroma / background chroma). Null without a mask.
  */
-export function regionStats(ps, cur, idx) {
+export function regionStats(ps, cur, idx, { details = true } = {}) {
   if (!ps.subject) return null;
   cur = cur || ps;
   const m = ps.subject, tint = ps.masks.regionTint;
+  const skin = details && ps.masks.skin, neutral = details && ps.masks.neutral;
   const N = idx ? idx.length : ps.n;
-  const R = [0, 1].map(() => ({ hist: new Float64Array(101), n: 0, l: 0, c: 0, ta: 0, tb: 0, tn: 0 }));
+  const R = [0, 1].map(() => ({ hist: new Float64Array(101), n: 0, l: 0, c: 0, ta: 0, tb: 0, tn: 0,
+    wa: 0, wb: 0, wn: 0, sa: 0, sb: 0, sc: 0, sn: 0,
+    hsl: details ? BANDS.map(() => ({ w: 0, hx: 0, hy: 0, c: 0, l: 0 })) : null }));
+  const bw = details ? new Float32Array(8) : null;
   let on = 0;
   for (let k = 0; k < N; k++) {
     const i = idx ? idx[k] : k;
@@ -236,13 +281,44 @@ export function regionStats(ps, cur, idx) {
     const r = v >= REGION_IN ? R[0] : v < REGION_OUT ? R[1] : null;
     if (!r) continue;
     const L = cur.L[i], a = cur.A[i], b = cur.B[i];
+    const C = Math.hypot(a, b);
     r.hist[Math.max(0, Math.min(100, Math.round(L)))]++;
-    r.n++; r.l += L; r.c += Math.hypot(a, b);
+    r.n++; r.l += L; r.c += C;
     if (tint[i]) { r.ta += a; r.tb += b; r.tn++; }
+    if (details && neutral[i]) { r.wa += a; r.wb += b; r.wn++; }
+    if (details && skin[i] && v >= 128) { r.sa += a; r.sb += b; r.sc += C; r.sn++; }
+    if (details && C > 2 && cur.lr) {
+      const h = rgbHue(linearToSrgb(cur.lr[i]), linearToSrgb(cur.lg[i]), linearToSrgb(cur.lb[i]));
+      bandWeights(h, bw);
+      const conf = Math.min(1, Math.max(0, (C - 3) / 10));
+      const rad = h * Math.PI / 180;
+      for (let q = 0; q < 8; q++) {
+        const w = bw[q] * conf;
+        if (!w) continue;
+        const z = r.hsl[q]; z.w += w; z.hx += Math.cos(rad) * w; z.hy += Math.sin(rad) * w;
+        z.c += C * w; z.l += L * w;
+      }
+    }
   }
   const out = [0, 1].map((j) => {
     const r = R[j];
-    return { n: r.n, L50: r.n ? percentileFromHist(r.hist, r.n, 50, 1) : 0, mL: r.n ? r.l / r.n : 0, C: r.n ? r.c / r.n : 0, a: r.tn ? r.ta / r.tn : 0, b: r.tn ? r.tb / r.tn : 0 };
+    const L50 = r.n ? percentileFromHist(r.hist, r.n, 50, 1) : 0;
+    const base = { n: r.n, L50, mL: r.n ? r.l / r.n : 0, C: r.n ? r.c / r.n : 0, a: r.tn ? r.ta / r.tn : 0, b: r.tn ? r.tb / r.tn : 0 };
+    if (!details) return base;
+    const pct = Object.fromEntries(PCTS.map((p) => [p, r.n ? percentileFromHist(r.hist, r.n, p, 1) : 0]));
+    const bands = Object.fromEntries(BANDS.map((name, i) => {
+      const z = r.hsl[i], weight = z.w / Math.max(1, r.n);
+      let hue = Math.atan2(z.hy, z.hx) * 180 / Math.PI; if (hue < 0) hue += 360;
+      return [name, { weight, hue, chroma: z.w ? z.c / z.w : 0, lum: z.w ? z.l / z.w : 0 }];
+    }));
+    let skinHue = Math.atan2(r.sb, r.sa) * 180 / Math.PI; if (skinHue < 0) skinHue += 360;
+    return {
+      ...base,
+      tone: { black: r.n ? percentileFromHist(r.hist, r.n, 0.5, 1) : 0, white: r.n ? percentileFromHist(r.hist, r.n, 99.5, 1) : 0, pct },
+      wb: { a: r.wn ? r.wa / r.wn : 0, b: r.wn ? r.wb / r.wn : 0, pixels: r.wn },
+      skin: r.sn >= 20 ? { hue: skinHue, chroma: r.sc / r.sn, a: r.sa / r.sn, b: r.sb / r.sn, pixels: r.sn } : null,
+      bands,
+    };
   });
   const [s, bg] = out;
   return {

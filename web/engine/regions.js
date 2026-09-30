@@ -4,9 +4,10 @@
 // while the photo as a whole stays where the whole-photo edit put it.
 
 import { processPixelSet } from './pipeline.js';
-import { regionStats, regionUsable } from './measure.js';
+import { BANDS, PCTS, regionStats, regionUsable } from './measure.js';
 import { lm } from './solver.js';
 import { counts } from './loss.js';
+import { linearToSrgb, lToY } from './color.js';
 
 // Share of the gap closed. Much of how a subject sits against its background in any one photo is the
 // light it was shot in, not the edit, so only part of the difference is copied, and no more than
@@ -72,7 +73,7 @@ export function fitRegions(ps, params, want, { move = REGION_MOVE, idx = null, s
   const cur = { L: new Float32Array(n), A: new Float32Array(n), B: new Float32Array(n), lr: new Float32Array(n), lg: new Float32Array(n), lb: new Float32Array(n) };
   const base = { ...params };
   delete base.local;
-  const st0 = regionStats(ps, processPixelSet(ps, base, idx, cur), idx);
+  const st0 = regionStats(ps, processPixelSet(ps, base, idx, cur), idx, { details: false });
   if (!regionUsable(st0)) return null;
   const T = regionTargets(st0, want, move, { step, darken, dull, cool });
   const clip0 = counts(ps, cur, idx);
@@ -94,7 +95,7 @@ export function fitRegions(ps, params, want, { move = REGION_MOVE, idx = null, s
   });
   const fn = (x) => {
     const p = { ...base, local: toLocal(x) };
-    const s = regionStats(ps, processPixelSet(ps, p, idx, cur), idx);
+    const s = regionStats(ps, processPixelSet(ps, p, idx, cur), idx, { details: false });
     const w = whole(s);
     const c = counts(ps, cur, idx);
     const r = [
@@ -118,7 +119,7 @@ export function fitRegions(ps, params, want, { move = REGION_MOVE, idx = null, s
   const local = toLocal(res.x);
   for (const r of ['subject', 'background']) for (const k of KEYS) local[r][k] = round(k, local[r][k]);
   const out = { ...base, local };
-  const st1 = regionStats(ps, processPixelSet(ps, out, idx, cur), idx);
+  const st1 = regionStats(ps, processPixelSet(ps, out, idx, cur), idx, { details: false });
   const r1 = (v) => Math.round(v * 10) / 10;
   const rel = (s) => ({ sep: r1(s.sep), dA: r1(s.dA), dB: r1(s.dB), chroma: Math.round(Math.exp(s.logC) * 100) / 100 });
   return {
@@ -129,6 +130,117 @@ export function fitRegions(ps, params, want, { move = REGION_MOVE, idx = null, s
       target: rel({ sep: T.sep, dA: T.dA, dB: T.dB, logC: T.logC }),
       theirs: rel({ sep: want.sep ?? st0.sep, dA: want.dA ?? st0.dA, dB: want.dB ?? st0.dB, logC: want.logC ?? st0.logC }),
       local,
+    },
+  };
+}
+
+const hueDiff = (a, b) => ((a - b + 540) % 360) - 180;
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const lstarToGray = (L) => Math.round(255 * linearToSrgb(lToY(clamp(L, 0, 100))));
+
+function subjectReferenceCurve(now, target, move) {
+  if (!now || !target || !now.pct || !target.pct) return null;
+  const transfer = (a, b, limit) => a + clamp(b - a, -limit, limit) * move;
+  const pairs = [[0, lstarToGray(transfer(now.black, target.black, 8))]];
+  for (const p of PCTS) {
+    const x = lstarToGray(now.pct[p]);
+    const y = lstarToGray(transfer(now.pct[p], target.pct[p], 12));
+    pairs.push([x, y]);
+  }
+  pairs.push([255, lstarToGray(transfer(now.white, target.white, 8))]);
+  pairs.sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const [x, y] of pairs) {
+    const py = Math.max(out.length ? out[out.length - 1][1] : 0, Math.min(255, y));
+    if (out.length && x === out[out.length - 1][0]) out[out.length - 1][1] = py;
+    else out.push([x, py]);
+  }
+  if (out[0][0] !== 0) out.unshift([0, out[0][1]]);
+  if (out[out.length - 1][0] !== 255) out.push([255, out[out.length - 1][1]]);
+  return out.every(([x, y]) => x === y) ? null : out;
+}
+
+/** A photo reference contributes three distinct cues: subject white balance and tone shape, and
+ * background HSL color relationships. The photographer profile path continues to use fitRegions(). */
+export function fitReferenceRegions(ps, params, want, opts = {}) {
+  const move = clamp(opts.move ?? 0.5, 0, 0.7);
+  const relation = fitRegions(ps, params, want, { ...opts, move });
+  if (!relation || !want.subject || !want.background) return relation;
+  const idx = sampleIdx(ps.n, 5000), cur = { L: new Float32Array(ps.n), A: new Float32Array(ps.n), B: new Float32Array(ps.n), lr: new Float32Array(ps.n), lg: new Float32Array(ps.n), lb: new Float32Array(ps.n) };
+  const local = { subject: { ...relation.params.local.subject }, background: { ...relation.params.local.background } };
+  // A photographic reference's background receives its color style through HSL; local WB belongs to
+  // the subject so that a warm or pink subject does not recolor the whole backdrop.
+  local.background.temp = 0; local.background.tint = 0;
+  let working = { ...relation.params, local };
+  const refit = (p) => regionStats(ps, processPixelSet(ps, p, idx, cur), idx);
+  let st = refit(working);
+
+  // Fit subject WB toward the reference's neutral-pixel cast when available, otherwise its low-chroma
+  // subject tint. Skin hue/chroma acts as an additional anchor when both photos contain enough skin.
+  const targetSub = want.subject, currentSub = st && st.subject;
+  if (currentSub && targetSub.n > 200) {
+    const neutralPair = currentSub.wb.pixels >= 12 && targetSub.wb && targetSub.wb.pixels >= 12;
+    const aKey = neutralPair ? 'wb' : null;
+    const sourceA = aKey ? currentSub.wb.a : currentSub.a, sourceB = aKey ? currentSub.wb.b : currentSub.b;
+    const targetA = aKey ? targetSub.wb.a : targetSub.a, targetB = aKey ? targetSub.wb.b : targetSub.b;
+    const aimA = sourceA + (targetA - sourceA) * move, aimB = sourceB + (targetB - sourceB) * move;
+    const skinAim = currentSub.skin && targetSub.skin
+      ? { hue: currentSub.skin.hue + hueDiff(targetSub.skin.hue, currentSub.skin.hue) * move,
+          chroma: currentSub.skin.chroma + (targetSub.skin.chroma - currentSub.skin.chroma) * move }
+      : null;
+    const baseTemp = local.subject.temp || 0, baseTint = local.subject.tint || 0;
+    const fn = (x) => {
+      const trial = { ...working, local: { ...local, subject: { ...local.subject, temp: baseTemp + x[0], tint: baseTint + x[1] } } };
+      const q = refit(trial), v = q && q.subject;
+      if (!v) return [0, 0, x[0] / 12, x[1] / 12];
+      const va = aKey ? v.wb.a : v.a, vb = aKey ? v.wb.b : v.b;
+      const r = [(va - aimA) / 1.5, (vb - aimB) / 1.5];
+      if (skinAim && v.skin) r.push(hueDiff(v.skin.hue, skinAim.hue) / 5, (v.skin.chroma - skinAim.chroma) / 4);
+      r.push(x[0] / 14, x[1] / 14);
+      return r;
+    };
+    const fit = lm(fn, [0, 0], [-18, -18], [18, 18], { iters: 10 });
+    local.subject.temp = Math.round(clamp(baseTemp + fit.x[0], -35, 35));
+    local.subject.tint = Math.round(clamp(baseTint + fit.x[1], -30, 30));
+    working = { ...working, local };
+    st = refit(working);
+  }
+
+  // Make the subject's measured tone distribution approach the reference with a smooth, monotone
+  // editable point curve. Exposure remains available as a separate correction.
+  const curve = subjectReferenceCurve(st && st.subject && st.subject.tone, targetSub.tone, move);
+  if (curve) { local.subject.curve = curve; local.subject.curveAmount = 100; local.subject.curveAuto = 'reference'; }
+  working = { ...working, local };
+  st = refit(working);
+
+  // Reproduce the reference's background palette with bounded, per-hue HSL moves. Empty or nearly
+  // empty hue bands are ignored so a color present only in one photograph is not invented elsewhere.
+  const changes = [];
+  const sourceBands = st && st.background && st.background.bands, targetBands = want.background.bands;
+  if (sourceBands && targetBands) for (const band of BANDS) {
+    const have = sourceBands[band], target = targetBands[band];
+    if (!have || !target || have.weight < 0.012 || target.weight < 0.012) continue;
+    const hue = clamp(hueDiff(target.hue, have.hue) * move / 30 * 100, -45, 45);
+    const sat = clamp((target.chroma - have.chroma) / Math.max(5, have.chroma) * 100 * move, -35, 35);
+    const lum = clamp((target.lum - have.lum) / 18 * 100 * move, -25, 25);
+    if (Math.abs(hue) >= 1 || Math.abs(sat) >= 1 || Math.abs(lum) >= 1) {
+      local.background[`hue_${band}`] = Math.round(hue);
+      local.background[`sat_${band}`] = Math.round(sat);
+      local.background[`lum_${band}`] = Math.round(lum);
+      changes.push(band);
+    }
+  }
+  working = { ...working, local };
+  const after = refit(working);
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const rel = (s) => ({ sep: r1(s.sep), dA: r1(s.dA), dB: r1(s.dB), chroma: Math.round(Math.exp(s.logC) * 100) / 100 });
+  return {
+    params: working,
+    regions: {
+      ...relation.regions,
+      after: rel(after),
+      local,
+      referenceStyle: { subjectCurve: !!curve, backgroundHslBands: changes },
     },
   };
 }
