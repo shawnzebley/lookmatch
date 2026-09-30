@@ -1,4 +1,4 @@
-import { SLIDERS, defaultParams, compile, LOCAL_SLIDERS, REGIONS, CURVE_KEYS, curveLUT, isIdentityCurve } from './engine/pipeline.js';
+import { SLIDERS, CURVE_SATURATION, defaultParams, compile, LOCAL_SLIDERS, REGIONS, CURVE_KEYS, curveLUT, isIdentityCurve } from './engine/pipeline.js';
 import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
 import { FINISH_PROFILES } from './engine/finish.js';
 import { srgbToLinear, linearToSrgb } from './engine/color.js';
@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-29d';
+const APP_VERSION = '2026-09-30a';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -647,9 +647,9 @@ function numbersTable(p) {
   </table>${p.guardScale < 0.99 ? `<p class="muted small">Edit scaled to ${Math.round(p.guardScale * 100)}% to avoid clipping.</p>` : ''}`;
 }
 
-function sliderRow(s, v) {
+function sliderRow(s, v, baseline = 0) {
   const step = s.step || 1;
-  return `<div class="sl ${Math.abs(v) > 1e-9 ? 'changed' : ''}" data-k="${s.key}"><label>${s.label}</label>
+  return `<div class="sl ${Math.abs(v - baseline) > 1e-9 ? 'changed' : ''}" data-k="${s.key}"><label>${s.label}</label>
     <input type="range" min="${s.ui[0]}" max="${s.ui[1]}" step="${step}" value="${v}">
     <input type="number" min="${s.ui[0]}" max="${s.ui[1]}" step="${step}" value="${step < 1 ? (+v).toFixed(2) : Math.round(v)}"></div>`;
 }
@@ -661,6 +661,8 @@ const CURVE_CHANNELS = [
   ['curveG', 'Green', '#83d69b'], ['curveB', 'Blue', '#77b9ff'],
 ];
 const IDENTITY_CURVE = [[0, 0], [255, 255]];
+const CURVE_GRID = [0, 64, 128, 192, 255];
+function snapCurveCoord(v) { return CURVE_GRID.reduce((best, q) => Math.abs(q - v) < Math.abs(best - v) ? q : best, CURVE_GRID[0]); }
 function currentCurvePoints(key = D.curveChannel) {
   return D.region === 'all' ? D.p.params[key] || IDENTITY_CURVE : localOf(D.p, D.region)[key] || IDENTITY_CURVE;
 }
@@ -676,22 +678,30 @@ function curveCardMarkup(p) {
   const local = D.region !== 'all';
   const points = currentCurvePoints();
   const color = CURVE_CHANNELS.find(([k]) => k === D.curveChannel)?.[2] || '#f3f1eb';
-  const grid = [0, 64, 128, 192, 255].map((v) => `<path d="M${v} 0V255 M0 ${v}H255"/>`).join('');
-  const dots = points.map(([x, y], i) => `<circle class="curve-dot" data-i="${i}" cx="${x}" cy="${255 - y}" r="4.5"/>`).join('');
+  const grid = CURVE_GRID.map((v) => `<path d="M${v} 0V255 M0 ${v}H255"/>`).join('');
+  const dots = points.map(([x, y], i) => `<circle class="curve-dot" data-i="${i}" cx="${x}" cy="${255 - y}" r="4.5" tabindex="0" aria-label="Curve point ${i + 1}: input ${x}, output ${y}; use arrow keys to adjust"/>`).join('');
   const target = local ? (D.region === 'subject' ? 'Subject mask' : 'Background mask') : 'Whole photo';
   const status = D.tool === 'curve' ? 'Tap a tone in the photo to place a control point.' : 'Tap the graph to add a point, or pick a tone from the photo.';
   const localCurves = local ? `<div id="curveAmountRow">${sliderRow({ key: 'curveAmount', label: 'Mask curve amount', ui: [0, 100] }, localOf(p, D.region).curveAmount ?? 100)}</div>` : '';
-  const exportNote = local && CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, D.region)[k]))
-    ? '<p class="muted small" style="margin:5px 0 0">Local curves are baked into the exported photo. Lightroom sidecars do not store local tone curves yet.</p>' : '';
+  const curveSat = sliderRow(CURVE_SATURATION, p.params.curveSaturation ?? 100, 100);
+  const notes = [];
+  if (local && CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, D.region)[k]))) notes.push('Local curves are baked into the exported photo. Lightroom sidecars do not store local tone curves yet.');
+  const anyCurve = CURVE_KEYS.some((k) => !isIdentityCurve(p.params[k])) || REGIONS.some((r) => CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, r)[k])));
+  if (anyCurve && Math.abs((p.params.curveSaturation ?? 100) - 100) > 1e-9) notes.push('Curve saturation compensation is baked into rendered exports; Lightroom XMP has no equivalent setting.');
+  const exportNote = notes.map((note) => `<p class="muted small" style="margin:5px 0 0">${note}</p>`).join('');
+  const copyMaster = D.curveChannel === 'curve' ? '<button id="curveCopyRGB">Copy Master to RGB</button>' : '';
   return `<h3>Tone curve · ${target}</h3>
     <div class="seg curve-channels" id="curveChannels">${CURVE_CHANNELS.map(([k, label]) => `<button data-c="${k}" class="${D.curveChannel === k ? 'on' : ''}">${label}</button>`).join('')}</div>
-    <svg class="curve-graph" id="curveGraph" viewBox="0 0 255 255" role="img" aria-label="${target} ${CURVE_CHANNELS.find(([k]) => k === D.curveChannel)?.[1]} tone curve" style="--curve-color:${color}">
+    <svg class="curve-graph" id="curveGraph" viewBox="0 0 255 255" role="group" aria-label="${target} ${CURVE_CHANNELS.find(([k]) => k === D.curveChannel)?.[1]} tone curve" style="--curve-color:${color}">
       <g class="curve-grid">${grid}</g><path class="curve-diagonal" d="M0 255L255 0"/><path class="curve-line" d="${curvePath(points)}"/>${dots}
     </svg>
-    <div class="row curve-actions"><button id="curvePick" class="${D.tool === 'curve' ? 'on' : ''}">Pick from photo</button><button id="curveS">Gentle S</button><button id="curveReset">Reset</button></div>
-    ${localCurves}<p class="muted small" id="curveHelp" style="margin:5px 0 0">${status}</p>${exportNote}`;
+    <div class="row curve-actions"><button id="curvePick" class="${D.tool === 'curve' ? 'on' : ''}">Pick from photo</button><button id="curveS">Gentle S</button>${copyMaster}<button id="curveReset">Reset</button></div>
+    <label class="chk"><input type="checkbox" id="curveSnap" ${D.curveSnap ? 'checked' : ''}>Snap points to grid (right-click graph to toggle)</label>
+    <div id="curveSaturationRow">${curveSat}</div>
+    <p class="muted small" style="margin:4px 0 0">At 100, curve color response is unchanged. 0 removes its chroma change; 200 doubles it. Separate HSL hue, saturation, and luminance sliders are in the Light controls.</p>
+    ${localCurves}<p class="muted small" id="curveHelp" style="margin:5px 0 0">${status} Left to right is shadows to highlights; move up to brighten and down to darken. Use Exposure for overall brightness and curves for style. RGB channels add or remove color. Arrow keys nudge a focused point (Shift = 5).</p>${exportNote}`;
 }
-function drawCurve() {
+function drawCurve(focusIndex = null) {
   const svg = $('#curveGraph');
   if (!svg || !D) return;
   const pts = currentCurvePoints();
@@ -700,10 +710,12 @@ function drawCurve() {
   for (let i = 0; i < pts.length; i++) {
     const [x, y] = pts[i], dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
     dot.setAttribute('class', 'curve-dot'); dot.dataset.i = String(i); dot.setAttribute('cx', String(x));
-    dot.setAttribute('cy', String(255 - y)); dot.setAttribute('r', '4.5'); svg.append(dot);
+    dot.setAttribute('cy', String(255 - y)); dot.setAttribute('r', '4.5'); dot.setAttribute('tabindex', '0');
+    dot.setAttribute('aria-label', `Curve point ${i + 1}: input ${x}, output ${y}; use arrow keys to adjust`); svg.append(dot);
   }
+  if (focusIndex != null) svg.querySelector(`.curve-dot[data-i="${focusIndex}"]`)?.focus();
 }
-function writeCurvePoints(points) {
+function writeCurvePoints(points, focusIndex = null) {
   points.sort((a, b) => a[0] - b[0]);
   const p = D.p.params;
   if (D.region === 'all') p[D.curveChannel] = points;
@@ -712,7 +724,7 @@ function writeCurvePoints(points) {
     p.local[D.region] = { ...(p.local[D.region] || {}), [D.curveChannel]: points };
   }
   D.userEdited = true;
-  drawCurve(); requestPreview(false); scheduleMeasure();
+  drawCurve(focusIndex); requestPreview(false); scheduleMeasure();
 }
 function renderCurveCard() {
   if (!D || !$('#curveCard')) return;
@@ -724,6 +736,15 @@ function renderCurveCard() {
   };
   $('#curvePick', box).onclick = () => setTool(D.tool === 'curve' ? null : 'curve');
   $('#curveS', box).onclick = () => writeCurvePoints([[0, 0], [64, 54], [128, 128], [192, 201], [255, 255]]);
+  if ($('#curveCopyRGB', box)) $('#curveCopyRGB', box).onclick = () => {
+    const points = currentCurvePoints('curve').map((q) => [...q]);
+    if (D.region === 'all') for (const key of ['curveR', 'curveG', 'curveB']) D.p.params[key] = points.map((q) => [...q]);
+    else {
+      D.p.params.local ||= {};
+      D.p.params.local[D.region] = { ...(D.p.params.local[D.region] || {}), ...Object.fromEntries(['curveR', 'curveG', 'curveB'].map((key) => [key, points.map((q) => [...q])])) };
+    }
+    D.userEdited = true; renderCurveCard(); requestPreview(false); scheduleMeasure(); toast('Master curve copied to RGB');
+  };
   $('#curveReset', box).onclick = () => {
     if (D.region === 'all') delete D.p.params[D.curveChannel];
     else if (D.p.params.local && D.p.params.local[D.region]) delete D.p.params.local[D.region][D.curveChannel];
@@ -734,27 +755,53 @@ function renderCurveCard() {
     D.p.params.local[D.region] = { ...(D.p.params.local[D.region] || {}), curveAmount: value };
     D.userEdited = true; requestPreview(false); scheduleMeasure();
   });
+  bindRows(box.querySelectorAll('#curveSaturationRow .sl'), (_k, value) => {
+    D.p.params.curveSaturation = value;
+    D.userEdited = true; requestPreview(false); scheduleMeasure();
+  }, 100);
+  $('#curveSnap', box).onchange = (e) => { D.curveSnap = e.target.checked; };
   const svg = $('#curveGraph', box);
   const xy = (e) => {
     const r = svg.getBoundingClientRect();
     return [Math.max(0, Math.min(255, (e.clientX - r.left) / r.width * 255)), Math.max(0, Math.min(255, 255 - (e.clientY - r.top) / r.height * 255))];
   };
+  svg.addEventListener('contextmenu', (e) => {
+    e.preventDefault(); D.curveSnap = !D.curveSnap;
+    $('#curveSnap', box).checked = D.curveSnap; toast(`Curve grid snap ${D.curveSnap ? 'on' : 'off'}`, 1600);
+  });
+  svg.addEventListener('keydown', (e) => {
+    const dot = e.target.closest('.curve-dot');
+    if (!dot) return;
+    const i = +dot.dataset.i, points = currentCurvePoints().map((q) => [...q]), step = e.shiftKey ? 5 : 1;
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+    e.preventDefault();
+    const [x0, y0] = points[i];
+    const xMin = i === 0 ? 0 : points[i - 1][0] + 2, xMax = i === points.length - 1 ? 255 : points[i + 1][0] - 2;
+    const yMin = i === 0 ? 0 : points[i - 1][1], yMax = i === points.length - 1 ? 255 : points[i + 1][1];
+    const x = Math.round(Math.max(xMin, Math.min(xMax, x0 + (e.key === 'ArrowRight' ? step : e.key === 'ArrowLeft' ? -step : 0))));
+    const y = Math.round(Math.max(yMin, Math.min(yMax, y0 + (e.key === 'ArrowUp' ? step : e.key === 'ArrowDown' ? -step : 0))));
+    points[i] = [x, y]; writeCurvePoints(points, i);
+  });
   svg.addEventListener('pointerdown', (e) => {
+    if (e.button === 2) return;
     e.preventDefault(); svg.setPointerCapture(e.pointerId);
     const dot = e.target.closest('.curve-dot');
-    if (dot) { D.curveDrag = +dot.dataset.i; return; }
-    const [x] = xy(e), points = currentCurvePoints().map((q) => [...q]);
+    if (dot) { dot.focus(); D.curveDrag = +dot.dataset.i; return; }
+    let [x, y] = xy(e); const points = currentCurvePoints().map((q) => [...q]);
+    if (D.curveSnap) { x = snapCurveCoord(x); y = snapCurveCoord(y); }
     const xi = Math.round(x);
     if (points.some(([px]) => Math.abs(px - xi) < 3)) return;
-    points.push([xi, Math.round(curveValueAt(points, xi))]); writeCurvePoints(points);
+    points.push([xi, Math.round(D.curveSnap ? y : curveValueAt(points, xi))]); points.sort((a, b) => a[0] - b[0]);
+    writeCurvePoints(points, points.findIndex(([px]) => px === xi));
   });
   svg.addEventListener('pointermove', (e) => {
     if (D.curveDrag == null) return;
     const points = currentCurvePoints().map((q) => [...q]), i = D.curveDrag, [rawX, rawY] = xy(e);
-    const x = i === 0 ? 0 : i === points.length - 1 ? 255 : Math.round(Math.max(points[i - 1][0] + 2, Math.min(points[i + 1][0] - 2, rawX)));
+    const snappedX = D.curveSnap ? snapCurveCoord(rawX) : rawX, snappedY = D.curveSnap ? snapCurveCoord(rawY) : rawY;
+    const x = i === 0 ? 0 : i === points.length - 1 ? 255 : Math.round(Math.max(points[i - 1][0] + 2, Math.min(points[i + 1][0] - 2, snappedX)));
     const lo = i === 0 ? 0 : points[i - 1][1], hi = i === points.length - 1 ? 255 : points[i + 1][1];
-    points[i] = [x, Math.round(Math.max(lo, Math.min(hi, rawY)))];
-    writeCurvePoints(points);
+    points[i] = [x, Math.round(Math.max(lo, Math.min(hi, snappedY)))];
+    writeCurvePoints(points, i);
   });
   const endDrag = () => { D.curveDrag = null; };
   svg.addEventListener('pointerup', endDrag); svg.addEventListener('pointercancel', endDrag);
@@ -945,7 +992,7 @@ function renderRetouchCard() {
 }
 
 // slider rows outside #sliders: range + number kept in step, onSet(key, value)
-function bindRows(rows, onSet) {
+function bindRows(rows, onSet, baseline = 0) {
   rows.forEach((row) => {
     const k = row.dataset.k;
     const [range, num] = row.querySelectorAll('input');
@@ -954,7 +1001,7 @@ function bindRows(rows, onSet) {
       v = Math.max(lo, Math.min(hi, +v || 0));
       if (from !== range) range.value = v;
       if (from !== num) num.value = step < 1 ? v.toFixed(1) : Math.round(v);
-      row.classList.toggle('changed', Math.abs(v) > 1e-9);
+      row.classList.toggle('changed', Math.abs(v - baseline) > 1e-9);
       onSet(k, v);
     };
     range.oninput = () => set(range.value, range);
@@ -1345,7 +1392,7 @@ function openDetail(p) {
       </div>
     </div>`;
   D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null, region: 'all', pick: null, showMask: false, flash: false,
-    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1, curveChannel: 'curve', curveDrag: null, view: { s: 1, x: 0, y: 0 }, hi: false, page: 'look' };
+    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1, curveChannel: 'curve', curveDrag: null, curveSnap: false, view: { s: 1, x: 0, y: 0 }, hi: false, page: 'look' };
   $('#sliders').innerHTML = sliderGroups(p);
   $('#grade').innerHTML = gradeCard(p);
   el.scrollTop = 0;
