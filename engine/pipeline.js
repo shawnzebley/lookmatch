@@ -24,6 +24,9 @@ export const SLIDERS = [
   { key: 'vibrance', label: 'Vibrance', group: 'Presence', ui: [-100, 100], cap: [-60, 60], lr: 'Vibrance' },
   { key: 'saturation', label: 'Saturation', group: 'Presence', ui: [-100, 100], cap: [-50, 40], lr: 'Saturation' },
 ];
+// Controls how much of the color change introduced by point curves is kept. 100 leaves the
+// curve's natural color response unchanged; 0 holds the pre-curve chroma while keeping curve tone.
+export const CURVE_SATURATION = { key: 'curveSaturation', label: 'Curve saturation', ui: [0, 200], cap: [0, 200] };
 for (const b of BANDS) {
   const B = b[0].toUpperCase() + b.slice(1);
   SLIDERS.push({ key: `hue_${b}`, label: `${B} hue`, group: 'HSL hue', ui: [-100, 100], cap: [-25, 25], lr: `HueAdjustment${B}` });
@@ -123,6 +126,7 @@ export function regionParams(p) {
 export function defaultParams() {
   const p = {};
   for (const s of SLIDERS) p[s.key] = 0;
+  p.curveSaturation = 100;
   return p;
 }
 
@@ -133,6 +137,7 @@ export function clampParams(p, useCap = false) {
     if (s.hue) o[s.key] = ((o[s.key] % 360) + 360) % 360;
     else o[s.key] = Math.min(hi, Math.max(lo, o[s.key] ?? 0));
   }
+  o.curveSaturation = Math.min(200, Math.max(0, o.curveSaturation ?? 100));
   return o;
 }
 
@@ -301,6 +306,7 @@ export function compile(p) {
   const lcB = !isIdentityCurve(p.curveBLocal) ? curveLUT(p.curveBLocal) : null;
   const localCurveAmount = Math.min(1, Math.max(0, (p.curveLocalAmount ?? 100) / 100));
   const anyCurve = cM || cR || cG || cB || (localCurveAmount > 0 && (lcM || lcR || lcG || lcB));
+  const curveSaturation = Math.min(2, Math.max(0, (p.curveSaturation ?? 100) / 100));
 
   const G = 30; // Lab units at 100% grading saturation
   const zones = p._gradeAB ? p._gradeAB.map(([u, v]) => [u * G / 100, v * G / 100]) : ['shadow', 'midtone', 'highlight'].map((z) => {
@@ -354,7 +360,12 @@ export function compile(p) {
     if (Y > 1e-6) { const k = Y1 / Y; r *= k; g *= k; b *= k; }
     else { r = g = b = Y1; }
 
+    let curveBaseChroma = null;
     if (anyCurve) {
+      if (curveSaturation !== 1) {
+        linToLab(Math.min(1, Math.max(0, r)), Math.min(1, Math.max(0, g)), Math.min(1, Math.max(0, b)), lab);
+        curveBaseChroma = Math.hypot(lab[1], lab[2]);
+      }
       let sr = linearToSrgb(Math.min(1, r)), sg = linearToSrgb(Math.min(1, g)), sb = linearToSrgb(Math.min(1, b));
       if (cM) { sr = lookup(cM, sr); sg = lookup(cM, sg); sb = lookup(cM, sb); }
       if (cR) sr = lookup(cR, sr);
@@ -374,6 +385,10 @@ export function compile(p) {
     linToLab(r, g, b, lab);
     let L = lab[0], A = lab[1], B = lab[2];
     let C = Math.hypot(A, B);
+    if (curveBaseChroma != null && C > 1e-6) {
+      const wanted = Math.max(0, curveBaseChroma + (C - curveBaseChroma) * curveSaturation);
+      A *= wanted / C; B *= wanted / C; C = wanted;
+    }
 
     if (anyHsl && C > 0.5) {
       const h = rgbHue(linearToSrgb(r), linearToSrgb(g), linearToSrgb(b));

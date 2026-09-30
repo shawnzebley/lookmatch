@@ -86,6 +86,8 @@ main { padding: 14px 16px; max-width: 900px; margin: 0 auto; }
 .curve-line { fill: none; stroke: var(--curve-color); stroke-width: 2.5; vector-effect: non-scaling-stroke; pointer-events: stroke; }
 .curve-dot { fill: var(--curve-color); stroke: #141516; stroke-width: 2; vector-effect: non-scaling-stroke; cursor: grab; touch-action: none; }
 .curve-dot:active { cursor: grabbing; }
+.curve-dot:focus { stroke: #fff; stroke-width: 3; outline: none; }
+.curve-graph:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .curve-actions { justify-content: center; flex-wrap: wrap; }
 .curve-actions button { padding: 6px 11px; font-size: 12px; }
 .pager { flex: 1; min-height: 0; display: flex; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; scrollbar-width: none; overscroll-behavior-x: contain; }
