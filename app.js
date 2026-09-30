@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-30b';
+const APP_VERSION = '2026-09-30c';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -572,11 +572,17 @@ function solveArgs(p) {
 // References saved before subject/background existed: measure the split once from the saved thumbnail.
 const upgrading = new Map();
 function ensurePresetRegions(pr) {
-  if (!pr || pr.lr || !pr.stats || pr.stats.regions !== undefined || !pr.thumb) return Promise.resolve();
+  const measured = pr && pr.stats && pr.stats.regions;
+  const current = measured && measured.subject && measured.subject.tone && measured.subject.bands
+    && measured.background && measured.background.tone && measured.background.bands
+    && pr.stats.signature && Number.isFinite(pr.stats.signature.halation);
+  if (!pr || pr.lr || !pr.stats || current || !pr.thumb) return Promise.resolve();
   if (!upgrading.has(pr.id)) {
     upgrading.set(pr.id, (async () => {
-      try { const r = await pool.call(0, 'measureRef', { file: await dataURLToBlob(pr.thumb) }, { priority: true }); pr.stats.regions = r.stats.regions || null; }
-      catch (e) { pr.stats.regions = null; }
+      try {
+        const r = await pool.call(0, 'measureRef', { file: await dataURLToBlob(pr.thumb) }, { priority: true });
+        pr.stats.regions = r.stats.regions || null; pr.stats.signature = r.stats.signature || { halation: 0 };
+      } catch (e) { pr.stats.regions = null; pr.stats.signature ||= { halation: 0 }; }
       try { await db.putPreset(pr); } catch (e) { /* stays in memory */ }
     })());
   }
@@ -684,8 +690,11 @@ function curveCardMarkup(p) {
   const status = D.tool === 'curve' ? 'Tap a tone in the photo to place a control point.' : 'Tap the graph to add a point, or pick a tone from the photo.';
   const localCurves = local ? `<div id="curveAmountRow">${sliderRow({ key: 'curveAmount', label: 'Mask curve amount', ui: [0, 100] }, localOf(p, D.region).curveAmount ?? 100)}</div>` : '';
   const curveSat = sliderRow(CURVE_SATURATION, p.params.curveSaturation ?? 100, 100);
-  const curveMatchNote = !local && D.curveChannel === 'curve' && p.params.curveAuto === 'reference'
-    ? `<p class="muted small" style="margin:5px 0 0">Fitted from this photo and the selected reference. ${isIdentityCurve(p.params.curve) ? 'No visible point-curve adjustment was needed; any small tonal correction remains in the Tone sliders.' : 'Adjust the points to refine the match.'}</p>` : '';
+  const fittedReferenceCurve = local
+    ? D.curveChannel === 'curve' && localOf(p, D.region).curveAuto === 'reference'
+    : D.curveChannel === 'curve' && p.params.curveAuto === 'reference';
+  const curveMatchNote = fittedReferenceCurve
+    ? `<p class="muted small" style="margin:5px 0 0">Fitted from this photo and the selected reference. ${isIdentityCurve(points) ? 'No visible point-curve adjustment was needed.' : 'Adjust the points to refine the match.'}</p>` : '';
   const notes = [];
   if (local && CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, D.region)[k]))) notes.push('Local curves are baked into the exported photo. Lightroom sidecars do not store local tone curves yet.');
   const anyCurve = CURVE_KEYS.some((k) => !isIdentityCurve(p.params[k])) || REGIONS.some((r) => CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, r)[k])));
@@ -724,7 +733,9 @@ function writeCurvePoints(points, focusIndex = null) {
   if (D.region === 'all') p[D.curveChannel] = points;
   else {
     p.local ||= {};
-    p.local[D.region] = { ...(p.local[D.region] || {}), [D.curveChannel]: points };
+    const loc = { ...(p.local[D.region] || {}), [D.curveChannel]: points };
+    if (D.curveChannel === 'curve') delete loc.curveAuto;
+    p.local[D.region] = loc;
   }
   D.userEdited = true;
   drawCurve(focusIndex); requestPreview(false); scheduleMeasure();
@@ -751,7 +762,10 @@ function renderCurveCard() {
   $('#curveReset', box).onclick = () => {
     if (D.region === 'all' && D.curveChannel === 'curve') delete D.p.params.curveAuto;
     if (D.region === 'all') delete D.p.params[D.curveChannel];
-    else if (D.p.params.local && D.p.params.local[D.region]) delete D.p.params.local[D.region][D.curveChannel];
+    else if (D.p.params.local && D.p.params.local[D.region]) {
+      delete D.p.params.local[D.region][D.curveChannel];
+      if (D.curveChannel === 'curve') delete D.p.params.local[D.region].curveAuto;
+    }
     D.userEdited = true; renderCurveCard(); requestPreview(false); scheduleMeasure();
   };
   if ($('#curveAmountRow', box)) bindRows(box.querySelectorAll('#curveAmountRow .sl'), (_k, value) => {
@@ -873,6 +887,11 @@ function regionNote(p) {
   const warm = (a.dB - b.dB) + 0.3 * (a.dA - b.dA);
   if (Math.abs(warm) >= 1) li.push(`Subject ${warm > 0 ? 'warmer' : 'cooler'} than the background`);
   if (Math.abs(a.chroma - b.chroma) >= 0.05) li.push(`Subject color ${a.chroma > b.chroma ? 'stronger' : 'weaker'} than the background: ${b.chroma.toFixed(2)}× → ${a.chroma.toFixed(2)}×`);
+  if (g.referenceStyle) {
+    li.push('Reference fit: subject white balance and tonal curve');
+    if (g.referenceStyle.backgroundHslBands.length) li.push(`Background HSL matched in ${g.referenceStyle.backgroundHslBands.join(', ')}`);
+    if (p.params.halation > 0) li.push(`Warm halation from the reference’s light sources: ${p.params.halation}%`);
+  }
   if (!li.length) li.push('Subject and background already sit the way the style does');
   const L = g.local, part = (r) => LOCAL_SLIDERS.filter((s) => L[r][s.key]).map((s) => `${s.label.toLowerCase()} ${s.key === 'exposure' ? signed(L[r][s.key], 2) : signed(L[r][s.key])}`).join(', ');
   const moves = REGIONS.map((r) => (part(r) ? `${r === 'subject' ? 'Subject' : 'Background'}: ${part(r)}` : '')).filter(Boolean).join(' · ');
@@ -1306,6 +1325,7 @@ function styleCard(p) {
       ${look?.kind === 'photographer' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : '<p class="muted small" style="margin:8px 0 0">Pick one to restyle this photo.</p>'}`;
   } else {
     body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
+      <p class="muted small" style="margin:8px 0 0">With a usable subject/background mask, reference matching fits the subject’s white balance and tone curve and the background’s HSL. It adds halation when it detects glow around lights.</p>
       ${pr ? `${strengthRow('str', 'Match', p.strength, 100)}
         <div class="sub">Add a photographer's finish on top</div><div class="fin" id="fin">${finishButtons(p, pr)}</div>
         ${fk !== 'off' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : ''}`
@@ -1376,7 +1396,7 @@ function openDetail(p) {
       <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
         <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span></div>
       <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
-        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Set exposure and tone from this photo's brightness range">Auto Adjust</button><div class="grow"></div><button id="reMatch">Redo</button></div>
+        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure gently and add a subtle, editable S curve">Auto Adjust</button><div class="grow"></div><button id="reMatch">Redo</button></div>
       <div class="cropbar" id="cropbar" hidden>
         <div class="aspects" id="aspects"><button data-a="free">Free</button><button data-a="orig">Original</button><button data-a="1">1:1</button><button data-a="0.8">4:5</button><button data-a="1.5">3:2</button><button data-a="1.7778">16:9</button><button data-a="flip" aria-label="Swap width and height">⇄</button></div>
         <div class="level"><label for="lvl">Level</label><input type="range" id="lvl" min="-45" max="45" step="0.1" value="0"><output id="lvlOut">0.0°</output><button id="lvlAuto">Auto</button></div>
