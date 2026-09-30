@@ -115,6 +115,21 @@ export const TONE_REG = {
 export const BRIGHTEN_HI_UP = 3;
 // Saturation cut that may pair with Vibrance up at no extra cost.
 export const SAT_DOWN_FREE = 15;
+// Most a face's lit side may brighten / darken (L*) to match the reference's skin lightness.
+export const SKIN_L_UP = 5;
+export const SKIN_L_DOWN = -10;
+// Half-width of the accepted window around the skin lightness target (L*).
+export const SKIN_L_TOL = 2;
+
+// Skin lightness follows the reference's, not the frame's median: a bright reference used to lift faces
+// by whatever the global tone match asked for (up to +14 L*). litDelta is null when the reference (an old
+// preset) has no skin lightness, or there is no reference (Lightroom presets, photographer finishes).
+export function skinLightDelta(o, ref, s = 1) {
+  const active = o.skin.source === 'faces' ? o.skin.frac > 0.0004 : o.skin.frac > 0.005;
+  const refHas = ref && ref.skin && ref.skin.litL > 0 && (ref.skin.source === 'faces' ? ref.skin.frac > 0.0004 : ref.skin.frac > 0.005);
+  const litDelta = active && refHas ? Math.max(SKIN_L_DOWN, Math.min(SKIN_L_UP, s * (ref.skin.litL - o.skin.litL))) : null;
+  return { active, litDelta };
+}
 
 export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNESS_PULL, scene = null, toneShape = TONE_SHAPE, zoneMove = ZONE_MOVE, bandMove = BAND_MOVE, endAbs = END_ABS, chromaCap = CHROMA_CAP, ownModel = OWN_MODEL } = {}) {
   const s = Math.min(1, Math.max(0, strength));
@@ -197,7 +212,8 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNE
     hi: Math.max(o.tone.clipHi, ref.tone.clipHi) + 0.001,
     lo: Math.max(o.tone.clipLo, ref.tone.clipLo) + 0.001,
   };
-  const skin = { hue: o.skin.hue, chroma: o.skin.chroma, spread: o.skin.hueSpread, litHue: o.skin.litHue, litChroma: o.skin.litChroma, active: o.skin.source === 'faces' ? o.skin.frac > 0.0004 : o.skin.frac > 0.005 };
+  const { active, litDelta } = skinLightDelta(o, ref, s);
+  const skin = { litL: litDelta == null ? null : o.skin.litL + litDelta, litDelta, hue: o.skin.hue, chroma: o.skin.chroma, spread: o.skin.hueSpread, litHue: o.skin.litHue, litChroma: o.skin.litChroma, active };
   return { tone: { pct }, wb, zones, bands, color, clip, skin, strength: s, anchor };
 }
 
@@ -220,7 +236,7 @@ function sampleIdx(n, count, pred, seed = 7) {
 }
 
 function skinResiduals(st, t) {
-  if (!t.skin.active || st.skin.frac < 0.0003) return [0, 0, 0, 0, 0, 0];
+  if (!t.skin.active || st.skin.frac < 0.0003) return [0, 0, 0, 0, 0, 0, 0];
   return [
     // believable skin hue window (Lab hue angle); a photo already outside it (colored stage light) may not get worse
     hinge(st.skin.hue, Math.min(35, t.skin.hue - 2), Math.max(64, t.skin.hue + 2)) / 1.5,
@@ -229,6 +245,7 @@ function skinResiduals(st, t) {
     Math.max(0, st.skin.hueSpread - t.skin.spread - 2) / 1,  // blotchy skin = hue spread grows
     hinge(wrapDeg(st.skin.litHue - t.skin.litHue), -6, 6) / 1.5,          // lit side of faces
     hinge(st.skin.litChroma / Math.max(1, t.skin.litChroma), 0.75, 1.4) * 40,
+    t.skin.litL == null ? 0 : hinge(st.skin.litL, t.skin.litL - SKIN_L_TOL - 1, t.skin.litL + SKIN_L_TOL + 1) / 0.8, // skin lightness as the reference has it
   ];
 }
 
@@ -298,7 +315,11 @@ export function solve(ps, o, ref, opts = {}) {
         const lit1 = litSkin.reduce((a, L) => a + toneMapL(L, p, fl), 0) / litSkin.length + toneBias[50] * 0;
         const all1 = allSkin.reduce((a, L) => a + toneMapL(L, p, fl), 0) / allSkin.length;
         const br1 = brightSkin.reduce((a, L) => a + toneMapL(L, p, fl), 0) / Math.max(1, brightSkin.length);
-        r.push(faceWeight * hinge(lit1 - litSkin0, -4, 14) / 1.2, faceWeight * hinge(all1 - allSkin0, -5, 14) / 1.2, faceWeight * hinge(br1 - brightSkin0, -6, 14) / 1.2);
+        // window around the reference-matched skin lightness; without one (old preset) at most +6 L* brighter
+        const d = T.skin.litDelta, tol = SKIN_L_TOL;
+        const [aLo, aHi, bLo, bHi, cLo, cHi] = d == null ? [-4, 6, -5, 6, -6, 6] : [d - tol, d + tol, d - tol - 1, d + tol + 1, d - tol - 2, d + tol + 2];
+        const w = d == null ? 1.2 : 0.2;
+        r.push(faceWeight * hinge(lit1 - litSkin0, aLo, aHi) / w, faceWeight * hinge(all1 - allSkin0, bLo, bHi) / w, faceWeight * hinge(br1 - brightSkin0, cLo, cHi) / w);
       } else r.push(0, 0, 0);
       r.push(Math.max(0, nearWhite(p) - origNearWhite - 0.004) * 600);
       TONE_KEYS.forEach((k, i) => { const c = capRange(k), w = toneReg[k] || [1, 1]; r.push(1.8 * reg * w[x[i] < 0 ? 0 : 1] * x[i] / (c[1] - c[0])); });

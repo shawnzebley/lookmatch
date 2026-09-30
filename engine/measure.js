@@ -269,7 +269,7 @@ export function measure(ps, cur, idx) {
   const z = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
   let na = 0, nb = 0, nn = 0;
   const band = Array.from({ length: 8 }, () => ({ w: 0, a: 0, b: 0, c: 0, l: 0 }));
-  let sa = 0, sb = 0, sc = 0, sn = 0; const skinH = []; let ha = 0, hb = 0, hc = 0, hn = 0;
+  let sa = 0, sb = 0, sc = 0, sn = 0, sl = 0; const skinH = []; let ha = 0, hb = 0, hc = 0, hn = 0, hl = 0;
 
   for (let k = 0; k < N; k++) {
     const i = get(k);
@@ -289,7 +289,7 @@ export function measure(ps, cur, idx) {
       const w = m.bw[o + q];
       if (w > 0) { const bd = band[q]; bd.w += w; bd.a += w * a; bd.b += w * b; bd.c += w * c; bd.l += w * l; }
     }
-    if (m.skin[i]) { sa += a; sb += b; sc += c; sn++; skinH.push(Math.atan2(b, a) * 180 / Math.PI); if (m.skin[i] === 2) { ha += a; hb += b; hc += c; hn++; } }
+    if (m.skin[i]) { sa += a; sb += b; sc += c; sl += l; sn++; skinH.push(Math.atan2(b, a) * 180 / Math.PI); if (m.skin[i] === 2) { ha += a; hb += b; hc += c; hl += l; hn++; } }
   }
 
   const pct = {};
@@ -340,6 +340,7 @@ export function measure(ps, cur, idx) {
   const sh = sn ? Math.atan2(sb / sn, sa / sn) * 180 / Math.PI : 0;
   let sv = 0; for (const h of skinH) { let d = h - sh; d = ((d + 180) % 360 + 360) % 360 - 180; sv += d * d; }
   const skin = { source: ps.skinSource, faces: ps.faceCount, frac: sn / N, hue: sh, chroma: sn ? sc / sn : 0, hueSpread: sn ? Math.sqrt(sv / sn) : 0,
+    L: sn ? sl / sn : 0, litL: hn ? hl / hn : 0,
     litHue: hn ? Math.atan2(hb / hn, ha / hn) * 180 / Math.PI : 0, litChroma: hn ? hc / hn : 0 };
 
   return { tone, curve, wb, zones, bands, color, skin };
