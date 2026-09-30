@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-30a';
+const APP_VERSION = '2026-09-30b';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -684,6 +684,8 @@ function curveCardMarkup(p) {
   const status = D.tool === 'curve' ? 'Tap a tone in the photo to place a control point.' : 'Tap the graph to add a point, or pick a tone from the photo.';
   const localCurves = local ? `<div id="curveAmountRow">${sliderRow({ key: 'curveAmount', label: 'Mask curve amount', ui: [0, 100] }, localOf(p, D.region).curveAmount ?? 100)}</div>` : '';
   const curveSat = sliderRow(CURVE_SATURATION, p.params.curveSaturation ?? 100, 100);
+  const curveMatchNote = !local && D.curveChannel === 'curve' && p.params.curveAuto === 'reference'
+    ? `<p class="muted small" style="margin:5px 0 0">Fitted from this photo and the selected reference. ${isIdentityCurve(p.params.curve) ? 'No visible point-curve adjustment was needed; any small tonal correction remains in the Tone sliders.' : 'Adjust the points to refine the match.'}</p>` : '';
   const notes = [];
   if (local && CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, D.region)[k]))) notes.push('Local curves are baked into the exported photo. Lightroom sidecars do not store local tone curves yet.');
   const anyCurve = CURVE_KEYS.some((k) => !isIdentityCurve(p.params[k])) || REGIONS.some((r) => CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, r)[k])));
@@ -699,7 +701,7 @@ function curveCardMarkup(p) {
     <label class="chk"><input type="checkbox" id="curveSnap" ${D.curveSnap ? 'checked' : ''}>Snap points to grid (right-click graph to toggle)</label>
     <div id="curveSaturationRow">${curveSat}</div>
     <p class="muted small" style="margin:4px 0 0">At 100, curve color response is unchanged. 0 removes its chroma change; 200 doubles it. Separate HSL hue, saturation, and luminance sliders are in the Light controls.</p>
-    ${localCurves}<p class="muted small" id="curveHelp" style="margin:5px 0 0">${status} Left to right is shadows to highlights; move up to brighten and down to darken. Use Exposure for overall brightness and curves for style. RGB channels add or remove color. Arrow keys nudge a focused point (Shift = 5).</p>${exportNote}`;
+    ${curveMatchNote}${localCurves}<p class="muted small" id="curveHelp" style="margin:5px 0 0">${status} Left to right is shadows to highlights; move up to brighten and down to darken. Use Exposure for overall brightness and curves for style. RGB channels add or remove color. Arrow keys nudge a focused point (Shift = 5).</p>${exportNote}`;
 }
 function drawCurve(focusIndex = null) {
   const svg = $('#curveGraph');
@@ -718,6 +720,7 @@ function drawCurve(focusIndex = null) {
 function writeCurvePoints(points, focusIndex = null) {
   points.sort((a, b) => a[0] - b[0]);
   const p = D.p.params;
+  if (D.region === 'all' && D.curveChannel === 'curve') delete p.curveAuto;
   if (D.region === 'all') p[D.curveChannel] = points;
   else {
     p.local ||= {};
@@ -746,6 +749,7 @@ function renderCurveCard() {
     D.userEdited = true; renderCurveCard(); requestPreview(false); scheduleMeasure(); toast('Master curve copied to RGB');
   };
   $('#curveReset', box).onclick = () => {
+    if (D.region === 'all' && D.curveChannel === 'curve') delete D.p.params.curveAuto;
     if (D.region === 'all') delete D.p.params[D.curveChannel];
     else if (D.p.params.local && D.p.params.local[D.region]) delete D.p.params.local[D.region][D.curveChannel];
     D.userEdited = true; renderCurveCard(); requestPreview(false); scheduleMeasure();
@@ -1414,6 +1418,7 @@ function openDetail(p) {
     try {
       const r = await pool.call(p.worker, 'autoAdjust', { id: p.id }, { priority: true });
       if (!D || D.p !== p) return;
+      delete (p.params ||= defaultParams()).curveAuto;
       Object.assign(p.params ||= defaultParams(), r);
       p.solved = structuredClone(p.params); p.status = 'done'; D.userEdited = true;
       refreshDetail(); D.goPage('light');
