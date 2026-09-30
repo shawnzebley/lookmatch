@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-30c';
+const APP_VERSION = '2026-09-30d';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -566,7 +566,8 @@ function solveArgs(p) {
   const split = p.split !== false;
   if (look.kind === 'photographer') return { refStats: null, lrParams: {}, strength: 1, finish: look.key, finishStrength, pull: 0.25, split };
   const pr = presetById(look.id);
-  return { refStats: pr.stats, lrParams: pr.lr ? pr.lrParams : null, strength: p.strength / 100, finish: p.finish || pr.finish || 'off', finishStrength, split };
+  const assist = S.settings.modelUrl && !pr.lr && pr.thumb;
+  return { refStats: pr.stats, lrParams: pr.lr ? pr.lrParams : null, strength: p.strength / 100, finish: p.finish || pr.finish || 'off', finishStrength, split, ...(assist ? { modelUrl: S.settings.modelUrl, refThumb: pr.thumb } : {}) };
 }
 
 // References saved before subject/background existed: measure the split once from the saved thumbnail.
@@ -599,7 +600,8 @@ function solvePhoto(p, { priority = false } = {}) {
   p.status = 'solving'; p.solvedLook = look; rerenderMatchSoon();
   return ensurePresetRegions(presetOf(p)).then(() => pool.call(p.worker, 'solve', { id: p.id, ...solveArgs(p) }, { priority })).then((r) => {
     Object.assign(r.params, keptEdits(p.params));
-    Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, style: r.style, regions: r.regions, mask: r.mask || p.mask, status: 'done' });
+    if (r.model && !r.model.ok) toast(`Model assist failed, matched without it: ${r.model.error}`);
+    Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, model: r.model, style: r.style, regions: r.regions, mask: r.mask || p.mask, status: 'done' });
     rerenderMatchSoon();
     // one photo in, style picked: go straight to the editor
     if (S.autoOpen && S.photos.length === 1 && !D && S.tab === 'match') { S.autoOpen = false; openDetail(p); }
@@ -2073,6 +2075,10 @@ function renderSettings() {
       <div class="field"><label class="t">Lightroom settings style</label>
         <select id="sLRM"><option value="sliders">Basic sliders (easy to tweak, approximate)</option><option value="curve">Tone curve (closer match)</option></select></div>
     </div>
+    <div class="card"><h3>Model assist</h3>
+      <p class="muted small">Optional. Paste the URL of your Deep Preset Space (see <code>server/README.md</code>). Each photo matched to a saved reference is sent there at 512 px, and the solver chases the result. Leave empty to keep everything on this phone. If the server fails, the plain match runs instead.</p>
+      <div class="field"><label class="t">Space URL</label><input type="url" id="sModel" placeholder="https://name-space.hf.space" value="${esc(s.modelUrl || '')}"></div>
+    </div>
     <div class="card"><h3>Google Drive</h3>
       <p class="small">${tok ? `Connected. Sign-in good for about ${drive.minutesLeft()} more minutes.` : 'Not connected.'}</p>
       <div class="field"><label class="t">OAuth client ID</label><input type="text" id="sCID" placeholder="xxxx.apps.googleusercontent.com" value="${esc(s.clientId)}"></div>
@@ -2093,6 +2099,7 @@ function renderSettings() {
   </div>`;
   $('#sDest').value = s.dest; $('#sLRM').value = s.lrMode;
   $('#sDest').onchange = (e) => { s.dest = e.target.value; saveSettings(); };
+  $('#sModel').onchange = (e) => { s.modelUrl = e.target.value.trim().replace(/\/+$/, ''); saveSettings(); };
   $('#sQ').onchange = (e) => { s.quality = Math.max(60, Math.min(100, +e.target.value || 92)); saveSettings(); };
   $('#sLR').onchange = (e) => { s.lightroom = e.target.checked; saveSettings(); };
   $('#sLRM').onchange = (e) => { s.lrMode = e.target.value; saveSettings(); };

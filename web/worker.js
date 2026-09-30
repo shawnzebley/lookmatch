@@ -18,6 +18,7 @@ import { visionErrors, LOADER, WASM, MP_BUILD } from './mp.js';
 import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
+import { stylizeRemote } from './lib/deeppreset.js';
 
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
@@ -565,9 +566,29 @@ const handlers = {
     return out;
   },
 
-  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true }) {
+  // modelUrl + refThumb (the reference's saved thumbnail) turn on model assist: the Deep Preset Space
+  // restyles this photo toward the reference, and the solver then chases that result's measured
+  // targets instead of the reference's own. Any failure falls back to the plain reference targets.
+  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true, modelUrl = null, refThumb = null }) {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
+    let model = null;
+    if (modelUrl && refThumb && refStats && !lrParams) {
+      try {
+        const src = await openBitmap(e, id);
+        const d = scaledData(src, SOLVE_SIDE, e.geom);
+        src.close();
+        const ref = await (await fetch(refThumb)).blob();
+        const out = await stylizeRemote(modelUrl, await toJpegBlob(d, 0.92), ref);
+        const bmp = await createImageBitmap(out);
+        const r = scaledData(bmp, SOLVE_SIDE);
+        bmp.close();
+        if (r.width !== e.ps.width || r.height !== e.ps.height) throw new Error('Model returned a different size');
+        const ps = prepare(r, { faces: mapPolys(e.faces, e.fullW, e.fullH, e.geom), subject: maskFor(e, r.width, r.height, e.geom) });
+        refStats = { ...measure(ps), scene: refStats.scene, regions: refStats.regions, signature: refStats.signature };
+        model = { ok: true };
+      } catch (err) { model = { ok: false, error: err.message }; }
+    }
     const res = lrParams
       ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene, pull })
       : solve(e.ps, o, refStats, { strength, scene: e.scene });
@@ -601,7 +622,7 @@ const handlers = {
     const cur = processPixelSet(e.ps, res.params);
     const after = measure(e.ps, cur);
     const loss = lossReport(e.ps, cur, res.params);
-    return { params: res.params, targets: res.targets, before: o, after, loss, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
+    return { model, params: res.params, targets: res.targets, before: o, after, loss, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
   },
 
   async measureParams({ id, params, auto = null }) {
