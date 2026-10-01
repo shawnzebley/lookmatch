@@ -209,6 +209,8 @@ export function prepare(img, opts = {}) {
   return {
     width, height, n, lr, lg, lb, L, A, B, hue, subject,
     skinMask: opts.skin && opts.skin.length === n ? opts.skin : null,
+    skinPeople: opts.skinPeople && opts.skinPeople.length === n ? opts.skinPeople : null,
+    skinPositions: opts.skinPositions || [],
     masks: { zone, zw, zoneTint, neutral, bw, lowSat, skin, regionTint },
     wbConfidence, neutralThreshold: thr, skinSource, faceCount: faceMask ? opts.faces.length : 0,
   };

@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-30d';
+const APP_VERSION = '2026-10-01a';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -576,14 +576,14 @@ function ensurePresetRegions(pr) {
   const measured = pr && pr.stats && pr.stats.regions;
   const current = measured && measured.subject && measured.subject.tone && measured.subject.bands
     && measured.background && measured.background.tone && measured.background.bands
-    && pr.stats.signature && Number.isFinite(pr.stats.signature.halation) && pr.stats.matchVersion === 1;
+    && pr.stats.signature && Number.isFinite(pr.stats.signature.halation) && pr.stats.matchVersion === 2;
   if (!pr || pr.lr || !pr.stats || current || !pr.thumb) return Promise.resolve();
   if (!upgrading.has(pr.id)) {
     upgrading.set(pr.id, (async () => {
       try {
         const r = await pool.call(0, 'measureRef', { file: await dataURLToBlob(pr.thumb) }, { priority: true });
         pr.stats.regions = r.stats.regions || null; pr.stats.signature = r.stats.signature || { halation: 0 };
-        pr.stats.maskedRegions = r.stats.maskedRegions; pr.stats.skinMatch = r.stats.skinMatch; pr.stats.matchVersion = 1;
+        pr.stats.maskedRegions = r.stats.maskedRegions; pr.stats.skinMatch = r.stats.skinMatch; pr.stats.matchVersion = 2;
       } catch (e) { pr.stats.regions = null; pr.stats.signature ||= { halation: 0 }; }
       try { await db.putPreset(pr); } catch (e) { /* stays in memory */ }
     })());
@@ -614,6 +614,21 @@ function solvePhoto(p, { priority = false } = {}) {
 
 function runQueue() {
   for (const p of S.photos) if (p.status === 'ready' && lookOf(p)) solvePhoto(p);
+}
+
+function skinTargetRows(p) {
+  const match = p.params?.skinMatch;
+  if (match?.version !== 2) return '';
+  const values = (z) => z ? `${f1(z.L)} / ${f1(z.a)} / ${f1(z.b)}` : '–';
+  const swatch = (z) => {
+    if (!z) return '';
+    const rgb = labToLin(z.L, z.a, z.b, [0, 0, 0]).map((v) => Math.round(linearToSrgb(Math.max(0, Math.min(1, v))) * 255));
+    return `<span style="display:inline-block;width:12px;height:12px;margin-right:4px;background:rgb(${rgb.join(',')})"></span>`;
+  };
+  return match.people.flatMap((person) => person.zones.map((zone) => {
+    const after = p.after?.skinMatch?.people?.find((q) => q.id === person.id)?.zones?.[zone.name];
+    return `<tr><td>Person ${person.id} ${esc({ shadow: 'shadow', midtone: 'midtone', lit: 'lit skin' }[zone.name])} (L* / a* / b*)</td><td>${values(zone.before)}</td><td>${swatch(after)}${values(after)}</td><td>${swatch(zone.target)}${values(zone.target)} (reference ${person.referenceId})</td></tr>`;
+  })).join('');
 }
 
 // ---------------------------------------------------------------- detail view
@@ -653,6 +668,7 @@ function numbersTable(p) {
     ${row('Mean chroma', f1(b.color.meanChroma), f1(a.color.meanChroma), `${f1(r?.color.meanChroma)} / ${f1(T.color.meanChroma)}`, false)}
     ${a.skinMatch && r?.skinMatch ? row('Skin brightness L*', f1(b.skinMatch?.L), f1(a.skinMatch.L), f1(r.skinMatch.L), false) : ''}
     ${a.skinMatch && r?.skinMatch ? row('Skin color a* / b*', `${f1(b.skinMatch?.a)} / ${f1(b.skinMatch?.b)}`, `${f1(a.skinMatch.a)} / ${f1(a.skinMatch.b)}`, `${f1(r.skinMatch.a)} / ${f1(r.skinMatch.b)}`, false) : ''}
+    ${skinTargetRows(p)}
     ${row('Skin hue° (lit side)', b.skin.frac > 0.005 ? `${f1(b.skin.hue)} (${f1(b.skin.litHue)})` : 'n/a', a.skin.frac > 0.005 ? `${f1(a.skin.hue)} (${f1(a.skin.litHue)})` : 'n/a', '35–64', false)}
     ${row('New clipping hi / lo %', '–', newClip, '≤ 0.10', false)}${regionRows(p)}
   </table>${p.guardScale < 0.99 ? `<p class="muted small">Edit scaled to ${Math.round(p.guardScale * 100)}% to avoid clipping.</p>` : ''}`;
@@ -984,7 +1000,9 @@ function retouchCard(p) {
   const status = tool === 'heal' ? 'Tap a blemish or crease. Tap Heal again when done.'
     : tool === 'source' ? 'Tap where the spot should copy from. Below the spot usually works best.'
     : heals.length ? `${heals.length} spot${heals.length > 1 ? 's' : ''} healed.` : 'No spots healed.';
-  return `<h3>Retouch</h3>${skinPart}
+  const matchedPeople = P.skinMatch?.version === 2 ? P.skinMatch.people.length : 0;
+  const skinTargets = !skin || !presetOf(p)?.stats?.skinMatch ? '' : `<p class="muted small">${matchedPeople ? `Reference skin targets: ${matchedPeople} person${matchedPeople === 1 ? '' : 's'}, paired by position. Shadow, midtone and lit-skin values are in More → Measurements.` : 'No confident person pairing for reference skin matching.'}${M?.peopleFaceFallbacks ? ' Missed body poses use facial skin only.' : ''} Unassigned skin is excluded.</p>`;
+  return `<h3>Retouch</h3>${skinPart}${skinTargets}
     <div class="mtools"><button id="hlOn" class="${tool === 'heal' ? 'on' : ''}">Heal</button><button id="hlSrc" class="${tool === 'source' ? 'on' : ''}" ${sel ? '' : 'disabled'}>Move source</button><button id="hlUndo" ${heals.length ? '' : 'disabled'}>Undo</button><div class="grow"></div><button id="hlClear" ${heals.length ? '' : 'disabled'}>Clear</button></div>
     <p class="muted small" style="margin:6px 0 0">${status}</p>
     <div class="chips-row" id="hlKind">${HEAL_KINDS.map(([l, v]) => `<button data-o="${v}" class="${Math.abs(D.healOp - v) < 1e-6 ? 'on' : ''}">${l} ${Math.round(v * 100)}%</button>`).join('')}</div>
@@ -1186,6 +1204,9 @@ function renderSyncCard() {
     $('#syGo', box).disabled = true;
     for (const q of qs) {
       const next = structuredClone(p.params);
+      // Automatic skin targets belong to this photo's person IDs.
+      if (q.params?.skinMatch) next.skinMatch = structuredClone(q.params.skinMatch);
+      else delete next.skinMatch;
       if (!o.light) for (const k of SYNC_OWN) next[k] = q.params ? q.params[k] ?? 0 : 0;
       if (!o.heals) next.heals = q.params && q.params.heals ? q.params.heals : [];
       Object.assign(q, { params: next, solved: structuredClone(next), look: p.look, solvedLook: lookOf(p), finish: p.finish, finishStrength: p.finishStrength, strength: p.strength, split: p.split, status: 'done', synced: true });

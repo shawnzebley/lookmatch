@@ -47,6 +47,8 @@ function regionSubset(ps, region) {
   masks.regionTint = null;
   const skinMask = ps.skinMask ? new ps.skinMask.constructor(count) : undefined;
   if (skinMask) for (let k = 0; k < count; k++) skinMask[k] = ps.skinMask[indices[k]];
+  const skinPeople = ps.skinPeople ? new Uint8Array(count) : null;
+  if (skinPeople) for (let k = 0; k < count; k++) skinPeople[k] = ps.skinPeople[indices[k]];
   return {
     ...planes,
     n: count,
@@ -55,6 +57,8 @@ function regionSubset(ps, region) {
     subject: null,
     masks,
     skinMask,
+    skinPeople,
+    skinPositions: ps.skinPositions || [],
     skinSource: ps.skinSource,
     faceCount: ps.faceCount,
     wbConfidence: Math.max(0.05, Math.min(1, masks.neutral.reduce((a, v) => a + (v ? 1 : 0), 0) / (0.03 * count))),

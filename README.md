@@ -58,3 +58,5 @@ node tools/solver_eval.mjs testdata/kodak --variants full,old [--random]  # solv
 python3 tools/run_models.py scratch/cmp --np-repo ../Neural-Preset --np-ckpt W/np_ckpt --dp-repo ../deep_preset --dp-ckpt W/dp_wppl.pth.tar  # outside models (PyTorch, CPU)
 python3 tools/fit_color_map.py scratch/cmp deeppreset && node tools/loss_png.mjs scratch/cmp neuralpreset deeppreset deeppreset-map
 ```
+
+Skin matching measures confident visible skin separately for each detected person, with shadow, midtone and lit-skin targets from the reference. One reference person supplies a style to all source people; multiple reference people are paired by image position, not identity. The details table shows the pairing and measured brightness/color. Ambiguous body pixels are excluded; missed poses use facial skin only. Automatic person targets stay with their own photo when settings are synced.
