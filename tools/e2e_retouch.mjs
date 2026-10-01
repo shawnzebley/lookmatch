@@ -99,8 +99,8 @@ if (after[1].exp !== before[1].exp || after[1].heals !== 0 || after[1].skin !== 
 // re-solve keeps the hand edits
 await page.evaluate(() => document.querySelector('#detail').scrollTop = 0);
 await page.click('#reMatch');
-await page.waitForFunction(() => window.__lm.S.photos[0].status === 'done' && document.querySelector('#reMatch').textContent === 'Redo', null, { timeout: 120000 });
-console.log('after Redo:', JSON.stringify(await S(() => { const q = window.__lm.S.photos[0].params; return { skin: q.skinTexture, heals: q.heals?.length, points: q.points?.length }; })));
+await page.waitForFunction(() => window.__lm.S.photos[0].status === 'done' && document.querySelector('#reMatch').textContent === 'Re-match', null, { timeout: 120000 });
+console.log('after Re-match:', JSON.stringify(await S(() => { const q = window.__lm.S.photos[0].params; return { skin: q.skinTexture, heals: q.heals?.length, points: q.points?.length }; })));
 
 // full-resolution export with skin pass + heals + point colour
 t = Date.now();

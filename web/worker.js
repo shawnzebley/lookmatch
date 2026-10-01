@@ -4,7 +4,7 @@ import { solve, solvePreset } from './engine/solver.js';
 import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
 import { fitRegions, fitReferenceRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
 import { signature, nearestRegions } from './engine/style.js';
-import { compile, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
+import { compile, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, curveLUT, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
 import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
@@ -389,6 +389,84 @@ function cullInfo(e, bmp) {
   return { faces, focus, eyes, sig: sceneSig(small.data, small.width, small.height) };
 }
 
+// Auto Adjust curves, fitted to the photo as it looks after the rest of its edit (with the basic
+// tone correction, without curves). Light curve: black and white points from the luminance range,
+// the median pulled toward middle grey, the quartiles spread toward normal contrast (or eased off
+// when the photo is already punchy), with no stretch steeper or flatter than AUTO_SLOPE.
+// R/G/B curves: line each channel's dark, middle and bright levels up with the other two on the
+// photo's least colourful pixels, which takes out a cast. When even those pixels are strongly
+// coloured (a wood floor under tungsten, a sunset) the colour is the scene, so the correction fades,
+// and a warm cast is only partly taken out (warm light usually reads as intended).
+const AUTO_MID = 118, AUTO_QSPREAD = 92, AUTO_RGB_MAX = 18, AUTO_SLOPE = [0.5, 1.8];
+const AUTO_GREY_FRAC = 0.15, AUTO_GREY_C = [10, 26], AUTO_WARM_KEEP = 0.4;
+function autoCurves(ps, params) {
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const cur = processPixelSet(ps, params);
+  const n = ps.n;
+  const usable = (i) => cur.L[i] > 12 && cur.L[i] < 95;
+  const chroma = new Uint32Array(101);
+  let nu = 0;
+  for (let i = 0; i < n; i++) if (usable(i)) { chroma[Math.min(100, Math.round(Math.hypot(cur.A[i], cur.B[i])))]++; nu++; }
+  let greyC = 100;
+  for (let c = 0, acc = 0; c <= 100; c++) { acc += chroma[c]; if (acc >= nu * AUTO_GREY_FRAC) { greyC = c; break; } }
+  const hist = () => [0, 1, 2].map(() => new Uint32Array(256));
+  const lum = new Uint32Array(256), neu = hist();
+  const v8 = (x) => Math.round(255 * linearToSrgb(clamp(x, 0, 1)));
+  let nn = 0, sa = 0, sb = 0;
+  for (let i = 0; i < n; i++) {
+    lum[v8(0.2126729 * cur.lr[i] + 0.7151522 * cur.lg[i] + 0.072175 * cur.lb[i])]++;
+    if (usable(i) && Math.hypot(cur.A[i], cur.B[i]) <= greyC) { neu[0][v8(cur.lr[i])]++; neu[1][v8(cur.lg[i])]++; neu[2][v8(cur.lb[i])]++; nn++; sa += cur.A[i]; sb += cur.B[i]; }
+  }
+  const pct = (h, total, q) => {
+    const want = q * total;
+    let acc = 0;
+    for (let v = 0; v < 256; v++) { acc += h[v]; if (acc >= want) return v; }
+    return 255;
+  };
+
+  const lo = pct(lum, n, 0.003), hi = pct(lum, n, 0.997);
+  const bx = Math.round(clamp(lo - 2, 0, 24)), wx = Math.round(clamp(hi + 2, 230, 255));
+  const st = (v) => clamp((v - bx) / (wx - bx) * 255, 0, 255);
+  const q25 = pct(lum, n, 0.25), q50 = pct(lum, n, 0.5), q75 = pct(lum, n, 0.75);
+  const ym = st(q50) + clamp((AUTO_MID - st(q50)) * 0.5, -18, 18);
+  const push = clamp((AUTO_QSPREAD - (st(q75) - st(q25))) * 0.3, -8, 14);
+  // Place the midpoint first, then the quartiles around it, each kept inside AUTO_SLOPE of the
+  // points already placed on either side (a quartile that can't fit is left out). The midpoint
+  // wins, so contrast never undoes the brightness correction.
+  const [sLo, sHi] = AUTO_SLOPE;
+  const curve = [[bx, 0], [wx, 255]];
+  const place = (x, y) => {
+    const j = curve.findIndex((q) => q[0] > x);
+    if (j < 1) return;
+    const [x0, y0] = curve[j - 1], [x1, y1] = curve[j];
+    if (x - x0 < 12 || x1 - x < 12) return;
+    const lo = Math.max(y0 + sLo * (x - x0), y1 - sHi * (x1 - x)), hi = Math.min(y0 + sHi * (x - x0), y1 - sLo * (x1 - x));
+    if (lo <= hi) curve.splice(j, 0, [x, Math.round(clamp(y, lo, hi))]);
+  };
+  place(q50, ym);
+  place(q25, st(q25) - push);
+  place(q75, st(q75) + push);
+
+  // channel curves sit after the light curve, so measure through it (percentiles survive a monotone map)
+  const M = curveLUT(curve);
+  const lit = (v) => 255 * M[Math.round(v / 255 * 1023)];
+  const warm = nn && sb / nn > 0 && sa / nn > -2;
+  const k = nn >= n * 0.02 ? 0.8 * clamp((AUTO_GREY_C[1] - greyC) / (AUTO_GREY_C[1] - AUTO_GREY_C[0]), 0, 1) * (warm ? 1 - AUTO_WARM_KEEP : 1) : 0;
+  const anchors = [0.05, 0.5, 0.95].map((q) => neu.map((h) => lit(pct(h, nn, q))));
+  const [curveR, curveG, curveB] = [0, 1, 2].map((c) => {
+    const pts = [[0, 0]];
+    for (const a of anchors) {
+      const x = Math.round(a[c]), [px, py] = pts[pts.length - 1];
+      const d = clamp(((a[0] + a[1] + a[2]) / 3 - a[c]) * k, -AUTO_RGB_MAX, AUTO_RGB_MAX);
+      if (Math.abs(d) < 1.5 || x < 10 || x > 245 || x - px < 16) continue;
+      pts.push([x, Math.round(clamp(x + d, py + 4, 251))]);
+    }
+    pts.push([255, 255]);
+    return pts;
+  });
+  return { curve, curveR, curveG, curveB };
+}
+
 const handlers = {
   async measureRef({ file }) {
     const e = { file };
@@ -544,26 +622,19 @@ const handlers = {
     return autoLevel(gray, d.width, d.height);
   },
 
-  // Correct only measured tonal problems. Keep the curve and color neutral unless this photo's
-  // histogram gives a reason to change them; Auto Adjust is a starting correction, not a look.
-  async autoAdjust({ id }) {
+  // Correct only measured problems; Auto Adjust is a starting correction, not a look. The basic
+  // sliders stay gentle and the curves do the work: autoCurves fits the light curve and the R/G/B
+  // curves to this photo as edited so far (white balance, HSL, local edits), minus its old curves.
+  async autoAdjust({ id, params = {} }) {
     const e = await ensurePrepared(id);
     const s = measure(e.ps), t = s.tone, p = t.pct;
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    const spread = p[95] - p[5];
-    // Exposure handles the photo's overall brightness. Keep the basic controls gentle, then use a
-    // restrained, editable S curve for style. Wide-range scenes get less curve contrast so the
-    // highlights and shadows stay intact; flat scenes get a little more shape.
     const exposure = clamp(Math.log2(lToY(47) / Math.max(0.0001, lToY(p[50]))) * 0.24, -0.35, 0.35);
     const highlights = clamp(-(p[99] - 94) * 0.22 - (t.clipHi > 0.002 ? 3 : 0), -10, 0);
     const shadows = clamp((5 - p[5]) * 0.22 + (t.clipLo > 0.002 ? 3 : 0), 0, 7);
-    const curvePush = Math.round(clamp((68 - spread) * 0.17, 1, 6));
-    const out = {
-      exposure, contrast: 0, highlights, shadows, whites: 0, blacks: 0,
-      curve: [[0, 0], [32, 32 - Math.round(curvePush * 0.6)], [64, 64 - curvePush], [128, 128],
-        [192, 192 + curvePush], [224, 224 + Math.round(curvePush * 0.6)], [255, 255]],
-    };
-    return out;
+    const basic = { exposure, contrast: 0, highlights, shadows, whites: 0, blacks: 0 };
+    const curves = autoCurves(e.ps, { ...params, ...basic, curve: null, curveR: null, curveG: null, curveB: null });
+    return { ...basic, ...curves };
   },
 
   // modelUrl + refThumb (the reference's saved thumbnail) turn on model assist: the Deep Preset Space
