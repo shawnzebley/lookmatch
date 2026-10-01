@@ -51,6 +51,7 @@ def tensor(im):
 
 
 @gpu
+@torch.no_grad()   # grad mode is per-thread, and ZeroGPU runs this off the main thread
 def run(photo, ref):
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     G.to(dev)
