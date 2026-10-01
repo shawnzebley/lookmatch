@@ -1398,7 +1398,7 @@ function openDetail(p) {
       <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
         <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span></div>
       <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
-        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure gently and add a subtle, editable S curve">Auto Adjust</button><div class="grow"></div><button id="reMatch">Redo</button></div>
+        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure, then fit the light and RGB curves to this photo">Auto Adjust</button><div class="grow"></div><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
       <div class="cropbar" id="cropbar" hidden>
         <div class="aspects" id="aspects"><button data-a="free">Free</button><button data-a="orig">Original</button><button data-a="1">1:1</button><button data-a="0.8">4:5</button><button data-a="1.5">3:2</button><button data-a="1.7778">16:9</button><button data-a="flip" aria-label="Swap width and height">⇄</button></div>
         <div class="level"><label for="lvl">Level</label><input type="range" id="lvl" min="-45" max="45" step="0.1" value="0"><output id="lvlOut">0.0°</output><button id="lvlAuto">Auto</button></div>
@@ -1418,7 +1418,8 @@ function openDetail(p) {
       </div>
     </div>`;
   D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null, region: 'all', pick: null, showMask: false, flash: false,
-    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1, curveChannel: 'curve', curveDrag: null, curveSnap: false, view: { s: 1, x: 0, y: 0 }, hi: false, page: 'look' };
+    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1, curveChannel: 'curve', curveDrag: null, curveSnap: false, view: { s: 1, x: 0, y: 0 }, hi: false, page: 'look',
+    hist: { stack: [], cur: editSnap(p) } };
   $('#sliders').innerHTML = sliderGroups(p);
   $('#grade').innerHTML = gradeCard(p);
   el.scrollTop = 0;
@@ -1433,12 +1434,13 @@ function openDetail(p) {
     $('#reMatch').disabled = true; $('#reMatch').textContent = 'Working…';
     await solvePhoto(p, { priority: true });
     D && (D.userEdited = false);
-    refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Redo';
+    refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Re-match';
   };
+  $('#undo').onclick = undo;
   $('#autoAdjust').onclick = async () => {
     const btn = $('#autoAdjust'); btn.disabled = true; btn.textContent = 'Adjusting…';
     try {
-      const r = await pool.call(p.worker, 'autoAdjust', { id: p.id }, { priority: true });
+      const r = await pool.call(p.worker, 'autoAdjust', { id: p.id, params: structuredClone(p.params || defaultParams()) }, { priority: true });
       if (!D || D.p !== p) return;
       delete (p.params ||= defaultParams()).curveAuto;
       Object.assign(p.params ||= defaultParams(), r);
@@ -1448,7 +1450,7 @@ function openDetail(p) {
       $('#sliders').querySelectorAll('details.group').forEach((group) => {
         if (visible.has($('summary', group)?.textContent.trim())) group.open = true;
       });
-      toast('Auto Adjust applied. Tone curve and HSL controls are open.');
+      toast('Auto Adjust applied. Light and RGB curves are set; Undo puts it back.');
     } catch (e) { toast(e.message, 4500); logError('auto adjust', e, p.file); }
     finally { if ($('#autoAdjust')) { $('#autoAdjust').disabled = false; $('#autoAdjust').textContent = 'Auto Adjust'; } }
   };
@@ -1578,11 +1580,44 @@ function jumpToSlider(k) {
   row.classList.remove('flash'); void row.offsetWidth; row.classList.add('flash');
 }
 
+// Undo: every edit ends in scheduleMeasure, so its debounce is where an edit counts as finished
+// (a whole slider drag is one step). Snapshots are the photo's params, as JSON, per open photo.
+const UNDO_MAX = 50;
+const editSnap = (p) => JSON.stringify({ params: p.params || null, solved: p.solved || null });
+function commitEdit() {
+  if (!D || !D.hist) return;
+  const s = editSnap(D.p);
+  if (s === D.hist.cur) return;
+  D.hist.stack.push(D.hist.cur);
+  if (D.hist.stack.length > UNDO_MAX) D.hist.stack.shift();
+  D.hist.cur = s;
+  syncUndo();
+}
+function syncUndo() { if (D && $('#undo')) $('#undo').disabled = !D.hist.stack.length; }
+function undo() {
+  if (!D || D.crop) return;
+  commitEdit();
+  const prev = D.hist.stack.pop();
+  if (!prev) return;
+  D.hist.cur = prev;
+  const o = JSON.parse(prev);
+  D.p.params = o.params || defaultParams(); D.p.solved = o.solved || null;
+  D.userEdited = true;
+  syncUndo();
+  refreshDetail();
+}
+document.addEventListener('keydown', (e) => {
+  if (!D || !(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || e.key.toLowerCase() !== 'z') return;
+  if (e.target.closest && e.target.closest('input, textarea, select')) return;
+  e.preventDefault(); undo();
+});
+
 let measureT;
 function scheduleMeasure(delay = 350) {
   clearTimeout(measureT);
   measureT = setTimeout(async () => {
     if (!D) return;
+    commitEdit();
     const p = D.p;
     const r = await pool.call(p.worker, 'measureParams', { id: p.id, params: { ...p.params }, auto: p.solved || null }, { priority: true });
     if (!D || D.p !== p) return;
@@ -1828,7 +1863,7 @@ function bindCropBar() {
       $('#reMatch').disabled = true; $('#reMatch').textContent = 'Working…';
       await solvePhoto(p, { priority: true });
       if (!D || D.p !== p) return;
-      refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Redo';
+      refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Re-match';
     } else {
       $('#nums').innerHTML = numbersTable(p);
       scheduleMeasure(0);
