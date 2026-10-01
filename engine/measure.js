@@ -4,6 +4,7 @@
 // so the solver compares like with like while it changes the image.
 
 import { SRGB8_TO_LIN, linearToSrgb, linToLab, rgbHue, abToWheelHue, labToCctDuv } from './color.js';
+import { skinStats } from './skin-match.js';
 
 function smoothstep(a, b, x) { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
 export function gradeWeights(L, shift = 0, out = [0, 0, 0]) {
@@ -207,6 +208,9 @@ export function prepare(img, opts = {}) {
 
   return {
     width, height, n, lr, lg, lb, L, A, B, hue, subject,
+    skinMask: opts.skin && opts.skin.length === n ? opts.skin : null,
+    skinPeople: opts.skinPeople && opts.skinPeople.length === n ? opts.skinPeople : null,
+    skinPositions: opts.skinPositions || [],
     masks: { zone, zw, zoneTint, neutral, bw, lowSat, skin, regionTint },
     wbConfidence, neutralThreshold: thr, skinSource, faceCount: faceMask ? opts.faces.length : 0,
   };
@@ -418,7 +422,7 @@ export function measure(ps, cur, idx) {
   const skin = { source: ps.skinSource, faces: ps.faceCount, frac: sn / N, hue: sh, chroma: sn ? sc / sn : 0, hueSpread: sn ? Math.sqrt(sv / sn) : 0,
     litHue: hn ? Math.atan2(hb / hn, ha / hn) * 180 / Math.PI : 0, litChroma: hn ? hc / hn : 0 };
 
-  return { tone, curve, wb, zones, bands, color, skin };
+  return { tone, curve, wb, zones, bands, color, skin, skinMatch: skinStats(ps, cur, idx) };
 }
 
 // Round everything for printing / storage.
