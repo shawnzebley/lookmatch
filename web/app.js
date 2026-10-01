@@ -1,4 +1,4 @@
-import { SLIDERS, defaultParams, compile, LOCAL_SLIDERS, REGIONS } from './engine/pipeline.js';
+import { SLIDERS, CURVE_SATURATION, defaultParams, compile, LOCAL_SLIDERS, REGIONS, CURVE_KEYS, curveLUT, isIdentityCurve } from './engine/pipeline.js';
 import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
 import { FINISH_PROFILES } from './engine/finish.js';
 import { srgbToLinear, linearToSrgb } from './engine/color.js';
@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-09-28b';
+const APP_VERSION = '2026-09-30d';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -366,7 +366,8 @@ function toneDots(s) {
 // ---------------------------------------------------------------- edit view: 1 photos, 2 style
 function statusLabel(p) {
   if (p.status === 'loading' && p.phase === 'heif') return 'converting HEIF';
-  if (p.status === 'ready' && !lookOf(p)) return 'pick a style';
+  if (p.params && !lookOf(p)) return 'edit';
+  if (p.status === 'ready' && !lookOf(p)) return 'open to edit';
   return { loading: 'reading', ready: 'queued', solving: 'styling', done: 'done', error: 'error', exporting: 'exporting', exported: 'exported' }[p.status] || p.status;
 }
 
@@ -384,7 +385,7 @@ function photoTile(p) {
   const t = h(`<button class="tile ${p.picked ? 'picked' : ''}" data-id="${p.id}">${p.thumbURL ? `<img src="${p.thumbURL}" alt="">` : ''}${cullDots(p.cull)}${p.picked ? '<span class="pick">★</span>' : ''}
     ${busy ? '<div class="spin"></div>' : ''}${p.loss && p.loss.worst !== 'ok' && !busy ? `<span class="wbadge ${p.loss.worst}" title="${esc(p.loss.issues.map((i) => i.text).join(', '))}">!</span>` : ''}<span class="st ${p.status === 'done' || p.status === 'exported' ? 'done' : p.status === 'error' ? 'err' : ''}">${statusLabel(p)}</span></button>`);
   t.onclick = () => {
-    if (p.params) return openDetail(p);
+    if (p.params || (p.status === 'ready' && !lookOf(p))) return openDetail(p);
     if (p.status !== 'error') { if (!lookOf(p)) $('#stepStyle')?.scrollIntoView({ behavior: 'smooth' }); return; }
     const s = showProblem(`Couldn't use ${p.name}`, p.errRec || logError('photo', p.error, p.file), '<button class="danger" id="pRemove">Remove</button>');
     $('#pRemove', s).onclick = () => { pool.call(p.worker, 'unload', { id: p.id }).catch(() => {}); S.photos = S.photos.filter((q) => q !== p); closeSheet(); renderMatch(); };
@@ -497,7 +498,7 @@ function renderMatch() {
     }
     photos.append(strip);
     if (total > 1) photos.append(cullBar());
-    const line = !look ? 'Now pick a style below.'
+    const line = !look ? 'Tap a photo to edit without a reference, or pick a style below.'
       : done < total ? `Styling like ${esc(lookName(look))}… ${done} of ${total}`
         : `${total === 1 ? 'Done.' : `All ${total} done.`} Tap a photo to fine-tune, crop or export.`;
     photos.append(h(`<p class="muted small step-note">${line}</p>`));
@@ -549,7 +550,10 @@ async function addPhotos(files) {
     S.photos.push(p);
     pool.call(p.worker, 'load', { id: p.id, file }).then((r) => {
       p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask; p.faceErr = r.faceErr; p.cull = r.cull; S.scenesKey = null; noteVision(r, file);
-      p.status = 'ready'; rerenderMatchSoon(); runQueue();
+      p.status = 'ready'; rerenderMatchSoon();
+      if (S.autoOpen && S.photos.length === 1 && !lookOf(p) && !D && S.tab === 'match') {
+        S.autoOpen = false; p.params = defaultParams(); openDetail(p);
+      } else runQueue();
     }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('add photo: read', e, file); rerenderMatchSoon(); });
   }
   setTab('match');
@@ -562,17 +566,24 @@ function solveArgs(p) {
   const split = p.split !== false;
   if (look.kind === 'photographer') return { refStats: null, lrParams: {}, strength: 1, finish: look.key, finishStrength, pull: 0.25, split };
   const pr = presetById(look.id);
-  return { refStats: pr.stats, lrParams: pr.lr ? pr.lrParams : null, strength: p.strength / 100, finish: p.finish || pr.finish || 'off', finishStrength, split };
+  const assist = S.settings.modelUrl && !pr.lr && pr.thumb;
+  return { refStats: pr.stats, lrParams: pr.lr ? pr.lrParams : null, strength: p.strength / 100, finish: p.finish || pr.finish || 'off', finishStrength, split, ...(assist ? { modelUrl: S.settings.modelUrl, refThumb: pr.thumb } : {}) };
 }
 
 // References saved before subject/background existed: measure the split once from the saved thumbnail.
 const upgrading = new Map();
 function ensurePresetRegions(pr) {
-  if (!pr || pr.lr || !pr.stats || pr.stats.regions !== undefined || !pr.thumb) return Promise.resolve();
+  const measured = pr && pr.stats && pr.stats.regions;
+  const current = measured && measured.subject && measured.subject.tone && measured.subject.bands
+    && measured.background && measured.background.tone && measured.background.bands
+    && pr.stats.signature && Number.isFinite(pr.stats.signature.halation);
+  if (!pr || pr.lr || !pr.stats || current || !pr.thumb) return Promise.resolve();
   if (!upgrading.has(pr.id)) {
     upgrading.set(pr.id, (async () => {
-      try { const r = await pool.call(0, 'measureRef', { file: await dataURLToBlob(pr.thumb) }, { priority: true }); pr.stats.regions = r.stats.regions || null; }
-      catch (e) { pr.stats.regions = null; }
+      try {
+        const r = await pool.call(0, 'measureRef', { file: await dataURLToBlob(pr.thumb) }, { priority: true });
+        pr.stats.regions = r.stats.regions || null; pr.stats.signature = r.stats.signature || { halation: 0 };
+      } catch (e) { pr.stats.regions = null; pr.stats.signature ||= { halation: 0 }; }
       try { await db.putPreset(pr); } catch (e) { /* stays in memory */ }
     })());
   }
@@ -589,7 +600,8 @@ function solvePhoto(p, { priority = false } = {}) {
   p.status = 'solving'; p.solvedLook = look; rerenderMatchSoon();
   return ensurePresetRegions(presetOf(p)).then(() => pool.call(p.worker, 'solve', { id: p.id, ...solveArgs(p) }, { priority })).then((r) => {
     Object.assign(r.params, keptEdits(p.params));
-    Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, style: r.style, regions: r.regions, mask: r.mask || p.mask, status: 'done' });
+    if (r.model && !r.model.ok) toast(`Model assist failed, matched without it: ${r.model.error}`);
+    Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, model: r.model, style: r.style, regions: r.regions, mask: r.mask || p.mask, status: 'done' });
     rerenderMatchSoon();
     // one photo in, style picked: go straight to the editor
     if (S.autoOpen && S.photos.length === 1 && !D && S.tab === 'match') { S.autoOpen = false; openDetail(p); }
@@ -643,11 +655,176 @@ function numbersTable(p) {
   </table>${p.guardScale < 0.99 ? `<p class="muted small">Edit scaled to ${Math.round(p.guardScale * 100)}% to avoid clipping.</p>` : ''}`;
 }
 
-function sliderRow(s, v) {
+function sliderRow(s, v, baseline = 0) {
   const step = s.step || 1;
-  return `<div class="sl ${Math.abs(v) > 1e-9 ? 'changed' : ''}" data-k="${s.key}"><label>${s.label}</label>
+  return `<div class="sl ${Math.abs(v - baseline) > 1e-9 ? 'changed' : ''}" data-k="${s.key}"><label>${s.label}</label>
     <input type="range" min="${s.ui[0]}" max="${s.ui[1]}" step="${step}" value="${v}">
     <input type="number" min="${s.ui[0]}" max="${s.ui[1]}" step="${step}" value="${step < 1 ? (+v).toFixed(2) : Math.round(v)}"></div>`;
+}
+
+// Lightroom-style master and RGB tone curves. Local curves are applied after the whole-photo curve,
+// through the current subject/background mask.
+const CURVE_CHANNELS = [
+  ['curve', 'Master', '#f3f1eb'], ['curveR', 'Red', '#ff7d73'],
+  ['curveG', 'Green', '#83d69b'], ['curveB', 'Blue', '#77b9ff'],
+];
+const IDENTITY_CURVE = [[0, 0], [255, 255]];
+const CURVE_GRID = [0, 64, 128, 192, 255];
+function snapCurveCoord(v) { return CURVE_GRID.reduce((best, q) => Math.abs(q - v) < Math.abs(best - v) ? q : best, CURVE_GRID[0]); }
+function currentCurvePoints(key = D.curveChannel) {
+  return D.region === 'all' ? D.p.params[key] || IDENTITY_CURVE : localOf(D.p, D.region)[key] || IDENTITY_CURVE;
+}
+function curveValueAt(points, value) {
+  const lut = curveLUT(points, 256);
+  return lut[Math.max(0, Math.min(255, Math.round(value)))] * 255;
+}
+function curvePath(points) {
+  const lut = curveLUT(points, 256);
+  return Array.from(lut, (v, i) => `${i ? 'L' : 'M'}${i} ${255 - v * 255}`).join(' ');
+}
+function curveCardMarkup(p) {
+  const local = D.region !== 'all';
+  const points = currentCurvePoints();
+  const color = CURVE_CHANNELS.find(([k]) => k === D.curveChannel)?.[2] || '#f3f1eb';
+  const grid = CURVE_GRID.map((v) => `<path d="M${v} 0V255 M0 ${v}H255"/>`).join('');
+  const dots = points.map(([x, y], i) => `<circle class="curve-dot" data-i="${i}" cx="${x}" cy="${255 - y}" r="4.5" tabindex="0" aria-label="Curve point ${i + 1}: input ${x}, output ${y}; use arrow keys to adjust"/>`).join('');
+  const target = local ? (D.region === 'subject' ? 'Subject mask' : 'Background mask') : 'Whole photo';
+  const status = D.tool === 'curve' ? 'Tap a tone in the photo to place a control point.' : 'Tap the graph to add a point, or pick a tone from the photo.';
+  const localCurves = local ? `<div id="curveAmountRow">${sliderRow({ key: 'curveAmount', label: 'Mask curve amount', ui: [0, 100] }, localOf(p, D.region).curveAmount ?? 100)}</div>` : '';
+  const curveSat = sliderRow(CURVE_SATURATION, p.params.curveSaturation ?? 100, 100);
+  const fittedReferenceCurve = local
+    ? D.curveChannel === 'curve' && localOf(p, D.region).curveAuto === 'reference'
+    : D.curveChannel === 'curve' && p.params.curveAuto === 'reference';
+  const curveMatchNote = fittedReferenceCurve
+    ? `<p class="muted small" style="margin:5px 0 0">Fitted from this photo and the selected reference. ${isIdentityCurve(points) ? 'No visible point-curve adjustment was needed.' : 'Adjust the points to refine the match.'}</p>` : '';
+  const notes = [];
+  if (local && CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, D.region)[k]))) notes.push('Local curves are baked into the exported photo. Lightroom sidecars do not store local tone curves yet.');
+  const anyCurve = CURVE_KEYS.some((k) => !isIdentityCurve(p.params[k])) || REGIONS.some((r) => CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, r)[k])));
+  if (anyCurve && Math.abs((p.params.curveSaturation ?? 100) - 100) > 1e-9) notes.push('Curve saturation compensation is baked into rendered exports; Lightroom XMP has no equivalent setting.');
+  const exportNote = notes.map((note) => `<p class="muted small" style="margin:5px 0 0">${note}</p>`).join('');
+  const copyMaster = D.curveChannel === 'curve' ? '<button id="curveCopyRGB">Copy Master to RGB</button>' : '';
+  return `<h3>Tone curve · ${target}</h3>
+    <div class="seg curve-channels" id="curveChannels">${CURVE_CHANNELS.map(([k, label]) => `<button data-c="${k}" class="${D.curveChannel === k ? 'on' : ''}">${label}</button>`).join('')}</div>
+    <svg class="curve-graph" id="curveGraph" viewBox="0 0 255 255" role="group" aria-label="${target} ${CURVE_CHANNELS.find(([k]) => k === D.curveChannel)?.[1]} tone curve" style="--curve-color:${color}">
+      <g class="curve-grid">${grid}</g><path class="curve-diagonal" d="M0 255L255 0"/><path class="curve-line" d="${curvePath(points)}"/>${dots}
+    </svg>
+    <div class="row curve-actions"><button id="curvePick" class="${D.tool === 'curve' ? 'on' : ''}">Pick from photo</button><button id="curveS">Gentle S</button>${copyMaster}<button id="curveReset">Reset</button></div>
+    <label class="chk"><input type="checkbox" id="curveSnap" ${D.curveSnap ? 'checked' : ''}>Snap points to grid (right-click graph to toggle)</label>
+    <div id="curveSaturationRow">${curveSat}</div>
+    <p class="muted small" style="margin:4px 0 0">At 100, curve color response is unchanged. 0 removes its chroma change; 200 doubles it. Separate HSL hue, saturation, and luminance sliders are in the Light controls.</p>
+    ${curveMatchNote}${localCurves}<p class="muted small" id="curveHelp" style="margin:5px 0 0">${status} Left to right is shadows to highlights; move up to brighten and down to darken. Use Exposure for overall brightness and curves for style. RGB channels add or remove color. Arrow keys nudge a focused point (Shift = 5).</p>${exportNote}`;
+}
+function drawCurve(focusIndex = null) {
+  const svg = $('#curveGraph');
+  if (!svg || !D) return;
+  const pts = currentCurvePoints();
+  svg.querySelector('.curve-line').setAttribute('d', curvePath(pts));
+  svg.querySelectorAll('.curve-dot').forEach((dot) => dot.remove());
+  for (let i = 0; i < pts.length; i++) {
+    const [x, y] = pts[i], dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    dot.setAttribute('class', 'curve-dot'); dot.dataset.i = String(i); dot.setAttribute('cx', String(x));
+    dot.setAttribute('cy', String(255 - y)); dot.setAttribute('r', '4.5'); dot.setAttribute('tabindex', '0');
+    dot.setAttribute('aria-label', `Curve point ${i + 1}: input ${x}, output ${y}; use arrow keys to adjust`); svg.append(dot);
+  }
+  if (focusIndex != null) svg.querySelector(`.curve-dot[data-i="${focusIndex}"]`)?.focus();
+}
+function writeCurvePoints(points, focusIndex = null) {
+  points.sort((a, b) => a[0] - b[0]);
+  const p = D.p.params;
+  if (D.region === 'all' && D.curveChannel === 'curve') delete p.curveAuto;
+  if (D.region === 'all') p[D.curveChannel] = points;
+  else {
+    p.local ||= {};
+    const loc = { ...(p.local[D.region] || {}), [D.curveChannel]: points };
+    if (D.curveChannel === 'curve') delete loc.curveAuto;
+    p.local[D.region] = loc;
+  }
+  D.userEdited = true;
+  drawCurve(focusIndex); requestPreview(false); scheduleMeasure();
+}
+function renderCurveCard() {
+  if (!D || !$('#curveCard')) return;
+  const box = $('#curveCard'); box.innerHTML = curveCardMarkup(D.p);
+  $('#curveChannels', box).onclick = (e) => {
+    const key = e.target.closest('button')?.dataset.c;
+    if (!key) return;
+    D.curveChannel = key; renderCurveCard();
+  };
+  $('#curvePick', box).onclick = () => setTool(D.tool === 'curve' ? null : 'curve');
+  $('#curveS', box).onclick = () => writeCurvePoints([[0, 0], [64, 54], [128, 128], [192, 201], [255, 255]]);
+  if ($('#curveCopyRGB', box)) $('#curveCopyRGB', box).onclick = () => {
+    const points = currentCurvePoints('curve').map((q) => [...q]);
+    if (D.region === 'all') for (const key of ['curveR', 'curveG', 'curveB']) D.p.params[key] = points.map((q) => [...q]);
+    else {
+      D.p.params.local ||= {};
+      D.p.params.local[D.region] = { ...(D.p.params.local[D.region] || {}), ...Object.fromEntries(['curveR', 'curveG', 'curveB'].map((key) => [key, points.map((q) => [...q])])) };
+    }
+    D.userEdited = true; renderCurveCard(); requestPreview(false); scheduleMeasure(); toast('Master curve copied to RGB');
+  };
+  $('#curveReset', box).onclick = () => {
+    if (D.region === 'all' && D.curveChannel === 'curve') delete D.p.params.curveAuto;
+    if (D.region === 'all') delete D.p.params[D.curveChannel];
+    else if (D.p.params.local && D.p.params.local[D.region]) {
+      delete D.p.params.local[D.region][D.curveChannel];
+      if (D.curveChannel === 'curve') delete D.p.params.local[D.region].curveAuto;
+    }
+    D.userEdited = true; renderCurveCard(); requestPreview(false); scheduleMeasure();
+  };
+  if ($('#curveAmountRow', box)) bindRows(box.querySelectorAll('#curveAmountRow .sl'), (_k, value) => {
+    D.p.params.local ||= {};
+    D.p.params.local[D.region] = { ...(D.p.params.local[D.region] || {}), curveAmount: value };
+    D.userEdited = true; requestPreview(false); scheduleMeasure();
+  });
+  bindRows(box.querySelectorAll('#curveSaturationRow .sl'), (_k, value) => {
+    D.p.params.curveSaturation = value;
+    D.userEdited = true; requestPreview(false); scheduleMeasure();
+  }, 100);
+  $('#curveSnap', box).onchange = (e) => { D.curveSnap = e.target.checked; };
+  const svg = $('#curveGraph', box);
+  const xy = (e) => {
+    const r = svg.getBoundingClientRect();
+    return [Math.max(0, Math.min(255, (e.clientX - r.left) / r.width * 255)), Math.max(0, Math.min(255, 255 - (e.clientY - r.top) / r.height * 255))];
+  };
+  svg.addEventListener('contextmenu', (e) => {
+    e.preventDefault(); D.curveSnap = !D.curveSnap;
+    $('#curveSnap', box).checked = D.curveSnap; toast(`Curve grid snap ${D.curveSnap ? 'on' : 'off'}`, 1600);
+  });
+  svg.addEventListener('keydown', (e) => {
+    const dot = e.target.closest('.curve-dot');
+    if (!dot) return;
+    const i = +dot.dataset.i, points = currentCurvePoints().map((q) => [...q]), step = e.shiftKey ? 5 : 1;
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+    e.preventDefault();
+    const [x0, y0] = points[i];
+    const xMin = i === 0 ? 0 : points[i - 1][0] + 2, xMax = i === points.length - 1 ? 255 : points[i + 1][0] - 2;
+    const yMin = i === 0 ? 0 : points[i - 1][1], yMax = i === points.length - 1 ? 255 : points[i + 1][1];
+    const x = Math.round(Math.max(xMin, Math.min(xMax, x0 + (e.key === 'ArrowRight' ? step : e.key === 'ArrowLeft' ? -step : 0))));
+    const y = Math.round(Math.max(yMin, Math.min(yMax, y0 + (e.key === 'ArrowUp' ? step : e.key === 'ArrowDown' ? -step : 0))));
+    points[i] = [x, y]; writeCurvePoints(points, i);
+  });
+  svg.addEventListener('pointerdown', (e) => {
+    if (e.button === 2) return;
+    e.preventDefault(); svg.setPointerCapture(e.pointerId);
+    const dot = e.target.closest('.curve-dot');
+    if (dot) { dot.focus(); D.curveDrag = +dot.dataset.i; return; }
+    let [x, y] = xy(e); const points = currentCurvePoints().map((q) => [...q]);
+    if (D.curveSnap) { x = snapCurveCoord(x); y = snapCurveCoord(y); }
+    const xi = Math.round(x);
+    if (points.some(([px]) => Math.abs(px - xi) < 3)) return;
+    points.push([xi, Math.round(D.curveSnap ? y : curveValueAt(points, xi))]); points.sort((a, b) => a[0] - b[0]);
+    writeCurvePoints(points, points.findIndex(([px]) => px === xi));
+  });
+  svg.addEventListener('pointermove', (e) => {
+    if (D.curveDrag == null) return;
+    const points = currentCurvePoints().map((q) => [...q]), i = D.curveDrag, [rawX, rawY] = xy(e);
+    const snappedX = D.curveSnap ? snapCurveCoord(rawX) : rawX, snappedY = D.curveSnap ? snapCurveCoord(rawY) : rawY;
+    const x = i === 0 ? 0 : i === points.length - 1 ? 255 : Math.round(Math.max(points[i - 1][0] + 2, Math.min(points[i + 1][0] - 2, snappedX)));
+    const lo = i === 0 ? 0 : points[i - 1][1], hi = i === points.length - 1 ? 255 : points[i + 1][1];
+    points[i] = [x, Math.round(Math.max(lo, Math.min(hi, snappedY)))];
+    writeCurvePoints(points, i);
+  });
+  const endDrag = () => { D.curveDrag = null; };
+  svg.addEventListener('pointerup', endDrag); svg.addEventListener('pointercancel', endDrag);
 }
 
 // colour grading lives on the wheels card; everything else stays in the slider groups
@@ -712,6 +889,11 @@ function regionNote(p) {
   const warm = (a.dB - b.dB) + 0.3 * (a.dA - b.dA);
   if (Math.abs(warm) >= 1) li.push(`Subject ${warm > 0 ? 'warmer' : 'cooler'} than the background`);
   if (Math.abs(a.chroma - b.chroma) >= 0.05) li.push(`Subject color ${a.chroma > b.chroma ? 'stronger' : 'weaker'} than the background: ${b.chroma.toFixed(2)}× → ${a.chroma.toFixed(2)}×`);
+  if (g.referenceStyle) {
+    li.push('Reference fit: subject white balance and tonal curve');
+    if (g.referenceStyle.backgroundHslBands.length) li.push(`Background HSL matched in ${g.referenceStyle.backgroundHslBands.join(', ')}`);
+    if (p.params.halation > 0) li.push(`Warm halation from the reference’s light sources: ${p.params.halation}%`);
+  }
   if (!li.length) li.push('Subject and background already sit the way the style does');
   const L = g.local, part = (r) => LOCAL_SLIDERS.filter((s) => L[r][s.key]).map((s) => `${s.label.toLowerCase()} ${s.key === 'exposure' ? signed(L[r][s.key], 2) : signed(L[r][s.key])}`).join(', ');
   const moves = REGIONS.map((r) => (part(r) ? `${r === 'subject' ? 'Subject' : 'Background'}: ${part(r)}` : '')).filter(Boolean).join(' · ');
@@ -734,6 +916,7 @@ function regionCard(p) {
     <div class="mtools"><button id="mAdd" class="${D.pick === 'add' ? 'on' : ''}">+ Add</button><button id="mRem" class="${D.pick === 'remove' ? 'on' : ''}" ${found ? '' : 'disabled'}>− Remove</button><button id="mUndo" ${M.picks ? '' : 'disabled'}>Undo</button><div class="grow"></div><button id="mShow" class="${D.showMask ? 'on' : ''}" ${found ? '' : 'disabled'}>Show</button></div>
     <p class="muted small" style="margin:6px 0 0">${status}</p>
     ${M.ok ? '' : '<div class="mtools"><button id="mRetry">Try again</button></div>'}
+    <p class="muted small" style="margin:4px 0 0">To edit a sky or another object, use + Add and tap it. Turn off people detection first if you want only that object in the mask.</p>
     ${M.people ? `<label class="chk"><input type="checkbox" id="mAuto" ${M.useAuto ? 'checked' : ''}> People count as the subject</label>` : ''}
     <label class="chk"><input type="checkbox" id="mSplit" ${p.split !== false ? 'checked' : ''}> Style sets the subject apart from the background</label>
     ${p.split !== false ? regionNote(p) : ''}`;
@@ -834,7 +1017,7 @@ function renderRetouchCard() {
 }
 
 // slider rows outside #sliders: range + number kept in step, onSet(key, value)
-function bindRows(rows, onSet) {
+function bindRows(rows, onSet, baseline = 0) {
   rows.forEach((row) => {
     const k = row.dataset.k;
     const [range, num] = row.querySelectorAll('input');
@@ -843,7 +1026,7 @@ function bindRows(rows, onSet) {
       v = Math.max(lo, Math.min(hi, +v || 0));
       if (from !== range) range.value = v;
       if (from !== num) num.value = step < 1 ? v.toFixed(1) : Math.round(v);
-      row.classList.toggle('changed', Math.abs(v) > 1e-9);
+      row.classList.toggle('changed', Math.abs(v - baseline) > 1e-9);
       onSet(k, v);
     };
     range.oninput = () => set(range.value, range);
@@ -858,6 +1041,7 @@ function setTool(t) {
   renderRetouchCard();
   renderRegionCard();
   renderPointCard();
+  renderCurveCard();
   draw();
 }
 
@@ -886,6 +1070,7 @@ async function toolTap(x, y) {
       setTool('heal'); requestPreview(false);
     } catch (e) { toast(e.message, 3000); }
   } else if (D.tool === 'point') pointTap(x, y);
+  else if (D.tool === 'curve') curveTap(x, y);
 }
 
 // heal spots in canvas px
@@ -956,6 +1141,20 @@ async function pointTap(x, y) {
   } catch (e) { toast(e.message, 3000); }
 }
 
+async function curveTap(x, y) {
+  const p = D.p, key = D.curveChannel, region = D.region;
+  try {
+    const r = await pool.call(p.worker, 'sampleCurve', { id: p.id, x, y, params: structuredClone(p.params), curveKey: key, region, side: previewSide() }, { priority: true });
+    if (!D || D.p !== p) return;
+    const points = currentCurvePoints(key).map((q) => [...q]);
+    const xi = r.value;
+    const close = points.findIndex(([px]) => Math.abs(px - xi) < 8);
+    if (close >= 0) points[close][1] = Math.round(curveValueAt(points, points[close][0]));
+    else points.push([xi, Math.round(curveValueAt(points, xi))]);
+    writeCurvePoints(points); setTool(null); toast('Tone point added. Drag it on the curve to adjust.');
+  } catch (e) { toast(e.message, 3000); }
+}
+
 // ---------------------------------------------------------------- sync
 // Lightroom's Sync: copy this photo's settings to the rest of the shoot. Exposure and white balance stay
 // each photo's own by default (light changes between shots); turn them on for a studio with fixed light.
@@ -1022,6 +1221,7 @@ function rebuildControls() {
   $('#grade').innerHTML = gradeCard(D.p);
   $('#gradeH').textContent = D.region === 'all' ? 'Color grading' : `Color grading · ${D.region === 'subject' ? 'Subject' : 'Background'}`;
   $('#slidersCard').classList.toggle('local', D.region !== 'all');
+  renderCurveCard();
   bindSliders();
   bindWheels();
   renderLoss();
@@ -1127,6 +1327,7 @@ function styleCard(p) {
       ${look?.kind === 'photographer' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : '<p class="muted small" style="margin:8px 0 0">Pick one to restyle this photo.</p>'}`;
   } else {
     body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
+      <p class="muted small" style="margin:8px 0 0">With a usable subject/background mask, reference matching fits the subject’s white balance and tone curve and the background’s HSL. It adds halation when it detects glow around lights.</p>
       ${pr ? `${strengthRow('str', 'Match', p.strength, 100)}
         <div class="sub">Add a photographer's finish on top</div><div class="fin" id="fin">${finishButtons(p, pr)}</div>
         ${fk !== 'off' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : ''}`
@@ -1185,7 +1386,9 @@ function renderStyleCard() {
 }
 
 // ---------------------------------------------------------------- detail view
+const PAGES = [['look', 'Look'], ['subject', 'Subject'], ['light', 'Light'], ['color', 'Color'], ['retouch', 'Retouch'], ['more', 'More']];
 function openDetail(p) {
+  p.params ||= defaultParams();
   const el = $('#detail');
   el.hidden = false;
   el.classList.remove('cropping');
@@ -1195,7 +1398,7 @@ function openDetail(p) {
       <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
         <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span></div>
       <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
-        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><div class="grow"></div><button id="reMatch">Redo</button></div>
+        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure, then fit the light and RGB curves to this photo">Auto Adjust</button><div class="grow"></div><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
       <div class="cropbar" id="cropbar" hidden>
         <div class="aspects" id="aspects"><button data-a="free">Free</button><button data-a="orig">Original</button><button data-a="1">1:1</button><button data-a="0.8">4:5</button><button data-a="1.5">3:2</button><button data-a="1.7778">16:9</button><button data-a="flip" aria-label="Swap width and height">⇄</button></div>
         <div class="level"><label for="lvl">Level</label><input type="range" id="lvl" min="-45" max="45" step="0.1" value="0"><output id="lvlOut">0.0°</output><button id="lvlAuto">Auto</button></div>
@@ -1203,22 +1406,24 @@ function openDetail(p) {
       </div>
       <div class="lossbar" id="loss"></div>
     </div>
-    <div id="dspace"></div>
-    <div class="dbody" id="dbody">
-      <div class="card" id="styleCard"></div>
-      <div class="card" id="regionCard"></div>
-      <div class="card" id="retouchCard"></div>
-      <div class="card"><h3 id="gradeH">Color grading</h3><div id="grade"></div></div>
-      <div class="card" id="pointCard"></div>
-      <div class="card" id="slidersCard"><div id="sliders"></div></div>
-      <div class="card" id="syncCard"></div>
-      <div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div>
+    <div class="dpanel" id="dbody">
+      <div class="ptabs" id="ptabs">${PAGES.map(([k, l]) => `<button data-p="${k}">${l}</button>`).join('')}</div>
+      <div class="pager" id="pager">
+        <div class="page" data-p="look"><div class="card" id="styleCard"></div></div>
+        <div class="page" data-p="subject"><div class="card" id="regionCard"></div></div>
+        <div class="page" data-p="light"><div class="card" id="slidersCard"><div id="sliders"></div></div><div class="card" id="curveCard"></div></div>
+        <div class="page" data-p="color"><div class="card"><h3 id="gradeH">Color grading</h3><div id="grade"></div></div><div class="card" id="pointCard"></div></div>
+        <div class="page" data-p="retouch"><div class="card" id="retouchCard"></div></div>
+        <div class="page" data-p="more"><div class="card" id="syncCard"></div><div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div></div>
+      </div>
     </div>`;
   D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null, region: 'all', pick: null, showMask: false, flash: false,
-    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1 };
+    tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1, curveChannel: 'curve', curveDrag: null, curveSnap: false, view: { s: 1, x: 0, y: 0 }, hi: false, page: 'look',
+    hist: { stack: [], cur: editSnap(p) } };
   $('#sliders').innerHTML = sliderGroups(p);
   $('#grade').innerHTML = gradeCard(p);
   el.scrollTop = 0;
+  bindPager();
   $('#dBack').onclick = closeDetail;
   $('#dExport').onclick = () => exportPhotos([p]);
   $('#dPick').onclick = () => { p.picked = !p.picked; $('#dPick').classList.toggle('on', p.picked); $('#dPick').setAttribute('aria-pressed', String(p.picked)); };
@@ -1229,12 +1434,31 @@ function openDetail(p) {
     $('#reMatch').disabled = true; $('#reMatch').textContent = 'Working…';
     await solvePhoto(p, { priority: true });
     D && (D.userEdited = false);
-    refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Redo';
+    refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Re-match';
+  };
+  $('#undo').onclick = undo;
+  $('#autoAdjust').onclick = async () => {
+    const btn = $('#autoAdjust'); btn.disabled = true; btn.textContent = 'Adjusting…';
+    try {
+      const r = await pool.call(p.worker, 'autoAdjust', { id: p.id, params: structuredClone(p.params || defaultParams()) }, { priority: true });
+      if (!D || D.p !== p) return;
+      delete (p.params ||= defaultParams()).curveAuto;
+      Object.assign(p.params ||= defaultParams(), r);
+      p.solved = structuredClone(p.params); p.status = 'done'; D.userEdited = true;
+      refreshDetail(); D.goPage('light');
+      const visible = new Set(['Tone', 'Tone curve', 'Presence', 'HSL hue', 'HSL saturation', 'HSL luminance']);
+      $('#sliders').querySelectorAll('details.group').forEach((group) => {
+        if (visible.has($('summary', group)?.textContent.trim())) group.open = true;
+      });
+      toast('Auto Adjust applied. Light and RGB curves are set; Undo puts it back.');
+    } catch (e) { toast(e.message, 4500); logError('auto adjust', e, p.file); }
+    finally { if ($('#autoAdjust')) { $('#autoAdjust').disabled = false; $('#autoAdjust').textContent = 'Auto Adjust'; } }
   };
   renderStyleCard();
   renderRegionCard();
   renderRetouchCard();
   renderPointCard();
+  renderCurveCard();
   renderSyncCard();
   bindCropBar();
   bindSliders();
@@ -1245,6 +1469,38 @@ function openDetail(p) {
   renderLoss();
   requestPreview(true);
   scheduleMeasure(0);
+}
+
+// The bottom panel is a horizontal slider. Keep its section tabs in sync with swipes,
+// and let a tap jump directly to the corresponding group of editing tools.
+function bindPager() {
+  const pager = $('#pager'), tabs = $('#ptabs');
+  const mark = (k) => {
+    D.page = k;
+    tabs.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.p === k));
+    tabs.querySelector('button.on')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+  };
+  const pageEl = (k) => pager.querySelector(`.page[data-p="${k}"]`);
+  D.goPage = (k, smooth = true) => {
+    const el = pageEl(k);
+    if (!el) return;
+    mark(k);
+    pager.scrollTo({ left: el.offsetLeft, behavior: smooth ? 'smooth' : 'auto' });
+  };
+  tabs.onclick = (e) => {
+    const k = e.target.closest('button')?.dataset.p;
+    if (k) D.goPage(k);
+  };
+  let t;
+  pager.onscroll = () => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      const i = Math.round(pager.scrollLeft / Math.max(1, pager.clientWidth));
+      const k = pager.children[i]?.dataset.p;
+      if (k && k !== D?.page) mark(k);
+    }, 60);
+  };
+  mark('look');
 }
 
 // ---------------------------------------------------------------- photo shrinks while scrolling
@@ -1324,11 +1580,44 @@ function jumpToSlider(k) {
   row.classList.remove('flash'); void row.offsetWidth; row.classList.add('flash');
 }
 
+// Undo: every edit ends in scheduleMeasure, so its debounce is where an edit counts as finished
+// (a whole slider drag is one step). Snapshots are the photo's params, as JSON, per open photo.
+const UNDO_MAX = 50;
+const editSnap = (p) => JSON.stringify({ params: p.params || null, solved: p.solved || null });
+function commitEdit() {
+  if (!D || !D.hist) return;
+  const s = editSnap(D.p);
+  if (s === D.hist.cur) return;
+  D.hist.stack.push(D.hist.cur);
+  if (D.hist.stack.length > UNDO_MAX) D.hist.stack.shift();
+  D.hist.cur = s;
+  syncUndo();
+}
+function syncUndo() { if (D && $('#undo')) $('#undo').disabled = !D.hist.stack.length; }
+function undo() {
+  if (!D || D.crop) return;
+  commitEdit();
+  const prev = D.hist.stack.pop();
+  if (!prev) return;
+  D.hist.cur = prev;
+  const o = JSON.parse(prev);
+  D.p.params = o.params || defaultParams(); D.p.solved = o.solved || null;
+  D.userEdited = true;
+  syncUndo();
+  refreshDetail();
+}
+document.addEventListener('keydown', (e) => {
+  if (!D || !(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || e.key.toLowerCase() !== 'z') return;
+  if (e.target.closest && e.target.closest('input, textarea, select')) return;
+  e.preventDefault(); undo();
+});
+
 let measureT;
 function scheduleMeasure(delay = 350) {
   clearTimeout(measureT);
   measureT = setTimeout(async () => {
     if (!D) return;
+    commitEdit();
     const p = D.p;
     const r = await pool.call(p.worker, 'measureParams', { id: p.id, params: { ...p.params }, auto: p.solved || null }, { priority: true });
     if (!D || D.p !== p) return;
@@ -1574,7 +1863,7 @@ function bindCropBar() {
       $('#reMatch').disabled = true; $('#reMatch').textContent = 'Working…';
       await solvePhoto(p, { priority: true });
       if (!D || D.p !== p) return;
-      refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Redo';
+      refreshDetail(); $('#reMatch').disabled = false; $('#reMatch').textContent = 'Re-match';
     } else {
       $('#nums').innerHTML = numbersTable(p);
       scheduleMeasure(0);
@@ -1821,6 +2110,10 @@ function renderSettings() {
       <div class="field"><label class="t">Lightroom settings style</label>
         <select id="sLRM"><option value="sliders">Basic sliders (easy to tweak, approximate)</option><option value="curve">Tone curve (closer match)</option></select></div>
     </div>
+    <div class="card"><h3>Model assist</h3>
+      <p class="muted small">Optional. Paste the URL of your Deep Preset Space (see <code>server/README.md</code>). Each photo matched to a saved reference is sent there at 512 px, and the solver chases the result. Leave empty to keep everything on this phone. If the server fails, the plain match runs instead.</p>
+      <div class="field"><label class="t">Space URL</label><input type="url" id="sModel" placeholder="https://name-space.hf.space" value="${esc(s.modelUrl || '')}"></div>
+    </div>
     <div class="card"><h3>Google Drive</h3>
       <p class="small">${tok ? `Connected. Sign-in good for about ${drive.minutesLeft()} more minutes.` : 'Not connected.'}</p>
       <div class="field"><label class="t">OAuth client ID</label><input type="text" id="sCID" placeholder="xxxx.apps.googleusercontent.com" value="${esc(s.clientId)}"></div>
@@ -1841,6 +2134,7 @@ function renderSettings() {
   </div>`;
   $('#sDest').value = s.dest; $('#sLRM').value = s.lrMode;
   $('#sDest').onchange = (e) => { s.dest = e.target.value; saveSettings(); };
+  $('#sModel').onchange = (e) => { s.modelUrl = e.target.value.trim().replace(/\/+$/, ''); saveSettings(); };
   $('#sQ').onchange = (e) => { s.quality = Math.max(60, Math.min(100, +e.target.value || 92)); saveSettings(); };
   $('#sLR').onchange = (e) => { s.lightroom = e.target.checked; saveSettings(); };
   $('#sLRM').onchange = (e) => { s.lrMode = e.target.value; saveSettings(); };

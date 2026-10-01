@@ -86,6 +86,9 @@ export function maskCorrections(p) {
   for (const r of REGIONS) {
     const loc = p.local[r];
     if (!localActive(loc)) continue;
+    const hasSidecarValues = Object.keys(LOCAL_CRS).some((k) => loc[k]) || loc.vibrance
+      || ['shadow', 'midtone', 'highlight'].some((z) => loc[`${z}Sat`]);
+    if (!hasSidecarValues) continue;
     const at = { What: 'Correction', CorrectionAmount: f6(1), CorrectionActive: 'true', CorrectionName: r === 'subject' ? 'LookMatch subject' : 'LookMatch background', CorrectionSyncID: guid() };
     for (const [k, [name, div]] of Object.entries(LOCAL_CRS)) at[name] = f6(Math.max(-1, Math.min(1, (loc[k] || 0) / div)));
     if (loc.vibrance) at.LocalSaturation = f6(Math.max(-1, Math.min(1, (loc.saturation || 0) / 100 + 0.6 * loc.vibrance / 100)));

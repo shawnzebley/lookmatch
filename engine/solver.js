@@ -2,8 +2,8 @@
 // Staged bounded Levenberg-Marquardt: tone -> white balance -> color -> tone/WB touch-up.
 
 import { PCTS, BANDS, measure } from './measure.js';
-import { SLIDERS, SLIDER_BY_KEY, defaultParams, toneMapL, toneRaw, exposeX, toneMaxSlope, toneReversal, fadeLevels, processPixelSet, clampParams } from './pipeline.js';
-import { wheelHueToAB, abToWheelHue, wrapDeg } from './color.js';
+import { SLIDERS, SLIDER_BY_KEY, defaultParams, toneMapL, toneRaw, exposeX, toneMaxSlope, toneReversal, fadeLevels, curveLUT, isIdentityCurve, processPixelSet, clampParams } from './pipeline.js';
+import { wheelHueToAB, abToWheelHue, wrapDeg, linearToSrgb, lToY } from './color.js';
 import { brightenFactor } from './scene.js';
 
 // ---------------- generic bounded LM (projected), finite-difference Jacobian --------------------
@@ -232,6 +232,44 @@ function skinResiduals(st, t) {
   ];
 }
 
+// Convert the fitted non-exposure tone map into an editable master point curve. The curve's x values
+// are the grayscale sRGB values after Exposure; its y values are the same grayscale values after the
+// fitted tonal shaping. This keeps Exposure available for brightness while curves carry the reference's
+// contrast, highlight, shadow, black-point, and white-point character.
+function toneTransferCurve(p) {
+  const fl = fadeLevels(p), points = [];
+  for (let i = 0; i <= 32; i++) {
+    const inputL = i * 100 / 32;
+    const exposedL = 100 * exposeX(inputL, p);
+    const outputL = toneMapL(inputL, p, fl);
+    const x = Math.round(255 * linearToSrgb(lToY(exposedL)));
+    const y = Math.round(255 * linearToSrgb(lToY(outputL)));
+    if (points.length && x <= points[points.length - 1][0]) points[points.length - 1] = [x, y];
+    else points.push([x, y]);
+  }
+  if (points[0]?.[0] !== 0) points.unshift([0, points[0]?.[1] ?? 0]);
+  if (points[points.length - 1]?.[0] !== 255) points.push([255, points[points.length - 1]?.[1] ?? 255]);
+
+  // Keep the automatically-created curve easy to inspect and edit without losing its shape.
+  const keep = new Uint8Array(points.length); keep[0] = 1; keep[points.length - 1] = 1;
+  const simplify = (first, last) => {
+    const [x0, y0] = points[first], [x1, y1] = points[last];
+    let farthest = -1, distance = 1.35;
+    for (let i = first + 1; i < last; i++) {
+      const f = (points[i][0] - x0) / Math.max(1, x1 - x0);
+      const d = Math.abs(points[i][1] - (y0 + f * (y1 - y0)));
+      if (d > distance) { farthest = i; distance = d; }
+    }
+    if (farthest >= 0) { keep[farthest] = 1; simplify(first, farthest); simplify(farthest, last); }
+  };
+  simplify(0, points.length - 1);
+  const out = points.filter((_, i) => keep[i]);
+  // If simplification makes the spline reverse, keep the denser sampled curve instead.
+  const lut = curveLUT(out, 256);
+  for (let i = 1; i < lut.length; i++) if (lut[i] + 1e-5 < lut[i - 1]) return points;
+  return out;
+}
+
 // ---------------- main entry ----------------------------------------------------------------------
 /**
  * ps: PixelSet from prepare() on the photo's preview; o: measure(ps); ref: preset stats.
@@ -452,13 +490,47 @@ export function solve(ps, o, ref, opts = {}) {
       Object.assign(params, scaled(lo));
     }
   }
+
+  // Keep overall brightness in Exposure and express the reference-matched tonal shape as a real,
+  // editable master curve. Refit color with that curve active because master curves also change the
+  // chroma of colored pixels; the reference's color targets still decide the final WB/HSL/grade.
+  const tCurve0 = performance.now();
+  let rCurveColor = null;
+  const matchedCurve = toneTransferCurve(params);
+  params.curveAuto = 'reference';
+  if (!isIdentityCurve(matchedCurve)) {
+    params.curve = matchedCurve;
+    for (const k of TONE_KEYS) if (k !== 'exposure') params[k] = 0;
+    rCurveColor = colorStage(Math.min(6, opts.colorIters ?? 10));
+
+    // Curves can move a few saturated pixels closer to clipping than the parametric tone map.
+    // If so, blend only the generated curve back toward identity until the existing clip budget holds.
+    const blendCurve = (amount) => matchedCurve.map(([x, y]) => [x, Math.round(x + (y - x) * amount)]);
+    if (over(clipOf(params))) {
+      const identity = blendCurve(0);
+      if (over(clipOf({ ...params, curve: identity }))) {
+        params.curve = identity;
+        guardK = Math.min(guardK, 0.999);
+      } else {
+        let keep = 0, cut = 1;
+        for (let it = 0; it < 8; it++) {
+          const amount = (keep + cut) / 2;
+          if (over(clipOf({ ...params, curve: blendCurve(amount) }))) cut = amount;
+          else keep = amount;
+        }
+        params.curve = blendCurve(keep);
+        guardK = Math.min(guardK, keep);
+      }
+    }
+  }
+  const tF = performance.now();
   const final = clampParams(params, true);
   for (const k of Object.keys(final)) if (SLIDER_BY_KEY[k] && !SLIDER_BY_KEY[k].hue) final[k] = Math.round(final[k] * (k === 'exposure' ? 100 : 1)) / (k === 'exposure' ? 100 : 1);
   return {
     params: final,
     targets: T,
     guardScale: guardK,
-    timings: { tone: tB - tA, wb: tC - tB, color: tD - tC, touchup: tE - tD, total: tE - t0, evals: rA.evals + rB.evals + rC.evals },
+    timings: { tone: tB - tA, wb: tC - tB, color: tD - tC, touchup: tE - tD, curves: tF - tCurve0, total: tF - t0, evals: rA.evals + rB.evals + rC.evals + (rCurveColor?.evals || 0) },
   };
 }
 

@@ -72,7 +72,30 @@ main { padding: 14px 16px; max-width: 900px; margin: 0 auto; }
 .stage canvas { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto; touch-action: none; }
 .dctl { display: flex; gap: 8px; align-items: center; padding: 8px 12px 6px; }
 .dctl .grow { flex: 1; }
-.dctl button { padding: 7px 11px; font-size: 13px; }
+.dctl button { padding: 6px 11px; font-size: 13px; white-space: nowrap; }
+.dhead button { padding: 7px 12px; }
+.dpanel { flex: none; height: clamp(160px, 30dvh, 320px); display: flex; flex-direction: column; background: var(--panel); border-top: 1px solid var(--line); padding-bottom: var(--safe-b); }
+.ptabs { flex: none; display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; padding: 8px 12px 6px; }
+.ptabs button { flex: none; padding: 5px 13px; font-size: 13px; border-radius: 99px; background: transparent; color: var(--muted); }
+.ptabs button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+.curve-channels { width: max-content; max-width: 100%; margin: 0 auto 8px; }
+.curve-channels button { padding: 6px 11px; font-size: 12px; }
+.curve-graph { display: block; width: min(100%, 320px); aspect-ratio: 1; margin: 6px auto 8px; border-radius: 8px; background: #121416; touch-action: none; user-select: none; }
+.curve-grid path { fill: none; stroke: rgba(255,255,255,.14); stroke-width: .7; vector-effect: non-scaling-stroke; }
+.curve-diagonal { fill: none; stroke: rgba(255,255,255,.28); stroke-width: 1; stroke-dasharray: 3 4; vector-effect: non-scaling-stroke; }
+.curve-line { fill: none; stroke: var(--curve-color); stroke-width: 2.5; vector-effect: non-scaling-stroke; pointer-events: stroke; }
+.curve-dot { fill: var(--curve-color); stroke: #141516; stroke-width: 2; vector-effect: non-scaling-stroke; cursor: grab; touch-action: none; }
+.curve-dot:active { cursor: grabbing; }
+.curve-dot:focus { stroke: #fff; stroke-width: 3; outline: none; }
+.curve-graph:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.curve-actions { justify-content: center; flex-wrap: wrap; }
+.curve-actions button { padding: 6px 11px; font-size: 12px; }
+.pager { flex: 1; min-height: 0; display: flex; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; scrollbar-width: none; overscroll-behavior-x: contain; }
+.pager::-webkit-scrollbar { display: none; }
+.page { flex: 0 0 100%; min-width: 0; overflow-y: auto; scroll-snap-align: start; scroll-snap-stop: always; overscroll-behavior: contain; padding: 0 4px 12px; }
+.page .card { background: none; border: 0; border-radius: 0; margin: 0; padding: 4px 12px 8px; }
+.page .card + .card { border-top: 1px solid var(--line); padding-top: 12px; }
+.page > .card, .page > .card > * { max-width: 700px; margin-left: auto; margin-right: auto; }
 button.tog.on { background: #3a1616; border-color: var(--bad); color: #ffb3a6; }
 .lossbar { padding: 0 12px 8px; font-size: 13px; }
 .lossbar:empty { display: none; }

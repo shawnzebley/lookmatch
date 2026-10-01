@@ -24,6 +24,9 @@ export const SLIDERS = [
   { key: 'vibrance', label: 'Vibrance', group: 'Presence', ui: [-100, 100], cap: [-60, 60], lr: 'Vibrance' },
   { key: 'saturation', label: 'Saturation', group: 'Presence', ui: [-100, 100], cap: [-50, 40], lr: 'Saturation' },
 ];
+// Controls how much of the color change introduced by point curves is kept. 100 leaves the
+// curve's natural color response unchanged; 0 holds the pre-curve chroma while keeping curve tone.
+export const CURVE_SATURATION = { key: 'curveSaturation', label: 'Curve saturation', ui: [0, 200], cap: [0, 200] };
 for (const b of BANDS) {
   const B = b[0].toUpperCase() + b.slice(1);
   SLIDERS.push({ key: `hue_${b}`, label: `${B} hue`, group: 'HSL hue', ui: [-100, 100], cap: [-25, 25], lr: `HueAdjustment${B}` });
@@ -53,6 +56,7 @@ SLIDERS.push({ key: 'finishRolloff', label: 'Roll off highlights', group: 'Finis
 // (finishShA/B, finishHiA/B Lab tints are still honoured by compile() but the photographer fit now uses the colour wheels)
 SLIDERS.push({ key: 'finishSat', label: 'Color intensity', group: 'Finish', ui: [-60, 60], cap: [-60, 60] });
 SLIDERS.push({ key: 'vignette', label: 'Vignette', group: 'Finish', ui: [-100, 100], cap: [-100, 100], lr: 'PostCropVignetteAmount' });
+SLIDERS.push({ key: 'halation', label: 'Halation', group: 'Finish', ui: [0, 100], cap: [0, 60] });
 SLIDERS.push({ key: 'grain', label: 'Grain', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainAmount' });
 SLIDERS.push({ key: 'grainSize', label: 'Grain size', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainSize' });
 SLIDERS.push({ key: 'gradeBalance', label: 'Balance', group: 'Color grading', ui: [-100, 100], cap: [-100, 100] });
@@ -76,6 +80,12 @@ export const LOCAL_SLIDERS = [
   { key: 'saturation', label: 'Saturation', group: 'Color', ui: [-100, 100] },
   { key: 'vibrance', label: 'Vibrance', group: 'Color', ui: [-100, 100] },
 ];
+for (const b of BANDS) {
+  const B = b[0].toUpperCase() + b.slice(1);
+  LOCAL_SLIDERS.push({ key: `hue_${b}`, label: `${B} hue`, group: 'HSL hue', ui: [-50, 50] });
+  LOCAL_SLIDERS.push({ key: `sat_${b}`, label: `${B} sat`, group: 'HSL saturation', ui: [-50, 50] });
+  LOCAL_SLIDERS.push({ key: `lum_${b}`, label: `${B} lum`, group: 'HSL luminance', ui: [-50, 50] });
+}
 export const LOCAL_WHEEL_KEYS = ['shadowHue', 'shadowSat', 'midtoneHue', 'midtoneSat', 'highlightHue', 'highlightSat'];
 const ZONES3 = ['shadow', 'midtone', 'highlight'];
 
@@ -89,7 +99,7 @@ function wheelAB(hue, sat) {
 export function localActive(loc) {
   if (!loc) return false;
   for (const s of LOCAL_SLIDERS) if (loc[s.key]) return true;
-  return ZONES3.some((z) => loc[`${z}Sat`]);
+  return ZONES3.some((z) => loc[`${z}Sat`]) || CURVE_KEYS.some((k) => !isIdentityCurve(loc[k]));
 }
 /** Does the edit treat subject and background differently? */
 export function hasLocal(p) { return !!(p && p.local && (localActive(p.local.subject) || localActive(p.local.background))); }
@@ -112,6 +122,8 @@ export function withLocal(p, loc) {
       return [a + c, b + d];
     });
   }
+  for (const k of CURVE_KEYS) if (!isIdentityCurve(loc[k])) q[`${k}Local`] = loc[k];
+  q.curveLocalAmount = loc.curveAmount ?? 100;
   return q;
 }
 export function regionParams(p) {
@@ -121,6 +133,7 @@ export function regionParams(p) {
 export function defaultParams() {
   const p = {};
   for (const s of SLIDERS) p[s.key] = 0;
+  p.curveSaturation = 100;
   return p;
 }
 
@@ -131,6 +144,7 @@ export function clampParams(p, useCap = false) {
     if (s.hue) o[s.key] = ((o[s.key] % 360) + 360) % 360;
     else o[s.key] = Math.min(hi, Math.max(lo, o[s.key] ?? 0));
   }
+  o.curveSaturation = Math.min(200, Math.max(0, o.curveSaturation ?? 100));
   return o;
 }
 
@@ -293,7 +307,13 @@ export function compile(p) {
   const cR = !isIdentityCurve(p.curveR) ? curveLUT(p.curveR) : null;
   const cG = !isIdentityCurve(p.curveG) ? curveLUT(p.curveG) : null;
   const cB = !isIdentityCurve(p.curveB) ? curveLUT(p.curveB) : null;
-  const anyCurve = cM || cR || cG || cB;
+  const lcM = !isIdentityCurve(p.curveLocal) ? curveLUT(p.curveLocal) : null;
+  const lcR = !isIdentityCurve(p.curveRLocal) ? curveLUT(p.curveRLocal) : null;
+  const lcG = !isIdentityCurve(p.curveGLocal) ? curveLUT(p.curveGLocal) : null;
+  const lcB = !isIdentityCurve(p.curveBLocal) ? curveLUT(p.curveBLocal) : null;
+  const localCurveAmount = Math.min(1, Math.max(0, (p.curveLocalAmount ?? 100) / 100));
+  const anyCurve = cM || cR || cG || cB || (localCurveAmount > 0 && (lcM || lcR || lcG || lcB));
+  const curveSaturation = Math.min(2, Math.max(0, (p.curveSaturation ?? 100) / 100));
 
   const G = 30; // Lab units at 100% grading saturation
   const zones = p._gradeAB ? p._gradeAB.map(([u, v]) => [u * G / 100, v * G / 100]) : ['shadow', 'midtone', 'highlight'].map((z) => {
@@ -347,18 +367,35 @@ export function compile(p) {
     if (Y > 1e-6) { const k = Y1 / Y; r *= k; g *= k; b *= k; }
     else { r = g = b = Y1; }
 
+    let curveBaseChroma = null;
     if (anyCurve) {
+      if (curveSaturation !== 1) {
+        linToLab(Math.min(1, Math.max(0, r)), Math.min(1, Math.max(0, g)), Math.min(1, Math.max(0, b)), lab);
+        curveBaseChroma = Math.hypot(lab[1], lab[2]);
+      }
       let sr = linearToSrgb(Math.min(1, r)), sg = linearToSrgb(Math.min(1, g)), sb = linearToSrgb(Math.min(1, b));
       if (cM) { sr = lookup(cM, sr); sg = lookup(cM, sg); sb = lookup(cM, sb); }
       if (cR) sr = lookup(cR, sr);
       if (cG) sg = lookup(cG, sg);
       if (cB) sb = lookup(cB, sb);
+      if (lcM && localCurveAmount) {
+        sr += (lookup(lcM, sr) - sr) * localCurveAmount;
+        sg += (lookup(lcM, sg) - sg) * localCurveAmount;
+        sb += (lookup(lcM, sb) - sb) * localCurveAmount;
+      }
+      if (lcR && localCurveAmount) sr += (lookup(lcR, sr) - sr) * localCurveAmount;
+      if (lcG && localCurveAmount) sg += (lookup(lcG, sg) - sg) * localCurveAmount;
+      if (lcB && localCurveAmount) sb += (lookup(lcB, sb) - sb) * localCurveAmount;
       r = srgbToLinear(sr); g = srgbToLinear(sg); b = srgbToLinear(sb);
     }
 
     linToLab(r, g, b, lab);
     let L = lab[0], A = lab[1], B = lab[2];
     let C = Math.hypot(A, B);
+    if (curveBaseChroma != null && C > 1e-6) {
+      const wanted = Math.max(0, curveBaseChroma + (C - curveBaseChroma) * curveSaturation);
+      A *= wanted / C; B *= wanted / C; C = wanted;
+    }
 
     if (anyHsl && C > 0.5) {
       const h = rgbHue(linearToSrgb(r), linearToSrgb(g), linearToSrgb(b));
@@ -561,7 +598,53 @@ export function applyLUTs(luts, mask, src, dst, count, chIn = 4, chOut = 4, seed
 }
 
 // ---- finish pass (position-dependent) -------------------------------------------------------
-export function hasSpatialFinish(p) { return !!(p.vignette || p.grain); }
+export function halationRadius(width, height) { return Math.max(2, Math.min(64, Math.round(Math.min(width, height) * 0.018))); }
+
+/** Warm light glow from bright sources. The reference matcher supplies a restrained amount only when
+ * its uploaded look contains isolated highlights with a brighter near ring than outer ring. */
+export function applyHalation(buf, width, rows, amount, y0 = 0, fullW = width, fullH = rows, radius = halationRadius(fullW, fullH), ch = 4) {
+  const strength = Math.max(0, Math.min(1, (amount || 0) / 100));
+  if (!strength || width < 1 || rows < 1) return;
+  radius = Math.max(1, Math.min(64, Math.round(radius)));
+  const n = width * rows, bright = new Float32Array(n), horizontal = new Float32Array(n), glow = new Float32Array(n);
+  for (let i = 0, o = 0; i < n; i++, o += ch) {
+    const Y = 0.2126 * S2L[buf[o]] + 0.7152 * S2L[buf[o + 1]] + 0.0722 * S2L[buf[o + 2]];
+    bright[i] = smoothstep(0.58, 0.96, Y);
+  }
+  const win = radius * 2 + 1;
+  for (let y = 0; y < rows; y++) {
+    const row = y * width;
+    let sum = 0;
+    for (let x = 0; x <= radius && x < width; x++) sum += bright[row + x];
+    for (let x = 0; x < width; x++) {
+      horizontal[row + x] = sum / win;
+      if (x - radius >= 0) sum -= bright[row + x - radius];
+      if (x + radius + 1 < width) sum += bright[row + x + radius + 1];
+    }
+  }
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    for (let y = 0; y <= radius && y < rows; y++) sum += horizontal[y * width + x];
+    for (let y = 0; y < rows; y++) {
+      const i = y * width + x;
+      glow[i] = Math.min(0.32, sum / win * radius * radius * 0.9);
+      if (y - radius >= 0) sum -= horizontal[(y - radius) * width + x];
+      if (y + radius + 1 < rows) sum += horizontal[(y + radius + 1) * width + x];
+    }
+  }
+  for (let i = 0, o = 0; i < n; i++, o += ch) {
+    const g = glow[i] * strength;
+    if (g < 1e-5) continue;
+    const r = S2L[buf[o]] + (1 - S2L[buf[o]]) * g * 0.18;
+    const gg = S2L[buf[o + 1]] + (1 - S2L[buf[o + 1]]) * g * 0.055;
+    const b = S2L[buf[o + 2]] + (1 - S2L[buf[o + 2]]) * g * 0.018;
+    buf[o] = Math.round(linearToSrgb(Math.min(1, r)) * 255);
+    buf[o + 1] = Math.round(linearToSrgb(Math.min(1, gg)) * 255);
+    buf[o + 2] = Math.round(linearToSrgb(Math.min(1, b)) * 255);
+  }
+}
+
+export function hasSpatialFinish(p) { return !!(p.vignette || p.grain || p.halation); }
 
 const S2L = new Float32Array(256);
 for (let i = 0; i < 256; i++) S2L[i] = srgbToLinear(i / 255);
@@ -620,6 +703,7 @@ export function renderImage(img, p, N = 33, mask = null) {
   const ch = img.channels || 4;
   const out = new Uint8Array(img.width * img.height * ch);
   applyLUTs(luts, mask, img.data, out, img.width * img.height, ch, ch);
+  if (p.halation) applyHalation(out, img.width, img.height, p.halation, 0, img.width, img.height, undefined, ch);
   if (hasSpatialFinish(p)) applyFinish(out, img.width, img.height, p, 0, img.width, img.height, 7, ch);
   return { width: img.width, height: img.height, channels: ch, data: out };
 }

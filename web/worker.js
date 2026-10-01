@@ -1,10 +1,10 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
-import { prepare, measure, regionStats, regionUsable } from './engine/measure.js';
+import { prepare, measure, regionStats, regionUsable, halationSignature } from './engine/measure.js';
 import { solve, solvePreset } from './engine/solver.js';
 import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
-import { fitRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
+import { fitRegions, fitReferenceRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
 import { signature, nearestRegions } from './engine/style.js';
-import { compile, buildLUTs, applyLUTs, applyFinish, hasSpatialFinish, hasLocal, processPixelSet, SLIDERS, LOCAL_SLIDERS, REGIONS } from './engine/pipeline.js';
+import { compile, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, curveLUT, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
 import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
@@ -17,7 +17,8 @@ import { personMask, tapMask, maskCanvasSize, segmenter } from './segment.js';
 import { visionErrors, LOADER, WASM, MP_BUILD } from './mp.js';
 import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
-import { srgbToLinear } from './engine/color.js';
+import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
+import { stylizeRemote } from './lib/deeppreset.js';
 
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
@@ -269,6 +270,7 @@ function renderInto(src, params, mask = null, skin = null, heals = null) {
   if (heals && heals.length) { data = Uint8ClampedArray.from(src.data); healBuffer(data, src.width, src.height, heals); }
   applyLUTs(luts, mask, data, out, src.width * src.height, 4, 4);
   if (skin && hasSkinPass(params)) applySkinPass(out, src.width, src.height, params, skin, Math.max(src.width, src.height));
+  if (params.halation) applyHalation(out, src.width, src.height, params.halation);
   if (hasSpatialFinish(params)) applyFinish(out, src.width, src.height, params);
   return { width: src.width, height: src.height, data: out };
 }
@@ -387,6 +389,84 @@ function cullInfo(e, bmp) {
   return { faces, focus, eyes, sig: sceneSig(small.data, small.width, small.height) };
 }
 
+// Auto Adjust curves, fitted to the photo as it looks after the rest of its edit (with the basic
+// tone correction, without curves). Light curve: black and white points from the luminance range,
+// the median pulled toward middle grey, the quartiles spread toward normal contrast (or eased off
+// when the photo is already punchy), with no stretch steeper or flatter than AUTO_SLOPE.
+// R/G/B curves: line each channel's dark, middle and bright levels up with the other two on the
+// photo's least colourful pixels, which takes out a cast. When even those pixels are strongly
+// coloured (a wood floor under tungsten, a sunset) the colour is the scene, so the correction fades,
+// and a warm cast is only partly taken out (warm light usually reads as intended).
+const AUTO_MID = 118, AUTO_QSPREAD = 92, AUTO_RGB_MAX = 18, AUTO_SLOPE = [0.5, 1.8];
+const AUTO_GREY_FRAC = 0.15, AUTO_GREY_C = [10, 26], AUTO_WARM_KEEP = 0.4;
+function autoCurves(ps, params) {
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const cur = processPixelSet(ps, params);
+  const n = ps.n;
+  const usable = (i) => cur.L[i] > 12 && cur.L[i] < 95;
+  const chroma = new Uint32Array(101);
+  let nu = 0;
+  for (let i = 0; i < n; i++) if (usable(i)) { chroma[Math.min(100, Math.round(Math.hypot(cur.A[i], cur.B[i])))]++; nu++; }
+  let greyC = 100;
+  for (let c = 0, acc = 0; c <= 100; c++) { acc += chroma[c]; if (acc >= nu * AUTO_GREY_FRAC) { greyC = c; break; } }
+  const hist = () => [0, 1, 2].map(() => new Uint32Array(256));
+  const lum = new Uint32Array(256), neu = hist();
+  const v8 = (x) => Math.round(255 * linearToSrgb(clamp(x, 0, 1)));
+  let nn = 0, sa = 0, sb = 0;
+  for (let i = 0; i < n; i++) {
+    lum[v8(0.2126729 * cur.lr[i] + 0.7151522 * cur.lg[i] + 0.072175 * cur.lb[i])]++;
+    if (usable(i) && Math.hypot(cur.A[i], cur.B[i]) <= greyC) { neu[0][v8(cur.lr[i])]++; neu[1][v8(cur.lg[i])]++; neu[2][v8(cur.lb[i])]++; nn++; sa += cur.A[i]; sb += cur.B[i]; }
+  }
+  const pct = (h, total, q) => {
+    const want = q * total;
+    let acc = 0;
+    for (let v = 0; v < 256; v++) { acc += h[v]; if (acc >= want) return v; }
+    return 255;
+  };
+
+  const lo = pct(lum, n, 0.003), hi = pct(lum, n, 0.997);
+  const bx = Math.round(clamp(lo - 2, 0, 24)), wx = Math.round(clamp(hi + 2, 230, 255));
+  const st = (v) => clamp((v - bx) / (wx - bx) * 255, 0, 255);
+  const q25 = pct(lum, n, 0.25), q50 = pct(lum, n, 0.5), q75 = pct(lum, n, 0.75);
+  const ym = st(q50) + clamp((AUTO_MID - st(q50)) * 0.5, -18, 18);
+  const push = clamp((AUTO_QSPREAD - (st(q75) - st(q25))) * 0.3, -8, 14);
+  // Place the midpoint first, then the quartiles around it, each kept inside AUTO_SLOPE of the
+  // points already placed on either side (a quartile that can't fit is left out). The midpoint
+  // wins, so contrast never undoes the brightness correction.
+  const [sLo, sHi] = AUTO_SLOPE;
+  const curve = [[bx, 0], [wx, 255]];
+  const place = (x, y) => {
+    const j = curve.findIndex((q) => q[0] > x);
+    if (j < 1) return;
+    const [x0, y0] = curve[j - 1], [x1, y1] = curve[j];
+    if (x - x0 < 12 || x1 - x < 12) return;
+    const lo = Math.max(y0 + sLo * (x - x0), y1 - sHi * (x1 - x)), hi = Math.min(y0 + sHi * (x - x0), y1 - sLo * (x1 - x));
+    if (lo <= hi) curve.splice(j, 0, [x, Math.round(clamp(y, lo, hi))]);
+  };
+  place(q50, ym);
+  place(q25, st(q25) - push);
+  place(q75, st(q75) + push);
+
+  // channel curves sit after the light curve, so measure through it (percentiles survive a monotone map)
+  const M = curveLUT(curve);
+  const lit = (v) => 255 * M[Math.round(v / 255 * 1023)];
+  const warm = nn && sb / nn > 0 && sa / nn > -2;
+  const k = nn >= n * 0.02 ? 0.8 * clamp((AUTO_GREY_C[1] - greyC) / (AUTO_GREY_C[1] - AUTO_GREY_C[0]), 0, 1) * (warm ? 1 - AUTO_WARM_KEEP : 1) : 0;
+  const anchors = [0.05, 0.5, 0.95].map((q) => neu.map((h) => lit(pct(h, nn, q))));
+  const [curveR, curveG, curveB] = [0, 1, 2].map((c) => {
+    const pts = [[0, 0]];
+    for (const a of anchors) {
+      const x = Math.round(a[c]), [px, py] = pts[pts.length - 1];
+      const d = clamp(((a[0] + a[1] + a[2]) / 3 - a[c]) * k, -AUTO_RGB_MAX, AUTO_RGB_MAX);
+      if (Math.abs(d) < 1.5 || x < 10 || x > 245 || x - px < 16) continue;
+      pts.push([x, Math.round(clamp(x + d, py + 4, 251))]);
+    }
+    pts.push([255, 255]);
+    return pts;
+  });
+  return { curve, curveR, curveG, curveB };
+}
+
 const handlers = {
   async measureRef({ file }) {
     const e = { file };
@@ -395,6 +475,7 @@ const handlers = {
     const stats = measure(e.ps);
     stats.scene = e.scene;
     stats.regions = regionStats(e.ps);
+    stats.signature = { halation: halationSignature(e.ps) };
     const thumb = await toJpegBlob(scaledData(bmp, 480), 0.85);
     bmp.close();
     return { stats, thumb, converted: e.converted || null };
@@ -491,6 +572,35 @@ const handlers = {
     return { L: acc[0] / n, a: acc[1] / n, b: acc[2] / n };
   },
 
+  // Tone-curve picker: sample the displayed point after the other settings, but before the selected curve.
+  async sampleCurve({ id, x, y, params, curveKey, region = 'all', side = 1200 }) {
+    if (!['curve', 'curveR', 'curveG', 'curveB'].includes(curveKey)) throw new Error('Unknown tone curve');
+    const d = await ensureDisplay(id, side, false);
+    const X = Math.round(x * (d.width - 1)), Y = Math.round(y * (d.height - 1)), rad = Math.max(2, Math.round(d.width / 250));
+    let q;
+    if (region === 'all') {
+      q = { ...params };
+      delete q[curveKey];
+    } else {
+      const loc = { ...((params.local && params.local[region]) || {}) };
+      delete loc[curveKey];
+      q = withLocal(params, loc);
+    }
+    const proc = compile(q), res = new Float64Array(6);
+    let total = 0, n = 0;
+    const ch = curveKey === 'curveR' ? 0 : curveKey === 'curveG' ? 1 : curveKey === 'curveB' ? 2 : -1;
+    for (let j = -rad; j <= rad; j++) for (let i = -rad; i <= rad; i++) {
+      const u = X + i, v = Y + j;
+      if (u < 0 || v < 0 || u >= d.width || v >= d.height) continue;
+      const o = (v * d.width + u) * 4;
+      proc(srgbToLinear(d.data[o] / 255), srgbToLinear(d.data[o + 1] / 255), srgbToLinear(d.data[o + 2] / 255), res);
+      total += ch < 0 ? linearToSrgb(lToY(res[3])) : linearToSrgb(res[ch]);
+      n++;
+    }
+    if (!n) throw new Error('That spot is outside the photo');
+    return { value: Math.round(Math.min(1, Math.max(0, total / n)) * 255) };
+  },
+
   // crop/level for one photo; everything measured afterwards (solve, loss checks) sees only the crop
   async setGeom({ id, geom }) {
     const e = cache.get(id);
@@ -512,12 +622,50 @@ const handlers = {
     return autoLevel(gray, d.width, d.height);
   },
 
-  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true }) {
+  // Correct only measured problems; Auto Adjust is a starting correction, not a look. The basic
+  // sliders stay gentle and the curves do the work: autoCurves fits the light curve and the R/G/B
+  // curves to this photo as edited so far (white balance, HSL, local edits), minus its old curves.
+  async autoAdjust({ id, params = {} }) {
+    const e = await ensurePrepared(id);
+    const s = measure(e.ps), t = s.tone, p = t.pct;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const exposure = clamp(Math.log2(lToY(47) / Math.max(0.0001, lToY(p[50]))) * 0.24, -0.35, 0.35);
+    const highlights = clamp(-(p[99] - 94) * 0.22 - (t.clipHi > 0.002 ? 3 : 0), -10, 0);
+    const shadows = clamp((5 - p[5]) * 0.22 + (t.clipLo > 0.002 ? 3 : 0), 0, 7);
+    const basic = { exposure, contrast: 0, highlights, shadows, whites: 0, blacks: 0 };
+    const curves = autoCurves(e.ps, { ...params, ...basic, curve: null, curveR: null, curveG: null, curveB: null });
+    return { ...basic, ...curves };
+  },
+
+  // modelUrl + refThumb (the reference's saved thumbnail) turn on model assist: the Deep Preset Space
+  // restyles this photo toward the reference, and the solver then chases that result's measured
+  // targets instead of the reference's own. Any failure falls back to the plain reference targets.
+  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true, modelUrl = null, refThumb = null }) {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
+    let model = null;
+    if (modelUrl && refThumb && refStats && !lrParams) {
+      try {
+        const src = await openBitmap(e, id);
+        const d = scaledData(src, SOLVE_SIDE, e.geom);
+        src.close();
+        const ref = await (await fetch(refThumb)).blob();
+        const out = await stylizeRemote(modelUrl, await toJpegBlob(d, 0.92), ref);
+        const bmp = await createImageBitmap(out);
+        const r = scaledData(bmp, SOLVE_SIDE);
+        bmp.close();
+        if (r.width !== e.ps.width || r.height !== e.ps.height) throw new Error('Model returned a different size');
+        const ps = prepare(r, { faces: mapPolys(e.faces, e.fullW, e.fullH, e.geom), subject: maskFor(e, r.width, r.height, e.geom) });
+        refStats = { ...measure(ps), scene: refStats.scene, regions: refStats.regions, signature: refStats.signature };
+        model = { ok: true };
+      } catch (err) { model = { ok: false, error: err.message }; }
+    }
     const res = lrParams
       ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene, pull })
       : solve(e.ps, o, refStats, { strength, scene: e.scene });
+    if (!lrParams && refStats && refStats.signature && refStats.signature.halation > 0) {
+      res.params.halation = Math.round(Math.min(60, refStats.signature.halation * Math.min(1, strength)));
+    }
     let style = null;
     const prof = finish && finish !== 'off' ? FINISH_PROFILES[finish] : null;
     if (prof) {
@@ -536,14 +684,16 @@ const handlers = {
         want = refStats.regions; move = REF_REGION.move * Math.min(1, strength); from = { kind: 'reference' };
       }
       if (want && move > 0) {
-        const r = fitRegions(e.ps, res.params, want, from && from.kind === 'reference' ? { ...REF_REGION, move } : { move });
+        const r = from && from.kind === 'reference' && want.subject && want.subject.tone && want.background && want.background.bands
+          ? fitReferenceRegions(e.ps, res.params, want, { ...REF_REGION, move })
+          : fitRegions(e.ps, res.params, want, from && from.kind === 'reference' ? { ...REF_REGION, move } : { move });
         if (r) { res.params = r.params; regions = { ...r.regions, from }; }
       }
     }
     const cur = processPixelSet(e.ps, res.params);
     const after = measure(e.ps, cur);
     const loss = lossReport(e.ps, cur, res.params);
-    return { params: res.params, targets: res.targets, before: o, after, loss, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
+    return { model, params: res.params, targets: res.targets, before: o, after, loss, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
   },
 
   async measureParams({ id, params, auto = null }) {
@@ -606,7 +756,8 @@ const handlers = {
     // the skin pass blurs, so each band is rendered with `halo` rows of context above and below
     const long = Math.max(OW, OH);
     const skinOn = hasSkinPass(params) && e.mask && e.mask.skinFrac >= 0.0005;
-    const halo = skinOn ? skinHalo(long) : 0;
+    const glowHalo = params.halation ? halationRadius(OW, OH) : 0;
+    const halo = Math.max(skinOn ? skinHalo(long) : 0, glowHalo);
     // tiles keep each canvas well under iOS Safari's ~16.7 MP canvas limit
     const tileH = Math.max(64, Math.min(OH, Math.floor(4_000_000 / OW) - 2 * halo));
     const [c, x] = canvas(OW, Math.min(OH, tileH + 2 * halo));
@@ -623,7 +774,8 @@ const handlers = {
       else {
         const tmp = new Uint8ClampedArray(OW * hh * 4);
         applyLUTs(luts, masked ? maskFor(e, OW, hh, g, ya, 1) : null, d, tmp, OW * hh, 4, 4, 1 + ya);
-        applySkinPass(tmp, OW, hh, params, maskFor(e, OW, hh, g, ya, 1, 'skin'), long, 4, y - ya, y - ya + h);
+        if (skinOn) applySkinPass(tmp, OW, hh, params, maskFor(e, OW, hh, g, ya, 1, 'skin'), long, 4, y - ya, y - ya + h);
+        if (params.halation) applyHalation(tmp, OW, hh, params.halation, ya, OW, OH, glowHalo);
         band.set(tmp.subarray((y - ya) * OW * 4, (y - ya + h) * OW * 4));
       }
       if (hasSpatialFinish(params)) applyFinish(band, OW, h, params, y, OW, OH);
