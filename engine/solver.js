@@ -80,9 +80,9 @@ export function lm(fn, x0, lo, hi, { iters = 25, h = null, lambda0 = 1e-2 } = {}
 const hinge = (v, lo, hi) => (v < lo ? lo - v : v > hi ? v - hi : 0);
 
 // How much of the reference's tone shape to copy, by percentile. The ends (black point, white point,
-// fades, crushed or rolled-off highlights) are mostly the edit; the middle of the histogram is mostly
-// what was in the scene, so copying it makes this photo's content look like the reference's content.
-export const TONE_SHAPE = { 1: 1, 5: 0.5, 10: 0.2, 25: 0, 50: 1, 75: 0, 90: 0.2, 95: 0.5, 99: 1 };
+// fades, crushed or rolled-off highlights) receive full weight. The quarter tones receive substantial
+// reference weight while retaining some source distribution for differences in scene content.
+export const TONE_SHAPE = { 1: 1, 5: 0.5, 10: 0.2, 25: 0.75, 50: 1, 75: 0.75, 90: 0.2, 95: 0.5, 99: 1 };
 
 // Zone tints and HSL bands mix the grade with whatever colors were in the scene. Only part of the
 // measured difference is trusted as the edit (tested on tools/solver_eval.mjs).
@@ -268,6 +268,53 @@ function toneTransferCurve(p) {
   const lut = curveLUT(out, 256);
   for (let i = 1; i < lut.length; i++) if (lut[i] + 1e-5 < lut[i - 1]) return points;
   return out;
+}
+
+const RGB_CURVE_X = [64, 128, 192];
+function rgbCurvesFromOffsets(offsets, amount = 1) {
+  return ['curveR', 'curveG', 'curveB'].map((key, channel) => {
+    const ys = RGB_CURVE_X.map((x, i) => x + offsets[channel * 3 + i] * amount);
+    // Project adjacent anchors into a monotone range while retaining identity endpoints.
+    const y1 = Math.max(1, Math.min(ys[0], 253));
+    const y2 = Math.max(y1 + 1, Math.min(ys[1], 254));
+    const y3 = Math.max(y2 + 1, Math.min(ys[2], 254));
+    return [key, [[0, 0], [RGB_CURVE_X[0], y1], [RGB_CURVE_X[1], y2], [RGB_CURVE_X[2], y3], [255, 255]]];
+  });
+}
+
+function fitReferenceRgbCurves(ps, T, params, sample, current) {
+  if (T.strength <= 0) return null;
+  const base = { ...params };
+  const evaluate = (offsets, commit = false) => {
+    const curves = rgbCurvesFromOffsets(offsets);
+    const candidate = { ...base, ...Object.fromEntries(curves) };
+    processPixelSet(ps, candidate, sample, current);
+    const st = measure(ps, current, sample);
+    const residuals = [
+      (st.wb.a - T.wb.a) / 0.8 * T.wb.weight,
+      (st.wb.b - T.wb.b) / 0.8 * T.wb.weight,
+    ];
+    for (const z of ['shadows', 'midtones', 'highlights']) {
+      const target = T.zones[z], have = st.zones[z];
+      if (target && have) residuals.push((have.a - target.a) / 0.8 * target.weight, (have.b - target.b) / 0.8 * target.weight);
+    }
+    for (const q of [25, 50, 75]) residuals.push((st.tone.pct[q] - T.tone.pct[q]) / (q === 50 ? 2 : 3));
+    residuals.push(...skinResiduals(st, T));
+    residuals.push(Math.max(0, st.tone.clipHi - T.clip.hi) * 3000, Math.max(0, st.tone.clipLo - T.clip.lo) * 3000);
+    // Keep the editable channel curves close to identity unless they improve measured targets.
+    offsets.forEach((v) => residuals.push(v / 12));
+    if (commit) return { candidate, stats: st };
+    return residuals;
+  };
+  const initial = new Array(9).fill(0), bound = new Array(9).fill(16);
+  const fitted = lm((x) => evaluate(x), initial, bound.map((v) => -v), bound, { iters: 10, lambda0: 0.08 });
+  if (!fitted.x.some((v) => Math.abs(v) > 0.75)) return null;
+  const before = evaluate(initial).reduce((sum, v) => sum + v * v, 0);
+  const after = evaluate(fitted.x).reduce((sum, v) => sum + v * v, 0);
+  if (!(after < before - 1e-5)) return null;
+  const { stats } = evaluate(fitted.x, true);
+  if (stats.tone.clipHi > T.clip.hi - 0.0006 || stats.tone.clipLo > T.clip.lo - 0.0006) return null;
+  return { curves: Object.fromEntries(rgbCurvesFromOffsets(fitted.x)), evals: fitted.evals };
 }
 
 // ---------------- main entry ----------------------------------------------------------------------
@@ -496,31 +543,38 @@ export function solve(ps, o, ref, opts = {}) {
   // chroma of colored pixels; the reference's color targets still decide the final WB/HSL/grade.
   const tCurve0 = performance.now();
   let rCurveColor = null;
+  let rgbCurveEvals = 0;
   const matchedCurve = toneTransferCurve(params);
   params.curveAuto = 'reference';
   if (!isIdentityCurve(matchedCurve)) {
     params.curve = matchedCurve;
     for (const k of TONE_KEYS) if (k !== 'exposure') params[k] = 0;
     rCurveColor = colorStage(Math.min(6, opts.colorIters ?? 10));
+  }
 
-    // Curves can move a few saturated pixels closer to clipping than the parametric tone map.
-    // If so, blend only the generated curve back toward identity until the existing clip budget holds.
-    const blendCurve = (amount) => matchedCurve.map(([x, y]) => [x, Math.round(x + (y - x) * amount)]);
-    if (over(clipOf(params))) {
-      const identity = blendCurve(0);
-      if (over(clipOf({ ...params, curve: identity }))) {
-        params.curve = identity;
-        guardK = Math.min(guardK, 0.999);
-      } else {
-        let keep = 0, cut = 1;
-        for (let it = 0; it < 8; it++) {
-          const amount = (keep + cut) / 2;
-          if (over(clipOf({ ...params, curve: blendCurve(amount) }))) cut = amount;
-          else keep = amount;
-        }
-        params.curve = blendCurve(keep);
-        guardK = Math.min(guardK, keep);
+  const rgbFit = fitReferenceRgbCurves(ps, T, params, sampleIdx(ps.n, 7000, null, 47), cur);
+  if (rgbFit) { Object.assign(params, rgbFit.curves); rgbCurveEvals = rgbFit.evals; }
+
+  // Curves can move a few saturated pixels closer to clipping. Attenuate generated master and RGB
+  // curves together until the existing clip budget holds.
+  const blendCurve = (amount) => matchedCurve.map(([x, y]) => [x, Math.round(x + (y - x) * amount)]);
+  const blendRgb = (amount) => Object.fromEntries(['curveR', 'curveG', 'curveB'].map((key) => [
+    key, (params[key] || [[0, 0], [255, 255]]).map(([x, y]) => [x, Math.round(x + (y - x) * amount)]),
+  ]));
+  const blendAll = (amount) => ({ ...params, curve: blendCurve(amount), ...blendRgb(amount) });
+  if ((!isIdentityCurve(matchedCurve) || rgbFit) && over(clipOf(params))) {
+    if (over(clipOf(blendAll(0)))) {
+      Object.assign(params, blendAll(0));
+      guardK = Math.min(guardK, 0.999);
+    } else {
+      let lo = 0, hi = 1;
+      for (let it = 0; it < 8; it++) {
+        const amount = (lo + hi) / 2;
+        if (over(clipOf(blendAll(amount)))) hi = amount;
+        else lo = amount;
       }
+      Object.assign(params, blendAll(lo));
+      guardK = Math.min(guardK, lo);
     }
   }
   const tF = performance.now();
@@ -530,7 +584,7 @@ export function solve(ps, o, ref, opts = {}) {
     params: final,
     targets: T,
     guardScale: guardK,
-    timings: { tone: tB - tA, wb: tC - tB, color: tD - tC, touchup: tE - tD, curves: tF - tCurve0, total: tF - t0, evals: rA.evals + rB.evals + rC.evals + (rCurveColor?.evals || 0) },
+    timings: { tone: tB - tA, wb: tC - tB, color: tD - tC, touchup: tE - tD, curves: tF - tCurve0, total: tF - t0, evals: rA.evals + rB.evals + rC.evals + (rCurveColor?.evals || 0) + rgbCurveEvals },
   };
 }
 

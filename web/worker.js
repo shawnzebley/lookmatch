@@ -1,6 +1,8 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
 import { prepare, measure, regionStats, regionUsable, halationSignature } from './engine/measure.js';
 import { solve, solvePreset } from './engine/solver.js';
+import { referenceRegionTargets, solveMaskedReference } from './engine/masked-reference.js';
+import { fitSkinMatch, applySkinMatchRGBA } from './engine/skin-match.js';
 import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
 import { fitRegions, fitReferenceRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
 import { signature, nearestRegions } from './engine/style.js';
@@ -19,6 +21,7 @@ import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
 import { stylizeRemote } from './lib/deeppreset.js';
+import { autoAdjustResult, hasReferenceCurve } from './engine/auto-adjust.js';
 
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
@@ -232,7 +235,7 @@ async function analyze(e, bmp) {
   }
   e.fullW = bmp.width; e.fullH = bmp.height;
   const d = scaledData(bmp, SOLVE_SIDE, e.geom);
-  e.ps = prepare(d, { faces: mapPolys(e.faces, bmp.width, bmp.height, e.geom), subject: maskFor(e, d.width, d.height, e.geom) });
+  e.ps = prepare(d, { faces: mapPolys(e.faces, bmp.width, bmp.height, e.geom), subject: maskFor(e, d.width, d.height, e.geom), skin: maskFor(e, d.width, d.height, e.geom, 0, null, 'skin') });
 }
 
 async function ensurePrepared(id) {
@@ -269,6 +272,7 @@ function renderInto(src, params, mask = null, skin = null, heals = null) {
   let data = src.data;
   if (heals && heals.length) { data = Uint8ClampedArray.from(src.data); healBuffer(data, src.width, src.height, heals); }
   applyLUTs(luts, mask, data, out, src.width * src.height, 4, 4);
+  if (skin && params.skinMatch) applySkinMatchRGBA(out, params.skinMatch, skin);
   if (skin && hasSkinPass(params)) applySkinPass(out, src.width, src.height, params, skin, Math.max(src.width, src.height));
   if (params.halation) applyHalation(out, src.width, src.height, params.halation);
   if (hasSpatialFinish(params)) applyFinish(out, src.width, src.height, params);
@@ -475,6 +479,8 @@ const handlers = {
     const stats = measure(e.ps);
     stats.scene = e.scene;
     stats.regions = regionStats(e.ps);
+    stats.maskedRegions = referenceRegionTargets(e.ps);
+    stats.matchVersion = 1;
     stats.signature = { halation: halationSignature(e.ps) };
     const thumb = await toJpegBlob(scaledData(bmp, 480), 0.85);
     bmp.close();
@@ -626,6 +632,9 @@ const handlers = {
   // sliders stay gentle and the curves do the work: autoCurves fits the light curve and the R/G/B
   // curves to this photo as edited so far (white balance, HSL, local edits), minus its old curves.
   async autoAdjust({ id, params = {} }) {
+    if (hasReferenceCurve(params)) {
+      return autoAdjustResult(params);
+    }
     const e = await ensurePrepared(id);
     const s = measure(e.ps), t = s.tone, p = t.pct;
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -634,7 +643,7 @@ const handlers = {
     const shadows = clamp((5 - p[5]) * 0.22 + (t.clipLo > 0.002 ? 3 : 0), 0, 7);
     const basic = { exposure, contrast: 0, highlights, shadows, whites: 0, blacks: 0 };
     const curves = autoCurves(e.ps, { ...params, ...basic, curve: null, curveR: null, curveG: null, curveB: null });
-    return { ...basic, ...curves };
+    return autoAdjustResult(params, { ...basic, ...curves });
   },
 
   // modelUrl + refThumb (the reference's saved thumbnail) turn on model assist: the Deep Preset Space
@@ -655,14 +664,22 @@ const handlers = {
         const r = scaledData(bmp, SOLVE_SIDE);
         bmp.close();
         if (r.width !== e.ps.width || r.height !== e.ps.height) throw new Error('Model returned a different size');
-        const ps = prepare(r, { faces: mapPolys(e.faces, e.fullW, e.fullH, e.geom), subject: maskFor(e, r.width, r.height, e.geom) });
-        refStats = { ...measure(ps), scene: refStats.scene, regions: refStats.regions, signature: refStats.signature };
+        const ps = prepare(r, { faces: mapPolys(e.faces, e.fullW, e.fullH, e.geom), subject: maskFor(e, r.width, r.height, e.geom), skin: maskFor(e, r.width, r.height, e.geom, 0, null, 'skin') });
+        refStats = { ...measure(ps), maskedRegions: referenceRegionTargets(ps), scene: refStats.scene, regions: refStats.regions, signature: refStats.signature };
         model = { ok: true };
       } catch (err) { model = { ok: false, error: err.message }; }
     }
-    const res = lrParams
+    // Masks are ready before fitting. Each region follows its own reference instead of correcting
+    // a whole-photo match afterwards; missing masks retain the whole-photo fallback.
+    const masked = !lrParams && split && refStats ? solveMaskedReference(e.ps, refStats, { strength, scene: e.scene }) : null;
+    const res = masked || (lrParams
       ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene, pull })
-      : solve(e.ps, o, refStats, { strength, scene: e.scene });
+      : solve(e.ps, o, refStats, { strength, scene: e.scene }));
+    // Skin has its own measured color and brightness target inside the subject, before finishes.
+    if (!lrParams && refStats?.skinMatch) {
+      const match = fitSkinMatch(e.ps, processPixelSet(e.ps, res.params), refStats.skinMatch, { move: Math.min(1, strength ?? 1) * 0.65 });
+      if (match) res.params.skinMatch = match;
+    }
     if (!lrParams && refStats && refStats.signature && refStats.signature.halation > 0) {
       res.params.halation = Math.round(Math.min(60, refStats.signature.halation * Math.min(1, strength)));
     }
@@ -673,8 +690,8 @@ const handlers = {
       res.params = f.params; style = f.style;
     }
     // subject vs background: the photographer's similar published photos, else the reference's own split
-    let regions = null;
-    if (split && e.ps.subject) {
+    let regions = masked?.regions || null;
+    if (!masked && split && e.ps.subject) {
       let want = null, move = REGION_MOVE, from = null;
       if (prof && prof.data) {
         want = nearestRegions(prof.data, signature(e.ps.L, e.ps.A, e.ps.B, e.ps.width, e.ps.height), !(style && style.mono));
@@ -727,7 +744,7 @@ const handlers = {
       mask = d.mask;
     }
     let skin = null, heals = null;
-    if (hasSkinPass(params) && e.mask) {
+    if ((hasSkinPass(params) || params.skinMatch) && e.mask) {
       const key = `${e.mask.ver}`;
       if (d.skinKey !== key) { d.skin = maskFor(e, d.width, d.height, plain ? null : e.geom, 0, null, 'skin'); d.skinKey = key; }
       skin = d.skin;
@@ -770,10 +787,14 @@ const handlers = {
       const d = x.getImageData(0, 0, OW, hh).data;
       if (healed) pasteHealed(d, OW, hh, ya, healed);
       const band = rgba.subarray(y * OW * 4, (y + h) * OW * 4);
-      if (!halo) applyLUTs(luts, masked ? maskFor(e, OW, h, g, y, 1) : null, d, band, OW * h, 4, 4, 1 + y);
+      if (!halo) {
+        applyLUTs(luts, masked ? maskFor(e, OW, h, g, y, 1) : null, d, band, OW * h, 4, 4, 1 + y);
+        if (params.skinMatch) applySkinMatchRGBA(band, params.skinMatch, maskFor(e, OW, h, g, y, 1, 'skin'));
+      }
       else {
         const tmp = new Uint8ClampedArray(OW * hh * 4);
         applyLUTs(luts, masked ? maskFor(e, OW, hh, g, ya, 1) : null, d, tmp, OW * hh, 4, 4, 1 + ya);
+        if (params.skinMatch) applySkinMatchRGBA(tmp, params.skinMatch, maskFor(e, OW, hh, g, ya, 1, 'skin'));
         if (skinOn) applySkinPass(tmp, OW, hh, params, maskFor(e, OW, hh, g, ya, 1, 'skin'), long, 4, y - ya, y - ya + h);
         if (params.halation) applyHalation(tmp, OW, hh, params.halation, ya, OW, OH, glowHalo);
         band.set(tmp.subarray((y - ya) * OW * 4, (y - ya + h) * OW * 4));

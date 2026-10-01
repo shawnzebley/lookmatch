@@ -7,6 +7,7 @@
 
 import { SRGB8_TO_LIN, linearToSrgb, srgbToLinear, linToLab, labToLin, yToL, lToY, rgbHue, wheelHueToAB } from './color.js';
 import { BANDS, bandWeights, gradeWeights } from './measure.js';
+import { applySkinMatchLinear } from './skin-match.js';
 
 // ---- slider definitions ---------------------------------------------------------------
 // cap = the guardrail range the solver may use; ui = the range the user may drag to.
@@ -721,6 +722,7 @@ export function processPixelSet(ps, p, idx, cur) {
     for (let k = 0; k < N; k++) {
       const i = idx ? idx[k] : k;
       proc(ps.lr[i], ps.lg[i], ps.lb[i], res);
+      if (p.skinMatch && ps.skinMask) applySkinMatchLinear(res, p, ps.skinMask[i]);
       cur.lr[i] = res[0]; cur.lg[i] = res[1]; cur.lb[i] = res[2];
       cur.L[i] = res[3]; cur.A[i] = res[4]; cur.B[i] = res[5];
     }
@@ -742,6 +744,7 @@ export function processPixelSet(ps, p, idx, cur) {
       linToLab(res[0], res[1], res[2], lab);
       res[3] = lab[0]; res[4] = lab[1]; res[5] = lab[2];
     }
+    if (p.skinMatch && ps.skinMask) applySkinMatchLinear(res, p, ps.skinMask[i]);
     cur.lr[i] = res[0]; cur.lg[i] = res[1]; cur.lb[i] = res[2];
     cur.L[i] = res[3]; cur.A[i] = res[4]; cur.B[i] = res[5];
   }

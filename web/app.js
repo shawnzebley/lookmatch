@@ -576,13 +576,14 @@ function ensurePresetRegions(pr) {
   const measured = pr && pr.stats && pr.stats.regions;
   const current = measured && measured.subject && measured.subject.tone && measured.subject.bands
     && measured.background && measured.background.tone && measured.background.bands
-    && pr.stats.signature && Number.isFinite(pr.stats.signature.halation);
+    && pr.stats.signature && Number.isFinite(pr.stats.signature.halation) && pr.stats.matchVersion === 1;
   if (!pr || pr.lr || !pr.stats || current || !pr.thumb) return Promise.resolve();
   if (!upgrading.has(pr.id)) {
     upgrading.set(pr.id, (async () => {
       try {
         const r = await pool.call(0, 'measureRef', { file: await dataURLToBlob(pr.thumb) }, { priority: true });
         pr.stats.regions = r.stats.regions || null; pr.stats.signature = r.stats.signature || { halation: 0 };
+        pr.stats.maskedRegions = r.stats.maskedRegions; pr.stats.skinMatch = r.stats.skinMatch; pr.stats.matchVersion = 1;
       } catch (e) { pr.stats.regions = null; pr.stats.signature ||= { halation: 0 }; }
       try { await db.putPreset(pr); } catch (e) { /* stays in memory */ }
     })());
@@ -650,6 +651,8 @@ function numbersTable(p) {
     ${row('Neutral cast error (Lab)', f1(wbErr(b)), f1(wbErr(a)), '0')}
     ${row('Zone color error (Lab)', f1(zoneErr(b)), f1(zoneErr(a)), '0')}
     ${row('Mean chroma', f1(b.color.meanChroma), f1(a.color.meanChroma), `${f1(r?.color.meanChroma)} / ${f1(T.color.meanChroma)}`, false)}
+    ${a.skinMatch && r?.skinMatch ? row('Skin brightness L*', f1(b.skinMatch?.L), f1(a.skinMatch.L), f1(r.skinMatch.L), false) : ''}
+    ${a.skinMatch && r?.skinMatch ? row('Skin color a* / b*', `${f1(b.skinMatch?.a)} / ${f1(b.skinMatch?.b)}`, `${f1(a.skinMatch.a)} / ${f1(a.skinMatch.b)}`, `${f1(r.skinMatch.a)} / ${f1(r.skinMatch.b)}`, false) : ''}
     ${row('Skin hue° (lit side)', b.skin.frac > 0.005 ? `${f1(b.skin.hue)} (${f1(b.skin.litHue)})` : 'n/a', a.skin.frac > 0.005 ? `${f1(a.skin.hue)} (${f1(a.skin.litHue)})` : 'n/a', '35–64', false)}
     ${row('New clipping hi / lo %', '–', newClip, '≤ 0.10', false)}${regionRows(p)}
   </table>${p.guardScale < 0.99 ? `<p class="muted small">Edit scaled to ${Math.round(p.guardScale * 100)}% to avoid clipping.</p>` : ''}`;
@@ -692,10 +695,13 @@ function curveCardMarkup(p) {
   const status = D.tool === 'curve' ? 'Tap a tone in the photo to place a control point.' : 'Tap the graph to add a point, or pick a tone from the photo.';
   const localCurves = local ? `<div id="curveAmountRow">${sliderRow({ key: 'curveAmount', label: 'Mask curve amount', ui: [0, 100] }, localOf(p, D.region).curveAmount ?? 100)}</div>` : '';
   const curveSat = sliderRow(CURVE_SATURATION, p.params.curveSaturation ?? 100, 100);
+  const regionalReference = p.regions?.referenceStyle?.regionCurves;
   const fittedReferenceCurve = local
-    ? D.curveChannel === 'curve' && localOf(p, D.region).curveAuto === 'reference'
-    : D.curveChannel === 'curve' && p.params.curveAuto === 'reference';
-  const curveMatchNote = fittedReferenceCurve
+    ? localOf(p, D.region).curveAuto === 'reference'
+    : p.params.curveAuto === 'reference';
+  const curveMatchNote = !local && regionalReference
+    ? '<p class="muted small" style="margin:5px 0 0">Reference light and RGB curves are fitted separately. Choose Subject or Background to view and refine them.</p>'
+    : fittedReferenceCurve
     ? `<p class="muted small" style="margin:5px 0 0">Fitted from this photo and the selected reference. ${isIdentityCurve(points) ? 'No visible point-curve adjustment was needed.' : 'Adjust the points to refine the match.'}</p>` : '';
   const notes = [];
   if (local && CURVE_KEYS.some((k) => !isIdentityCurve(localOf(p, D.region)[k]))) notes.push('Local curves are baked into the exported photo. Lightroom sidecars do not store local tone curves yet.');
@@ -890,7 +896,7 @@ function regionNote(p) {
   if (Math.abs(warm) >= 1) li.push(`Subject ${warm > 0 ? 'warmer' : 'cooler'} than the background`);
   if (Math.abs(a.chroma - b.chroma) >= 0.05) li.push(`Subject color ${a.chroma > b.chroma ? 'stronger' : 'weaker'} than the background: ${b.chroma.toFixed(2)}× → ${a.chroma.toFixed(2)}×`);
   if (g.referenceStyle) {
-    li.push('Reference fit: subject white balance and tonal curve');
+    li.push(g.referenceStyle.regionCurves ? 'Reference fit: separate subject and background light and RGB curves' : 'Reference fit: subject white balance and tonal curve');
     if (g.referenceStyle.backgroundHslBands.length) li.push(`Background HSL matched in ${g.referenceStyle.backgroundHslBands.join(', ')}`);
     if (p.params.halation > 0) li.push(`Warm halation from the reference’s light sources: ${p.params.halation}%`);
   }
@@ -1442,6 +1448,12 @@ function openDetail(p) {
     try {
       const r = await pool.call(p.worker, 'autoAdjust', { id: p.id, params: structuredClone(p.params || defaultParams()) }, { priority: true });
       if (!D || D.p !== p) return;
+      const preservedReference = r.preservedReference === true;
+      delete r.preservedReference;
+      if (preservedReference) {
+        toast('Reference match preserved. Use Re-match to recalculate it.');
+        return;
+      }
       delete (p.params ||= defaultParams()).curveAuto;
       Object.assign(p.params ||= defaultParams(), r);
       p.solved = structuredClone(p.params); p.status = 'done'; D.userEdited = true;

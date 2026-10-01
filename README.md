@@ -4,9 +4,17 @@ Copies the look of a reference photo onto other photos. A preset stores the refe
 (tone percentiles, curve shape, neutral cast, zone color, HSL bands, saturation), not slider values.
 Every incoming photo is measured and solved on its own.
 
+When both photos have usable subject/background masks, each region's reference targets are fitted
+directly after isolation, before photographer finishes. Subject and background each have editable
+master and RGB curves; the 25th and 75th tone percentiles contribute to the reference match.
+Skin has separate masked Lab color and brightness targets, with bounded corrections that ease off
+in deep shadows and highlights. Auto Adjust preserves reference-matched settings; use Re-match
+to calculate them again. Without usable region masks, matching falls back to whole-photo targets.
+
 ## Layout
 - `engine/` — shared by the browser and Node
   - `measure.js` — stats for any image (preview-size); fixed pixel masks so edited images compare like with like
+  - `masked-reference.js`, `skin-match.js` — independent region fits and masked reference skin color/brightness in measurement, preview and export
   - `pipeline.js` — Lightroom-style sliders as deterministic global ops, compiled to a 33³ LUT
   - `solver.js` — staged bounded Levenberg–Marquardt: tone → white balance → color → touch-up, with clipping, banding and skin guards
   - `transfer.js` — color transfer (histogram match + Monge-Kantorovich), baked to a LUT. Test-only for now: lost to the solver on every look in tools/compare.mjs
@@ -31,6 +39,7 @@ is decoded with libheif (web/vendor/libheif, loaded only then) and kept as a q97
 
 ## Test scripts
 ```
+npm test                                                   # reference curves, masked regions, skin matching, Auto Adjust
 npm i
 python3 tools/fetch_published.py cvatik mckinnon xenie borisov   # published portfolios -> scratch/pub (never committed)
 python3 tools/style_records.py cvatik=scratch/pub/cvatik ...     # per-image numbers -> engine/style-data.js

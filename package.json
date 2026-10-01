@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Copy the look of one photo onto others: per-photo measured, solved edits.",
   "scripts": {
+    "test": "node --test tools/*.test.mjs",
     "build": "sh tools/build-web.sh",
     "measure": "node tools/measure.mjs",
     "match": "node tools/match.mjs",
