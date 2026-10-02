@@ -22,7 +22,7 @@ import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
 import { stylizeRemote } from './lib/deeppreset.js';
-import { autoAdjustResult, sCurvePush, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor, lookFade, lookSkinPoint, lookBands, lookPresence } from './engine/auto-adjust.js';
+import { autoAdjustResult, sCurvePush, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor, lookFade, lookSkinPoint, lookBands, lookPresence, colorContrast } from './engine/auto-adjust.js';
 
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
@@ -711,6 +711,9 @@ const handlers = {
     const wb = haveSkin && !target?.skin ? skinWhiteBalance(sa / sn, sb / sn) : { temp: 0, tint: 0 };
     const pres = (target?.chroma && look?.kind === 'reference' ? lookPresence(own.color.meanChroma, target.chroma) : null) || presenceFor(own.color.meanChroma);
     Object.assign(basic, hsl, points.length ? { points } : {}, pres, wb.temp || wb.tint ? { temp: clamp((params.temp || 0) + wb.temp, -60, 60), tint: clamp((params.tint || 0) + wb.tint, -50, 50) } : {});
+    // default look only: warm highlights / cool shadows when the photo lacks that separation (a chosen look owns the wheels)
+    const wheelsFree = !look?.kind && !['shadowSat', 'midtoneSat', 'highlightSat'].some((k) => params[k]);
+    if (wheelsFree) Object.assign(basic, colorContrast(own.zones));
     if (look?.kind === 'photographer') { basic.finishBlacks = 0; basic.finishRolloff = 0; }
     const curves = autoCurves(e.ps, { ...base, ...basic }, { midL: target?.p50 != null ? clamp(target.p50, 35, 65) : null, spreadL: target?.p25 != null && target?.p75 != null ? [target.p25, target.p75] : null });
     return autoAdjustResult(params, { ...basic, ...curves });
