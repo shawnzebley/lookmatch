@@ -48,20 +48,31 @@ assert.equal(lookFade({ p1: 12, p99: 85, clipLo: 0.01, clipHi: 0 }, { p1: 4, p99
 assert.equal(lookFade({ p1: 2, p99: 98 }, null), null);
 // skin: rotate and saturate toward the look's skin, small and capped
 const sk = lookSkinPoint({ L: 60, a: 12, b: 22 }, { hue: 45, chroma: 30 });
-assert.ok(sk.auto && sk.hue < 0 && sk.sat > 0 && Math.abs(sk.hue) <= 35 && sk.sat <= 30);
+assert.ok(sk.auto && sk.hue < 0 && sk.sat > 0 && Math.abs(sk.hue) <= 60 && sk.sat <= 50);
 assert.equal(lookSkinPoint({ L: 60, a: 15, b: 20 }, { hue: 53.13, chroma: 25 }), null);
-// bands: the biggest move becomes the picked point, the rest HSL, skin bands never touched
-const lb = lookBands(
-  { orange: { weight: 0.3, hue: 55, chroma: 25, lum: 60, lumRel: 5 }, blue: { weight: 0.2, hue: -70, chroma: 30, lum: 40, lumRel: -15 }, green: { weight: 0.05, hue: 130, chroma: 20, lum: 50, lumRel: -5 } },
-  { orange: { weight: 0.3, hue: 40, chroma: 40, lum: 60, lumRel: 5 }, blue: { weight: 0.2, hue: -60, chroma: 18, lum: 40, lumRel: -20 }, green: { weight: 0.05, hue: 120, chroma: 12, lum: 50, lumRel: -5 } },
-);
-assert.ok(lb.point.auto && lb.point.sat < 0);
-assert.ok(!Object.keys(lb.hsl).some((k) => k.endsWith('orange')) && lb.hsl.sat_green < 0);
+// skin: with the look's skin brightness known, luminance closes the gap too
+const sk2 = lookSkinPoint({ L: 50, a: 15, b: 20 }, { hue: 53.13, chroma: 25, lum: 58 });
+assert.ok(sk2.lum > 0 && sk2.lum <= 50);
+// bands: every colour with a gap gets HSL sliders (no picked point), red and orange left to the skin point when there is skin
+const own = { red: { weight: 0.1, hue: 25, chroma: 30, lum: 50, lumRel: 0 }, orange: { weight: 0.3, hue: 55, chroma: 25, lum: 60, lumRel: 5 }, blue: { weight: 0.2, hue: -70, chroma: 30, lum: 40, lumRel: -15 }, green: { weight: 0.05, hue: 130, chroma: 20, lum: 50, lumRel: -5 } };
+const tgt = { red: { weight: 0.1, hue: 35, chroma: 40, lum: 50, lumRel: 0 }, orange: { weight: 0.3, hue: 40, chroma: 40, lum: 60, lumRel: 5 }, blue: { weight: 0.2, hue: -60, chroma: 18, lum: 40, lumRel: -20 }, green: { weight: 0.05, hue: 120, chroma: 12, lum: 50, lumRel: -5 } };
+const lb = lookBands(own, tgt);
+assert.equal(lb.point, null);
+assert.ok(lb.hsl.sat_blue < 0 && lb.hsl.sat_green < 0 && lb.hsl.lum_blue < 0);
+assert.ok(!Object.keys(lb.hsl).some((k) => k.endsWith('orange') || k.endsWith('red')));
+assert.ok(lookBands(own, tgt, { skin: false }).hsl.sat_orange > 0);
 assert.deepEqual(lookBands({}, {}), { point: null, hsl: {} });
 // intensity
 assert.ok(lookPresence(20, 12).vibrance < 0 && lookPresence(20, 30).vibrance > 0);
 assert.equal(lookPresence(0, 12), null);
 console.log('look-chasing checks passed');
+
+import { sCurvePush, S_MIN, S_MAX } from '../engine/auto-adjust.js';
+// the master curve always gets an S: never under S_MIN, more for a flat photo or a punchier look, capped at S_MAX
+assert.equal(sCurvePush(140), S_MIN);
+assert.ok(sCurvePush(60) > sCurvePush(85) && sCurvePush(10) === S_MAX);
+assert.ok(sCurvePush(90, 120) > sCurvePush(90, null));
+console.log('s-curve checks passed');
 
 import { colorContrast } from '../engine/auto-adjust.js';
 // warm highlights over cool shadows: a flat-cast photo gets both wheels, one that already has the split gets none

@@ -113,38 +113,45 @@ export function lookFade(own, target) {
   };
 }
 
-// Skin point: own skin { L, a, b } toward the look's skin { hue, chroma } (Lab hue degrees).
+// Skin point (the colour eyedropper on the face): own skin { L, a, b } onto the look's skin { hue, chroma, lum }
+// (Lab hue degrees, lum optional: older saved references don't carry it). Capped so one click never overshoots.
 export function lookSkinPoint(own, target) {
   const C = Math.hypot(own.a, own.b);
   if (!target || !Number.isFinite(target.hue) || !Number.isFinite(target.chroma) || !(C >= 4)) return null;
   const h = Math.atan2(own.b, own.a) * 180 / Math.PI;
-  const hue = Math.round(clamp(angDiff(target.hue, h) / 30 * 100, -35, 35));
-  const sat = Math.round(clamp((target.chroma / C - 1) * 100, -30, 30));
-  const lum = own.L < 55 ? 6 : own.L > 80 ? -4 : 0;
+  const hue = Math.round(clamp(angDiff(target.hue, h) / 30 * 100, -60, 60));
+  const sat = Math.round(clamp((target.chroma / C - 1) * 100, -50, 50));
+  // luminance slider: +-100 is +-20 L*, so close most of the gap to the look's skin brightness
+  const lum = Number.isFinite(target.lum) && target.lum > 10 ? Math.round(clamp((target.lum - own.L) * 4, -50, 50)) : own.L < 55 ? 6 : own.L > 80 ? -4 : 0;
   if (near0(hue, sat, lum)) return null;
   return { L: own.L, a: own.a, b: own.b, hue, sat, lum, range: 35, auto: true };
 }
 
-// Colour bands toward the look's (hue, saturation, luminance of each band). Skin hues (red, orange) are left
-// to the skin point. The band that has to move most gets a picked point; the others get HSL deltas.
-export function lookBands(own = {}, target = {}) {
-  const moves = [];
-  for (const k of ['yellow', 'green', 'aqua', 'blue', 'purple', 'magenta']) {
+// Background colours onto the look's, one HSL slider triple per colour band (hue, saturation, luminance).
+// Pass bands measured without skin pixels (measure().bandsBg). Red and orange are skipped when the photo has
+// skin, because the skin point owns those hues; without skin they are background like any other.
+export function lookBands(own = {}, target = {}, { skin = true } = {}) {
+  const hsl = {};
+  for (const k of ['red', 'orange', 'yellow', 'green', 'aqua', 'blue', 'purple', 'magenta']) {
+    if (skin && (k === 'red' || k === 'orange')) continue;
     const o = own[k], t = target[k];
     if (!o || !t || !(o.weight >= 0.02) || !(o.chroma > 8) || !(t.weight >= 0.01) || !(t.chroma > 5)) continue;
-    const sat = Math.round(clamp((t.chroma / o.chroma - 1) * 70, -35, 35));
-    const hue = Math.round(clamp(angDiff(t.hue, o.hue) / 30 * 100, -40, 40));
-    const lum = Math.round(clamp(((t.lumRel || 0) - (o.lumRel || 0)) * 1.2, -20, 20));
+    const sat = Math.round(clamp((t.chroma / o.chroma - 1) * 70, -45, 45));
+    const hue = Math.round(clamp(angDiff(t.hue, o.hue) / 30 * 100, -60, 60));
+    const lum = Math.round(clamp(((t.lumRel || 0) - (o.lumRel || 0)) * 1.5, -30, 30));
     if (near0(sat, hue, lum)) continue;
-    moves.push({ k, o, sat, hue, lum, score: o.weight * (Math.abs(sat) + Math.abs(hue) * 0.5 + Math.abs(lum)) });
+    hsl[`hue_${k}`] = hue; hsl[`sat_${k}`] = sat; hsl[`lum_${k}`] = lum;
   }
-  if (!moves.length) return { point: null, hsl: {} };
-  const top = moves.reduce((m, v) => (v.score > m.score ? v : m));
-  const rad = top.o.hue * Math.PI / 180;
-  const point = { L: top.o.lum, a: top.o.chroma * Math.cos(rad), b: top.o.chroma * Math.sin(rad), hue: top.hue, sat: top.sat, lum: top.lum, range: 40, auto: true };
-  const hsl = {};
-  for (const m of moves) if (m !== top) { hsl[`hue_${m.k}`] = m.hue; hsl[`sat_${m.k}`] = m.sat; hsl[`lum_${m.k}`] = m.lum; }
-  return { point, hsl };
+  return { point: null, hsl };
+}
+
+// S-curve strength for the master curve: how many curve units the quartiles move apart (shadows down,
+// highlights up) around the midpoint. Never below S_MIN, so every photo gets some S; a flat photo or a
+// punchier look gets more. spread = the photo's own quartile spread, want = the look's (else AUTO default).
+export const S_MIN = 5, S_MAX = 14, S_DEFAULT_SPREAD = 92;
+export function sCurvePush(spread, want = null) {
+  const target = Number.isFinite(want) ? clamp(want, 70, 130) : S_DEFAULT_SPREAD;
+  return clamp((target - spread) * 0.3, S_MIN, S_MAX);
 }
 
 // Overall colour intensity toward the look's mean chroma.

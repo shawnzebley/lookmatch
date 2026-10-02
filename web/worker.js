@@ -22,7 +22,7 @@ import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
 import { stylizeRemote } from './lib/deeppreset.js';
-import { autoAdjustResult, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor, lookFade, lookSkinPoint, lookBands, lookPresence, colorContrast } from './engine/auto-adjust.js';
+import { autoAdjustResult, sCurvePush, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor, lookFade, lookSkinPoint, lookBands, lookPresence, colorContrast } from './engine/auto-adjust.js';
 
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
@@ -427,9 +427,9 @@ function cullInfo(e, bmp) {
 // photo's least colourful pixels, which takes out a cast. When even those pixels are strongly
 // coloured (a wood floor under tungsten, a sunset) the colour is the scene, so the correction fades,
 // and a warm cast is only partly taken out (warm light usually reads as intended).
-const AUTO_MID = 118, AUTO_QSPREAD = 92, AUTO_RGB_MAX = 18, AUTO_SLOPE = [0.5, 1.8];
+const AUTO_MID = 118, AUTO_RGB_MAX = 18, AUTO_SLOPE = [0.5, 1.8];
 const AUTO_GREY_FRAC = 0.15, AUTO_GREY_C = [10, 26], AUTO_WARM_KEEP = 0.4;
-function autoCurves(ps, params, { midL = null } = {}) {
+function autoCurves(ps, params, { midL = null, spreadL = null } = {}) {
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const cur = processPixelSet(ps, params);
   const n = ps.n;
@@ -460,7 +460,9 @@ function autoCurves(ps, params, { midL = null } = {}) {
   const q25 = pct(lum, n, 0.25), q50 = pct(lum, n, 0.5), q75 = pct(lum, n, 0.75);
   const midTarget = midL != null ? clamp(v8(lToY(midL)), 90, 150) : AUTO_MID;
   const ym = st(q50) + clamp((midTarget - st(q50)) * 0.5, -18, 18);
-  const push = clamp((AUTO_QSPREAD - (st(q75) - st(q25))) * 0.3, -8, 14);
+  // always an S: the quartiles move apart around the midpoint, more when the photo is flat or the look is punchy
+  const wantSpread = spreadL != null ? v8(lToY(spreadL[1])) - v8(lToY(spreadL[0])) : null;
+  const push = sCurvePush(st(q75) - st(q25), wantSpread);
   // Place the midpoint first, then the quartiles around it, each kept inside AUTO_SLOPE of the
   // points already placed on either side (a quartile that can't fit is left out). The midpoint
   // wins, so contrast never undoes the brightness correction.
@@ -674,7 +676,7 @@ const handlers = {
     let target = null;
     if (look?.kind === 'reference' && look.refStats?.tone?.pct) {
       const r = look.refStats;
-      target = { p1: r.tone.pct[1], p50: r.tone.pct[50], p99: r.tone.pct[99], bands: r.bands, skin: r.skin, chroma: r.color?.meanChroma };
+      target = { p1: r.tone.pct[1], p25: r.tone.pct[25], p50: r.tone.pct[50], p75: r.tone.pct[75], p99: r.tone.pct[99], bands: r.bandsBg || r.bands, skin: r.skin, chroma: r.color?.meanChroma };
     } else if (look?.kind === 'photographer' && FINISH_PROFILES[look.finish]?.p1 != null) {
       const T = styleTargets(e.ps, FINISH_PROFILES[look.finish], false);
       target = { p1: T.p1, p99: T.p99 };
@@ -700,7 +702,7 @@ const handlers = {
     const clip = { clipLo: own.tone.clipLo, clipHi: own.tone.clipHi };
     Object.assign(basic, lookFade({ p1: own.tone.pct[1], p99: own.tone.pct[99], ...clip }, target) || fadeFor({ ...clip, p5: own.tone.pct[5], p99: own.tone.pct[99] }));
     // colour picker + HSL: toward the look's skin and colour bands, else the default clean-portrait look
-    const lc = target?.bands ? lookBands(own.bands, target.bands) : lookColor(own.bands);
+    const lc = target?.bands ? lookBands(own.bandsBg, target.bands, { skin: haveSkin }) : lookColor(own.bands);
     const sp = !haveSkin ? null : target?.skin ? lookSkinPoint({ L: sl / sn, a: sa / sn, b: sb / sn }, target.skin) : skinPoint(sl / sn, sa / sn, sb / sn);
     const points = [...base.points, ...[sp, lc.point].filter(Boolean)];
     const hsl = {};
@@ -713,7 +715,7 @@ const handlers = {
     const wheelsFree = !look?.kind && !['shadowSat', 'midtoneSat', 'highlightSat'].some((k) => params[k]);
     if (wheelsFree) Object.assign(basic, colorContrast(own.zones));
     if (look?.kind === 'photographer') { basic.finishBlacks = 0; basic.finishRolloff = 0; }
-    const curves = autoCurves(e.ps, { ...base, ...basic }, { midL: target?.p50 != null ? clamp(target.p50, 35, 65) : null });
+    const curves = autoCurves(e.ps, { ...base, ...basic }, { midL: target?.p50 != null ? clamp(target.p50, 35, 65) : null, spreadL: target?.p25 != null && target?.p75 != null ? [target.p25, target.p75] : null });
     return autoAdjustResult(params, { ...basic, ...curves });
   },
 
