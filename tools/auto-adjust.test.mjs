@@ -73,3 +73,14 @@ assert.equal(sCurvePush(140), S_MIN);
 assert.ok(sCurvePush(60) > sCurvePush(85) && sCurvePush(10) === S_MAX);
 assert.ok(sCurvePush(90, 120) > sCurvePush(90, null));
 console.log('s-curve checks passed');
+
+import { colorContrast } from '../engine/auto-adjust.js';
+// warm highlights over cool shadows: a flat-cast photo gets both wheels, one that already has the split gets none
+const flat = colorContrast({ shadows: { b: 1, mass: 0.3 }, highlights: { b: 2, mass: 0.2 } });
+assert.equal(flat.shadowHue, 225); assert.equal(flat.highlightHue, 40);
+assert.ok(flat.shadowSat > 0 && flat.shadowSat <= 12 && flat.highlightSat > 0 && flat.highlightSat <= 8 && flat.shadowSat > flat.highlightSat);
+assert.deepEqual(colorContrast({ shadows: { b: -2, mass: 0.3 }, highlights: { b: 3, mass: 0.2 } }), {});
+// a nearly empty zone or missing measurements: leave the wheels alone
+assert.deepEqual(colorContrast({ shadows: { b: 0, mass: 0.005 }, highlights: { b: 0, mass: 0.3 } }), {});
+assert.deepEqual(colorContrast({}), {});
+console.log('colour contrast checks passed');
