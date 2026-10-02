@@ -44,3 +44,44 @@ export function presenceFor(meanChroma) {
 export function highlightRollOff(exposure) {
   return exposure > 0.08 ? Math.round(clamp(exposure * 22, 0, 12)) : 0;
 }
+
+// ---- fade, point colour and HSL for the look Auto Adjust aims at: a clean, natural portrait with a soft
+// matte floor. Fade is sized from the measured clipping so it also keeps the photo from blowing or crushing.
+// tone: { clipLo, clipHi, p5, p99 } (fractions, and L* percentiles)
+export function fadeFor(tone = {}) {
+  const lo = tone.clipLo > 0.002 ? 9 : tone.p5 < 4 ? 6 : 4;
+  const hi = tone.clipHi > 0.002 ? 6 : tone.p99 > 97 ? 4 : 2;
+  return { fadeBlacks: lo, fadeWhites: hi };
+}
+
+// Colour-picker moves. Skin: nudge hue toward natural, chroma into a healthy range, lift a dark face.
+export function skinPoint(L, a, b) {
+  const C = Math.hypot(a, b);
+  if (!Number.isFinite(C) || C < 4) return null;
+  const h = Math.atan2(b, a) * 180 / Math.PI;
+  const hue = Math.round(clamp((53 - h) / 30 * 100, -15, 15));
+  const sat = C < 18 ? 8 : C > 32 ? -8 : 0;
+  const lum = L < 55 ? 6 : L > 80 ? -4 : 0;
+  if (!hue && !sat && !lum) return null;
+  return { L, a, b, hue, sat, lum, range: 35, auto: true };
+}
+
+// Look targets per colour band (outside skin hues, which the skin point owns): foliage tamed, blues deepened.
+const BAND_LOOK = {
+  green: { sat: -10, lum: -4 },
+  aqua: { sat: -4, lum: -4 },
+  blue: { sat: 8, lum: -6 },
+  purple: { sat: -6, lum: 0 },
+  magenta: { sat: -6, lum: 0 },
+};
+// bands: measure().bands. The most prominent look colour gets a picked point, the other present bands get HSL.
+export function lookColor(bands = {}, minWeight = 0.03) {
+  const present = Object.keys(BAND_LOOK).filter((k) => (bands[k]?.weight || 0) >= minWeight && (bands[k]?.chroma || 0) > 8);
+  if (!present.length) return { point: null, hsl: {} };
+  const top = present.reduce((m, k) => (bands[k].weight * bands[k].chroma > bands[m].weight * bands[m].chroma ? k : m));
+  const bd = bands[top], rad = bd.hue * Math.PI / 180, t = BAND_LOOK[top];
+  const point = { L: bd.lum, a: bd.chroma * Math.cos(rad), b: bd.chroma * Math.sin(rad), hue: 0, sat: t.sat, lum: t.lum, range: 40, auto: true };
+  const hsl = {};
+  for (const k of present) if (k !== top) { hsl[`sat_${k}`] = BAND_LOOK[k].sat; hsl[`lum_${k}`] = BAND_LOOK[k].lum; }
+  return { point, hsl };
+}

@@ -32,3 +32,20 @@ assert.equal(highlightRollOff(0), 0);
 assert.equal(highlightRollOff(-0.3), 0);
 assert.ok(highlightRollOff(0.5) > highlightRollOff(0.2) && highlightRollOff(0.6) <= 12);
 console.log('portrait rule checks passed');
+
+import { fadeFor, skinPoint, lookColor } from '../engine/auto-adjust.js';
+// fade scales with measured clipping
+assert.deepEqual(fadeFor({ clipLo: 0, clipHi: 0, p5: 12, p99: 90 }), { fadeBlacks: 4, fadeWhites: 2 });
+assert.ok(fadeFor({ clipLo: 0.01, clipHi: 0.01, p5: 1, p99: 99 }).fadeBlacks > 4);
+assert.ok(fadeFor({ clipLo: 0.01, clipHi: 0.01, p5: 1, p99: 99 }).fadeWhites > 2);
+// skin point: pale/dark skin gets a small, flagged move; healthy mid skin gets none
+const pale = skinPoint(50, 10, 10);
+assert.ok(pale.auto && pale.sat > 0 && pale.lum > 0 && Math.abs(pale.hue) <= 15);
+assert.equal(skinPoint(65, 15, 20), null);
+assert.equal(skinPoint(65, 1, 1), null);
+// look colour: the strongest non-skin band gets the picked point, other present bands get HSL, skin bands untouched
+const lc = lookColor({ orange: { weight: 0.3, hue: 55, chroma: 25, lum: 60 }, blue: { weight: 0.2, hue: -60, chroma: 30, lum: 40 }, green: { weight: 0.05, hue: 130, chroma: 20, lum: 50 } });
+assert.ok(lc.point.auto && lc.point.sat > 0 && Math.abs(lc.point.L - 40) < 1e-9);
+assert.deepEqual(lc.hsl, { sat_green: -10, lum_green: -4 });
+assert.deepEqual(lookColor({}), { point: null, hsl: {} });
+console.log('look rule checks passed');
