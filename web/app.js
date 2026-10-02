@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-10-01b';
+const APP_VERSION = '2026-10-02a';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -318,18 +318,56 @@ async function restorePresets() {
 // S.look applies to every photo; p.look overrides it for one photo (set in the editor).
 const LOOK_KEY = 'lm_look';
 const PHOTOGRAPHERS = Object.keys(FINISH_PROFILES).filter((k) => k !== 'off');
+const NONE_LOOK = Object.freeze({ kind: 'none' });
+const isNoneLook = (l) => l?.kind === 'none';
 const presetById = (id) => S.presets.find((q) => q.id === id) || null;
-const lookValid = (l) => !!l && (l.kind === 'photographer' ? !!FINISH_PROFILES[l.key] : !!presetById(l.id));
-const lookOf = (p) => (lookValid(p.look) ? p.look : lookValid(S.look) ? S.look : null);
+const lookValid = (l) => !!l && (isNoneLook(l) || (l.kind === 'photographer' ? !!FINISH_PROFILES[l.key] : l.kind === 'preset' && !!presetById(l.id)));
+const lookOf = (p) => (isNoneLook(p.look) ? NONE_LOOK : lookValid(p.look) ? p.look : isNoneLook(S.look) ? NONE_LOOK : lookValid(S.look) ? S.look : null);
 const presetOf = (p) => { const l = lookOf(p); return l && l.kind === 'preset' ? presetById(l.id) : null; };
-const lookName = (l) => (!l ? '' : l.kind === 'photographer' ? FINISH_PROFILES[l.key].name : presetById(l.id)?.name || 'reference');
-const sameLook = (a, b) => !!a && !!b && a.kind === b.kind && (a.key || a.id) === (b.key || b.id);
+const lookName = (l) => (!l ? '' : isNoneLook(l) ? 'Plain photo' : l.kind === 'photographer' ? FINISH_PROFILES[l.key].name : presetById(l.id)?.name || 'reference');
+const sameLook = (a, b) => !!a && !!b && a.kind === b.kind && (isNoneLook(a) || (a.key || a.id) === (b.key || b.id));
 // photographer finish in effect for a photo: the photographer itself, or the one added on top of a reference
-const finishKeyOf = (p) => { const l = lookOf(p); if (!l) return 'off'; return l.kind === 'photographer' ? l.key : p.finish || presetById(l.id)?.finish || 'off'; };
+const finishKeyOf = (p) => { const l = lookOf(p); if (!l || isNoneLook(l)) return 'off'; return l.kind === 'photographer' ? l.key : p.finish || presetById(l.id)?.finish || 'off'; };
+
+function resetPhotoLook(p) {
+  cancelPhotoSolve(p);
+  const retained = keptEdits(p.params);
+  p.params = { ...defaultParams(), ...retained };
+  p.solved = null; p.solvedLook = NONE_LOOK; p.finish = undefined; p.finishStrength = undefined; p.strength = 100;
+  p.style = null; p.regions = null; p.targets = null; p.after = null; p.loss = null; p.model = null;
+  delete p.error; delete p.errRec;
+  if (p.before) p.status = 'done';
+  return Object.keys(retained).length > 0;
+}
+
+function setPhotoNone(p) {
+  const editing = D?.p === p;
+  if (editing) commitEdit();
+  const before = editing ? editSnap(p) : null;
+  p.look = NONE_LOOK;
+  const hasKeptEdits = resetPhotoLook(p);
+  if (editing) {
+    D.styleKind = null;
+    D.userEdited = hasKeptEdits;
+    recordLookResetUndo(before);
+    refreshDetail();
+  }
+  runQueue(); rerenderMatchSoon();
+}
 
 function setLook(l) {
   S.look = l;
   try { localStorage.setItem(LOOK_KEY, JSON.stringify(l)); } catch (e) { /* private mode */ }
+  if (isNoneLook(l)) {
+    const activePhoto = D?.p && S.photos.includes(D.p) ? D.p : null;
+    if (activePhoto) commitEdit();
+    const activeBefore = activePhoto ? editSnap(activePhoto) : null;
+    for (const ph of S.photos) { ph.look = null; resetPhotoLook(ph); }
+    if (S.photos.length === 1) S.autoOpen = true;
+    if (activePhoto && D?.p === activePhoto) { D.styleKind = null; D.userEdited = Object.keys(keptEdits(D.p.params)).length > 0; recordLookResetUndo(activeBefore); refreshDetail(); }
+    runQueue(); renderMatch();
+    return;
+  }
   if (l.kind === 'preset') { S.presetId = l.id; localStorage.setItem('lm_preset', l.id); }
   const pr = l.kind === 'preset' ? presetById(l.id) : null;
   for (const ph of S.photos) {
@@ -371,6 +409,7 @@ function toneDots(s) {
 // ---------------------------------------------------------------- edit view: 1 photos, 2 style
 function statusLabel(p) {
   if (p.status === 'loading' && p.phase === 'heif') return 'converting HEIF';
+  if (isNoneLook(lookOf(p))) return p.params ? 'edit' : 'open to edit';
   if (p.params && !lookOf(p)) return 'edit';
   if (p.status === 'ready' && !lookOf(p)) return 'open to edit';
   return { loading: 'reading', ready: 'queued', solving: 'styling', done: 'done', error: 'error', exporting: 'exporting', exported: 'exported' }[p.status] || p.status;
@@ -390,7 +429,7 @@ function photoTile(p) {
   const t = h(`<button class="tile ${p.picked ? 'picked' : ''}" data-id="${p.id}">${p.thumbURL ? `<img src="${p.thumbURL}" alt="">` : ''}${cullDots(p.cull)}${p.picked ? '<span class="pick">★</span>' : ''}
     ${busy ? '<div class="spin"></div>' : ''}${p.loss && p.loss.worst !== 'ok' && !busy ? `<span class="wbadge ${p.loss.worst}" title="${esc(p.loss.issues.map((i) => i.text).join(', '))}">!</span>` : ''}<span class="st ${p.status === 'done' || p.status === 'exported' ? 'done' : p.status === 'error' ? 'err' : ''}">${statusLabel(p)}</span></button>`);
   t.onclick = () => {
-    if (p.params || (p.status === 'ready' && !lookOf(p))) return openDetail(p);
+    if (p.params || (p.status === 'ready' && (!lookOf(p) || isNoneLook(lookOf(p))))) return openDetail(p);
     if (p.status !== 'error') { if (!lookOf(p)) $('#stepStyle')?.scrollIntoView({ behavior: 'smooth' }); return; }
     const s = showProblem(`Couldn't use ${p.name}`, p.errRec || logError('photo', p.error, p.file), '<button class="danger" id="pRemove">Remove</button>');
     $('#pRemove', s).onclick = () => { pool.call(p.worker, 'unload', { id: p.id }).catch(() => {}); S.photos = S.photos.filter((q) => q !== p); closeSheet(); renderMatch(); };
@@ -503,11 +542,12 @@ function renderMatch() {
     }
     photos.append(strip);
     if (total > 1) photos.append(cullBar());
-    const line = !look ? 'Tap a photo to edit without a reference, or pick a style below.'
-      : done < total ? `Styling like ${esc(lookName(look))}… ${done} of ${total}`
+    const line = isNoneLook(look) ? 'Plain photo selected. Tap a photo to edit.'
+      : !look ? 'Tap a photo to edit without a reference, or pick a style below.'
+        : done < total ? `Styling like ${esc(lookName(look))}… ${done} of ${total}`
         : `${total === 1 ? 'Done.' : `All ${total} done.`} Tap a photo to fine-tune, crop or export.`;
     photos.append(h(`<p class="muted small step-note">${line}</p>`));
-    if (look && done < total) photos.append(h(`<div class="progress"><i style="width:${(done / total) * 100}%"></i></div>`));
+    if (look && !isNoneLook(look) && done < total) photos.append(h(`<div class="progress"><i style="width:${(done / total) * 100}%"></i></div>`));
   }
   v.append(photos);
   $('#addPhotos', v).onclick = () => $('#pickPhotos').click();
@@ -521,12 +561,16 @@ function renderMatch() {
   const kind = S.styleTab || look?.kind || 'photographer';
   const style = h(`<section class="step ${total && !look ? 'attention' : ''}" id="stepStyle"><div class="step-h"><span class="n">2</span><h2>Style</h2>
       <div class="grow"></div>${look ? `<span class="muted small">Using ${esc(lookName(look))}</span>` : ''}</div>
-    <div class="seg wide" id="styleSeg"><button data-k="photographer" class="${kind === 'photographer' ? 'on' : ''}">Photographer</button><button data-k="preset" class="${kind === 'preset' ? 'on' : ''}">Reference photo</button></div>
-    <p class="muted small step-note">${kind === 'photographer' ? 'What that photographer would do to each of your photos, read from the published shots most like each scene.' : 'Copy the look of one photo onto yours. Your saved references and Lightroom presets are here.'}</p>
+    <div class="seg wide" id="styleSeg"><button data-k="photographer" class="${kind === 'photographer' ? 'on' : ''}">Photographer</button><button data-k="preset" class="${kind === 'preset' ? 'on' : ''}">Reference photo</button><button data-k="none" class="${isNoneLook(look) ? 'on' : ''}">None</button></div>
+    <p class="muted small step-note">${isNoneLook(look) ? 'Use the photo as it was captured.' : kind === 'photographer' ? 'What that photographer would do to each of your photos, read from the published shots most like each scene.' : 'Copy the look of one photo onto yours. Your saved references and Lightroom presets are here.'}</p>
     </section>`);
   const pick = (l) => { if (!sameLook(l, S.look)) setLook(l); };
-  style.append(kind === 'photographer' ? photographerCards(look, pick) : referenceCards(look, pick));
-  $('#styleSeg', style).onclick = (e) => { const k = e.target.dataset.k; if (!k) return; S.styleTab = k; renderMatch(); };
+  if (kind !== 'none') style.append(kind === 'photographer' ? photographerCards(look, pick) : referenceCards(look, pick));
+  $('#styleSeg', style).onclick = (e) => {
+    const k = e.target.dataset.k; if (!k) return;
+    if (k === 'none') { S.styleTab = 'none'; if (!isNoneLook(S.look)) setLook(NONE_LOOK); else renderMatch(); return; }
+    S.styleTab = k; renderMatch();
+  };
   v.append(style);
   setTopActions();
 }
@@ -556,8 +600,9 @@ async function addPhotos(files) {
     pool.call(p.worker, 'load', { id: p.id, file }).then((r) => {
       p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask; p.faceErr = r.faceErr; p.cull = r.cull; S.scenesKey = null; noteVision(r, file);
       p.status = 'ready'; rerenderMatchSoon();
-      if (S.autoOpen && S.photos.length === 1 && !lookOf(p) && !D && S.tab === 'match') {
-        S.autoOpen = false; p.params = defaultParams(); openDetail(p);
+      if (isNoneLook(lookOf(p))) { p.params = defaultParams(); p.status = 'done'; }
+      if (S.autoOpen && S.photos.length === 1 && (!lookOf(p) || isNoneLook(lookOf(p))) && !D && S.tab === 'match') {
+        S.autoOpen = false; p.params ||= defaultParams(); openDetail(p);
       } else runQueue();
     }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('add photo: read', e, file); rerenderMatchSoon(); });
   }
@@ -566,7 +611,7 @@ async function addPhotos(files) {
 
 function solveArgs(p) {
   const look = lookOf(p);
-  if (!look) return null;
+  if (!look || isNoneLook(look)) return null;
   const finishStrength = (p.finishStrength ?? 100) / 100;
   const split = p.split !== false;
   if (look.kind === 'photographer') return { refStats: null, lrParams: {}, strength: 1, finish: look.key, finishStrength, pull: 0.25, split };
@@ -599,6 +644,15 @@ const KEEP_KEYS = ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points'];
 const keptEdits = (params) => Object.fromEntries(KEEP_KEYS.filter((k) => params && params[k] != null).map((k) => [k, structuredClone(params[k])]));
 
 const solveRuns = new WeakMap();
+function cancelPhotoSolve(p) {
+  solveRuns.set(p, (solveRuns.get(p) || 0) + 1);
+  const w = pool.workers[p.worker];
+  if (!w) return;
+  const stale = w.queue.filter((job) => job.type === 'solve' && job.args.id === p.id);
+  if (!stale.length) return;
+  w.queue = w.queue.filter((job) => !stale.includes(job));
+  for (const job of stale) job.rej(new Error('Plain photo selected; queued style cancelled'));
+}
 function solvePhoto(p, { priority = false } = {}) {
   if (!solveArgs(p)) return Promise.resolve();
   const run = (solveRuns.get(p) || 0) + 1; solveRuns.set(p, run);
@@ -619,7 +673,10 @@ function solvePhoto(p, { priority = false } = {}) {
 }
 
 function runQueue() {
-  for (const p of S.photos) if (p.status === 'ready' && lookOf(p)) solvePhoto(p);
+  for (const p of S.photos) if (p.status === 'ready') {
+    if (isNoneLook(lookOf(p))) { p.params ||= defaultParams(); p.status = 'done'; }
+    else if (solveArgs(p)) solvePhoto(p);
+  }
 }
 
 function skinTargetRows(p) {
@@ -1239,7 +1296,7 @@ async function maskOp(args) {
     renderRegionCard();
     if (args.op === 'retry') renderRetouchCard();
     // a new subject changes what the style does, unless the sliders were already hand-tuned
-    if (lookOf(p) && p.split !== false && !D.userEdited) {
+    if (lookOf(p) && !isNoneLook(lookOf(p)) && p.split !== false && !D.userEdited) {
       await solvePhoto(p, { priority: true });
       if (D && D.p === p) { D.userEdited = false; refreshDetail(); }
     } else { requestPreview(false); scheduleMeasure(0); }
@@ -1350,25 +1407,27 @@ function styleNote(p) {
 
 const strengthRow = (id, label, v, max) => `<div class="strength"><span class="muted small slbl">${label}</span><input type="range" id="${id}" min="0" max="${max}" step="5" value="${v}"><output id="${id}Out">${v}%</output></div>`;
 
-// the editor's Style card: the same two choices as the main page, for this photo only
+// The editor's style selection applies to this photo only.
 function styleCard(p) {
   const look = lookOf(p), kind = (D && D.styleKind) || look?.kind || 'photographer';
   const pr = presetOf(p), fk = finishKeyOf(p);
   let body;
-  if (kind === 'photographer') {
+  if (kind === 'none') {
+    body = '<p class="muted small" style="margin:8px 0 0">Use the photo as it was captured. Manual edits remain available below.</p>';
+  } else if (kind === 'photographer') {
     body = `<div class="chips-row" id="dPick">${PHOTOGRAPHERS.map((k) => `<button data-l="photographer:${k}" class="${look?.kind === 'photographer' && look.key === k ? 'on' : ''}">${esc(FINISH_PROFILES[k].name)}</button>`).join('')}</div>
       ${look?.kind === 'photographer' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : '<p class="muted small" style="margin:8px 0 0">Pick one to restyle this photo.</p>'}`;
   } else {
     body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
-      <p class="muted small" style="margin:8px 0 0">With a usable subject/background mask, reference matching fits the subject’s white balance and tone curve and the background’s HSL. It adds halation when it detects glow around lights.</p>
+      <p class="muted small" style="margin:8px 0 0">Reference matching fits separate light and RGB curves for the subject and background, then matches each person’s skin brightness and color. It adds halation when it detects glow around lights.</p>
       ${pr ? `${strengthRow('str', 'Match', p.strength, 100)}
         <div class="sub">Add a photographer's finish on top</div><div class="fin" id="fin">${finishButtons(p, pr)}</div>
         ${fk !== 'off' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : ''}`
     : '<p class="muted small" style="margin:8px 0 0">Pick a reference to copy its look onto this photo.</p>'}`;
   }
   const others = S.photos.length > 1;
-  return `<h3>Style</h3><div class="seg wide" id="dSeg"><button data-k="photographer" class="${kind === 'photographer' ? 'on' : ''}">Photographer</button><button data-k="preset" class="${kind === 'preset' ? 'on' : ''}">Reference photo</button></div>
-    ${body}${others && look ? '<div class="row" style="margin-top:10px"><button id="lookAll">Use this style on all photos</button></div>' : ''}`;
+  return `<h3>Style</h3><div class="seg wide" id="dSeg"><button data-k="photographer" class="${kind === 'photographer' ? 'on' : ''}">Photographer</button><button data-k="preset" class="${kind === 'preset' ? 'on' : ''}">Reference photo</button><button data-k="none" class="${isNoneLook(look) ? 'on' : ''}">None</button></div>
+    ${body}${others && look && !isNoneLook(look) ? '<div class="row" style="margin-top:10px"><button id="lookAll">Use this style on all photos</button></div>' : ''}`;
 }
 
 function renderStyleCard() {
@@ -1385,8 +1444,12 @@ function renderStyleCard() {
     D.userEdited = false;
     refreshDetail();
   };
-  $('#dSeg', box).onclick = (e) => { const k = e.target.dataset.k; if (!k) return; D.styleKind = k; renderStyleCard(); };
-  $('#dPick', box).onclick = (e) => {
+  $('#dSeg', box).onclick = (e) => {
+    const k = e.target.dataset.k; if (!k) return;
+    if (k === 'none') { D.styleKind = null; if (!isNoneLook(lookOf(p))) setPhotoNone(p); else renderStyleCard(); return; }
+    D.styleKind = k; renderStyleCard();
+  };
+  if (picks) picks.onclick = (e) => {
     const b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.a === 'ref') return $('#pickRef').click();
@@ -1406,6 +1469,7 @@ function renderStyleCard() {
   }
   if ($('#lookAll', box)) $('#lookAll', box).onclick = () => {
     const l = lookOf(p);
+    if (isNoneLook(l)) { setLook(NONE_LOOK); toast(`Plain photo on all ${S.photos.length} photos`); return; }
     S.look = l;
     try { localStorage.setItem(LOOK_KEY, JSON.stringify(l)); } catch (e) { /* private mode */ }
     for (const ph of S.photos) {
@@ -1429,21 +1493,25 @@ function openDetail(p) {
   el.hidden = false;
   el.classList.remove('cropping');
   document.body.style.overflow = 'hidden';
-  el.innerHTML = `<div class="dtop">
-      <div class="dhead"><button class="ghost" id="dBack">‹ Back</button><div class="nm">${esc(p.name)}${p.cull ? ` <span class="muted small">${p.cull.eyes ? `eyes ${p.cull.eyes}` : ''}${p.cull.eyes && p.cull.focus != null ? ' · ' : ''}${p.cull.focus != null ? `focus ${p.cull.focus.toFixed(1)}` : ''}</span>` : ''}</div><button id="dPick" class="${p.picked ? 'on' : ''}" aria-pressed="${!!p.picked}" aria-label="Pick">★</button><button class="primary" id="dExport">Export</button></div>
+  const compactPortrait = matchMedia('(max-width: 700px) and (orientation: portrait)').matches;
+  el.classList.toggle('panel-collapsed', compactPortrait);
+  el.innerHTML = `<div class="editor-layout" id="editorLayout"><main class="editor-main" id="editorMain"><div class="dtop">
+      <div class="dhead"><button class="ghost" id="dBack">‹ Back</button><div class="nm">${esc(p.name)}${p.cull ? ` <span class="muted small">${p.cull.eyes ? `eyes ${p.cull.eyes}` : ''}${p.cull.eyes && p.cull.focus != null ? ' · ' : ''}${p.cull.focus != null ? `focus ${p.cull.focus.toFixed(1)}` : ''}</span>` : ''}</div><button id="dKeep" class="${p.picked ? 'on' : ''}" aria-pressed="${!!p.picked}" aria-label="Pick">★</button><button class="primary" id="dExport">Export</button></div>
       <div class="stage" id="stage"><canvas id="cv"></canvas><span class="lbl l" id="lblL">Before</span><span class="lbl r" id="lblR">After</span>
         <img class="refthumb" id="refthumb" alt="reference" hidden><span class="reflbl" id="reflbl" hidden>ref</span></div>
-      <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div>
-        <button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure, then fit the light and RGB curves to this photo">Auto Adjust</button><div class="grow"></div><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
+      <div class="dctl" id="dctl"><div class="seg" id="mode"><button data-m="before">Before</button><button data-m="split" class="on">Split</button><button data-m="after">After</button></div></div>
       <div class="cropbar" id="cropbar" hidden>
         <div class="aspects" id="aspects"><button data-a="free">Free</button><button data-a="orig">Original</button><button data-a="1">1:1</button><button data-a="0.8">4:5</button><button data-a="1.5">3:2</button><button data-a="1.7778">16:9</button><button data-a="flip" aria-label="Swap width and height">⇄</button></div>
         <div class="level"><label for="lvl">Level</label><input type="range" id="lvl" min="-45" max="45" step="0.1" value="0"><output id="lvlOut">0.0°</output><button id="lvlAuto">Auto</button></div>
         <div class="row"><button class="ghost" id="cropReset">Reset</button><div class="grow"></div><button id="cropCancel">Cancel</button><button class="primary" id="cropDone">Done</button></div>
       </div>
       <div class="lossbar" id="loss"></div>
-    </div>
-    <div class="dpanel" id="dbody">
-      <div class="ptabs" id="ptabs">${PAGES.map(([k, l]) => `<button data-p="${k}">${l}</button>`).join('')}</div>
+    </div></main>
+    <aside class="dpanel" id="dbody">
+      <div class="panel-head"><div class="panel-topline"><strong class="panel-title">Controls</strong><button class="panel-toggle" id="panelToggle" type="button" aria-label="Collapse controls" aria-expanded="true">‹</button></div>
+        <div class="edit-actions"><button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure, then fit the light and RGB curves to this photo">Auto Adjust</button><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
+        <nav class="ptabs" id="ptabs" aria-label="Editing sections">${PAGES.map(([k, l]) => `<button data-p="${k}" title="${l}" aria-label="${l}"><span class="tab-icon" aria-hidden="true">${({ look: '◉', subject: '◌', light: '☼', color: '◐', retouch: '✦', more: '⋯' })[k]}</span><span class="tab-label">${l}</span></button>`).join('')}</nav>
+      </div>
       <div class="pager" id="pager">
         <div class="page" data-p="look"><div class="card" id="styleCard"></div></div>
         <div class="page" data-p="subject"><div class="card" id="regionCard"></div></div>
@@ -1452,17 +1520,16 @@ function openDetail(p) {
         <div class="page" data-p="retouch"><div class="card" id="retouchCard"></div></div>
         <div class="page" data-p="more"><div class="card" id="syncCard"></div><div class="card"><h3>Measurements</h3><div id="nums">${numbersTable(p)}</div></div></div>
       </div>
-    </div>`;
-  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null, region: 'all', pick: null, showMask: false, flash: false,
+    </aside></div>`;
+  D = { p, mode: 'split', split: 0.5, orig: null, edit: null, busy: false, again: false, overlay: false, holding: false, crop: null, styleKind: null, region: 'all', pick: null, showMask: false, flash: false, panelOpen: !compactPortrait, compactPortrait,
     tool: null, healSel: -1, healSize: 0.015, healOp: 0.6, pointSel: -1, curveChannel: 'curve', curveDrag: null, curveSnap: false, view: { s: 1, x: 0, y: 0 }, hi: false, page: 'look',
     hist: { stack: [], cur: editSnap(p) } };
   $('#sliders').innerHTML = sliderGroups(p);
   $('#grade').innerHTML = gradeCard(p);
-  el.scrollTop = 0;
   bindPager();
   $('#dBack').onclick = closeDetail;
   $('#dExport').onclick = () => exportPhotos([p]);
-  $('#dPick').onclick = () => { p.picked = !p.picked; $('#dPick').classList.toggle('on', p.picked); $('#dPick').setAttribute('aria-pressed', String(p.picked)); };
+  $('#dKeep').onclick = () => { p.picked = !p.picked; $('#dKeep').classList.toggle('on', p.picked); $('#dKeep').setAttribute('aria-pressed', String(p.picked)); };
   $('#mode').onclick = (e) => { const m = e.target.dataset.m; if (!m) return; D.mode = m; [...$('#mode').children].forEach((b) => b.classList.toggle('on', b.dataset.m === m)); draw(); };
   $('#clipBtn').onclick = () => setOverlay(!D.overlay);
   $('#cropBtn').onclick = () => enterCrop();
@@ -1506,28 +1573,40 @@ function openDetail(p) {
   bindSliders();
   bindWheels();
   bindStage();
-  el.onscroll = () => requestAnimationFrame(applyShrink);
-  applyShrink();
+  syncEditorLayout();
   renderLoss();
   requestPreview(true);
   scheduleMeasure(0);
 }
 
-// The bottom panel is a horizontal slider. Keep its section tabs in sync with swipes,
-// and let a tap jump directly to the corresponding group of editing tools.
+// Controls scroll vertically in the left pane; section tabs jump within that pane.
 function bindPager() {
   const pager = $('#pager'), tabs = $('#ptabs');
   const mark = (k) => {
     D.page = k;
-    tabs.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b.dataset.p === k));
-    tabs.querySelector('button.on')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+    tabs.querySelectorAll('button[data-p]').forEach((b) => {
+      const selected = b.dataset.p === k;
+      b.classList.toggle('on', selected);
+      b.setAttribute('aria-current', selected ? 'page' : 'false');
+    });
   };
   const pageEl = (k) => pager.querySelector(`.page[data-p="${k}"]`);
+  D.setPanelOpen = (open) => {
+    D.panelOpen = !!open;
+    $('#detail').classList.toggle('panel-collapsed', !D.panelOpen);
+    const toggle = $('#panelToggle');
+    toggle.textContent = D.panelOpen ? '‹' : '›';
+    toggle.setAttribute('aria-expanded', String(D.panelOpen));
+    toggle.setAttribute('aria-label', D.panelOpen ? 'Collapse controls' : 'Expand controls');
+  };
+  $('#panelToggle').onclick = () => D.setPanelOpen(!D.panelOpen);
+  D.setPanelOpen(D.panelOpen);
   D.goPage = (k, smooth = true) => {
     const el = pageEl(k);
     if (!el) return;
+    if (!D.panelOpen) D.setPanelOpen(true);
     mark(k);
-    pager.scrollTo({ left: el.offsetLeft, behavior: smooth ? 'smooth' : 'auto' });
+    pager.scrollTo({ top: pager.scrollTop + el.getBoundingClientRect().top - pager.getBoundingClientRect().top, behavior: smooth ? 'smooth' : 'auto' });
   };
   tabs.onclick = (e) => {
     const k = e.target.closest('button')?.dataset.p;
@@ -1537,33 +1616,36 @@ function bindPager() {
   pager.onscroll = () => {
     clearTimeout(t);
     t = setTimeout(() => {
-      const i = Math.round(pager.scrollLeft / Math.max(1, pager.clientWidth));
-      const k = pager.children[i]?.dataset.p;
+      const top = pager.getBoundingClientRect().top + 8;
+      let active = pager.children[0];
+      for (const page of pager.children) {
+        if (page.getBoundingClientRect().top <= top) active = page;
+        else break;
+      }
+      const k = active?.dataset.p;
       if (k && k !== D?.page) mark(k);
     }, 60);
   };
   mark('look');
 }
 
-// ---------------------------------------------------------------- photo shrinks while scrolling
-// The stage starts at 40% of the screen height (62% in landscape) and gives up height as the
-// controls scroll, down to STAGE_MIN of that. A spacer takes the height it gave up, so the
-// sliders track the finger instead of jumping.
-const STAGE_MIN = 0.5;
-function stageMax() { return Math.round(window.innerHeight * (window.innerWidth > window.innerHeight ? 0.62 : 0.4)); }
-function applyShrink() {
+// ---------------------------------------------------------------- editor pane sizing
+function syncEditorLayout() {
   if (!D) return;
-  const st = $('#stage'), sp = $('#dspace'), det = $('#detail');
-  if (!st || !sp) return;
-  if (D.crop) { st.style.height = ''; sp.style.height = '0px'; return; }
-  const mx = stageMax(), mn = Math.round(mx * STAGE_MIN);
-  const d = Math.max(0, Math.min(mx - mn, det.scrollTop));
-  st.style.height = `${mx - d}px`;
-  sp.style.height = `${d}px`;
-  const small = d > (mx - mn) * 0.6;
-  $('#refthumb')?.classList.toggle('mini', small);
+  const st = $('#stage');
+  if (st) st.style.height = '';
+  $('#refthumb')?.classList.remove('mini');
 }
-window.addEventListener('resize', () => { if (D) { applyShrink(); if (D.crop) drawCrop(); } });
+window.addEventListener('resize', () => {
+  if (!D) return;
+  const compactPortrait = matchMedia('(max-width: 700px) and (orientation: portrait)').matches;
+  if (compactPortrait !== D.compactPortrait) {
+    D.compactPortrait = compactPortrait;
+    D.setPanelOpen(!compactPortrait);
+  }
+  syncEditorLayout();
+  if (D.crop) drawCrop();
+});
 
 function finishButtons(p, pr) {
   const cur = p.finish || pr?.finish || 'off';
@@ -1615,17 +1697,17 @@ function jumpToSlider(k) {
   if (D.region !== want) { D.region = want; renderRegionCard(); rebuildControls(); requestPreview(false); }
   const row = controlFor(k);
   if (!row) return;
-  const det = $('#detail');
   const dt = row.closest('details'); if (dt) dt.open = true;
-  const top = $('.dtop').getBoundingClientRect().height;
-  det.scrollTo({ top: det.scrollTop + row.getBoundingClientRect().top - top - 12, behavior: 'smooth' });
+  const page = row.closest('.page'), pager = $('#pager');
+  if (page) D.goPage(page.dataset.p, false);
+  requestAnimationFrame(() => pager.scrollTo({ top: pager.scrollTop + row.getBoundingClientRect().top - pager.getBoundingClientRect().top - 12, behavior: 'smooth' }));
   row.classList.remove('flash'); void row.offsetWidth; row.classList.add('flash');
 }
 
 // Undo: every edit ends in scheduleMeasure, so its debounce is where an edit counts as finished
 // (a whole slider drag is one step). Snapshots are the photo's params, as JSON, per open photo.
 const UNDO_MAX = 50;
-const editSnap = (p) => JSON.stringify({ params: p.params || null, solved: p.solved || null });
+const editSnap = (p) => JSON.stringify({ params: p.params || null, solved: p.solved || null, look: p.look ?? null, finish: p.finish ?? null, finishStrength: p.finishStrength ?? null, strength: p.strength ?? null, split: p.split ?? null });
 function commitEdit() {
   if (!D || !D.hist) return;
   const s = editSnap(D.p);
@@ -1633,6 +1715,16 @@ function commitEdit() {
   D.hist.stack.push(D.hist.cur);
   if (D.hist.stack.length > UNDO_MAX) D.hist.stack.shift();
   D.hist.cur = s;
+  syncUndo();
+}
+function recordLookResetUndo(before) {
+  if (!D?.hist || before == null) return;
+  const after = editSnap(D.p);
+  if (before !== after) {
+    D.hist.stack.push(before);
+    if (D.hist.stack.length > UNDO_MAX) D.hist.stack.shift();
+  }
+  D.hist.cur = after;
   syncUndo();
 }
 function syncUndo() { if (D && $('#undo')) $('#undo').disabled = !D.hist.stack.length; }
@@ -1644,6 +1736,12 @@ function undo() {
   D.hist.cur = prev;
   const o = JSON.parse(prev);
   D.p.params = o.params || defaultParams(); D.p.solved = o.solved || null;
+  if (Object.hasOwn(o, 'look')) D.p.look = o.look;
+  if (Object.hasOwn(o, 'finish')) D.p.finish = o.finish;
+  if (Object.hasOwn(o, 'finishStrength')) D.p.finishStrength = o.finishStrength;
+  if (Object.hasOwn(o, 'strength')) D.p.strength = o.strength;
+  if (Object.hasOwn(o, 'split')) D.p.split = o.split;
+  D.p.solvedLook = lookOf(D.p);
   D.userEdited = true;
   syncUndo();
   refreshDetail();
@@ -1813,10 +1911,10 @@ async function enterCrop() {
     aspect: g ? null : W / H, auto: !g, prev: g ? { ...g } : null, img: null, drag: null,
   };
   const det = $('#detail');
-  det.scrollTop = 0; det.classList.add('cropping');
+  det.classList.add('cropping');
   $('#dctl').hidden = true; $('#cropbar').hidden = false; $('#loss').hidden = true; $('#dbody').hidden = true;
   $('#lblL').hidden = true; $('#lblR').hidden = true;
-  applyShrink();
+  syncEditorLayout();
   syncCropBar();
   try {
     const r = await pool.call(p.worker, 'preview', { id: p.id, params: { ...p.params }, side: previewSide(), plain: true }, { priority: true });
@@ -1832,7 +1930,7 @@ function exitCrop() {
   const det = $('#detail');
   det.classList.remove('cropping');
   $('#dctl').hidden = false; $('#cropbar').hidden = true; $('#loss').hidden = false; $('#dbody').hidden = false;
-  applyShrink();
+  syncEditorLayout();
   $('#cropBtn').classList.toggle('on', !!D.p.geom);
 }
 

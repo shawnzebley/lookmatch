@@ -63,21 +63,31 @@ main { padding: 14px 16px; max-width: 900px; margin: 0 auto; }
 @keyframes sp { to { transform: rotate(360deg); } }
 
 /* detail */
-.detail { position: fixed; inset: 0; z-index: 40; background: var(--bg); overflow-y: auto; overflow-anchor: none; padding: 0 0 calc(24px + var(--safe-b)); -webkit-overflow-scrolling: touch; }
+.detail { position: fixed; inset: 0; z-index: 40; height: 100vh; height: 100dvh; display: flex; flex-direction: column; background: var(--bg); overflow: hidden; overflow-anchor: none; padding: 0; }
+.editor-layout { display: flex; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+.editor-main { display: flex; flex: 1 1 auto; min-width: 0; min-height: 0; max-width: none; margin: 0; padding: 0; }
 .dhead { display: flex; align-items: center; gap: 8px; padding: calc(var(--safe-t) + 8px) 12px 8px; background: rgba(17,18,20,.94); backdrop-filter: blur(12px); border-bottom: 1px solid var(--line); }
 .dhead .nm { flex: 1; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dtop { position: sticky; top: 0; z-index: 5; background: var(--bg); box-shadow: 0 6px 18px rgba(0,0,0,.45); }
-.stage { position: relative; background: #000; height: 40vh; display: flex; align-items: center; justify-content: center; overflow: hidden; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
-@media (orientation: landscape) { .stage { height: 62vh; } }
+.dtop { position: relative; display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
+.stage { position: relative; flex: 1 1 auto; min-width: 0; min-height: 120px; background: #000; height: auto; display: flex; align-items: center; justify-content: center; overflow: hidden; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
 .stage canvas { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto; touch-action: none; }
-.dctl { display: flex; gap: 8px; align-items: center; padding: 8px 12px 6px; }
+.dctl { display: flex; flex: none; gap: 8px; align-items: center; padding: 8px 12px calc(8px + var(--safe-b)); }
 .dctl .grow { flex: 1; }
 .dctl button { padding: 6px 11px; font-size: 13px; white-space: nowrap; }
 .dhead button { padding: 7px 12px; }
-.dpanel { flex: none; height: clamp(160px, 30dvh, 320px); display: flex; flex-direction: column; background: var(--panel); border-top: 1px solid var(--line); padding-bottom: var(--safe-b); }
-.ptabs { flex: none; display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; padding: 8px 12px 6px; }
-.ptabs button { flex: none; padding: 5px 13px; font-size: 13px; border-radius: 99px; background: transparent; color: var(--muted); }
+.dpanel { order: -1; flex: 0 0 320px; width: 320px; min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--panel); border-right: 1px solid var(--line); overflow: hidden; }
+.panel-head { flex: none; padding: 8px 10px 0; border-bottom: 1px solid var(--line); }
+.panel-topline { display: flex; align-items: center; justify-content: space-between; min-height: 34px; }
+.panel-title { margin: 0; font-size: 14px; font-weight: 650; }
+.panel-toggle { flex: none; width: 32px; height: 30px; padding: 0; font-size: 20px; line-height: 1; }
+.edit-actions { display: flex; flex-wrap: wrap; gap: 5px; padding: 5px 0 8px; }
+.edit-actions button { flex: 1 1 calc(33.333% - 5px); min-width: 0; padding: 6px 5px; font-size: 12px; white-space: nowrap; }
+.ptabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; padding: 0 0 8px; }
+.ptabs button { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 5px; padding: 6px 4px; font-size: 12px; border-radius: 8px; background: transparent; color: var(--muted); }
+.tab-icon { font-size: 15px; line-height: 1; }
 .ptabs button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+.dpanel #dPick { flex-direction: column; overflow: visible; }
+.dpanel #dPick button { width: 100%; justify-content: flex-start; white-space: normal; text-align: left; }
 .curve-channels { width: max-content; max-width: 100%; margin: 0 auto 8px; }
 .curve-channels button { padding: 6px 11px; font-size: 12px; }
 .curve-graph { display: block; width: min(100%, 320px); aspect-ratio: 1; margin: 6px auto 8px; border-radius: 8px; background: #121416; touch-action: none; user-select: none; }
@@ -90,9 +100,8 @@ main { padding: 14px 16px; max-width: 900px; margin: 0 auto; }
 .curve-graph:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .curve-actions { justify-content: center; flex-wrap: wrap; }
 .curve-actions button { padding: 6px 11px; font-size: 12px; }
-.pager { flex: 1; min-height: 0; display: flex; overflow-x: auto; overflow-y: hidden; scroll-snap-type: x mandatory; scrollbar-width: none; overscroll-behavior-x: contain; }
-.pager::-webkit-scrollbar { display: none; }
-.page { flex: 0 0 100%; min-width: 0; overflow-y: auto; scroll-snap-align: start; scroll-snap-stop: always; overscroll-behavior: contain; padding: 0 4px 12px; }
+.pager { flex: 1 1 auto; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 0 0 12px; }
+.page { min-width: 0; overflow: visible; padding: 8px 4px 4px; scroll-margin-top: 8px; }
 .page .card { background: none; border: 0; border-radius: 0; margin: 0; padding: 4px 12px 8px; }
 .page .card + .card { border-top: 1px solid var(--line); padding-top: 12px; }
 .page > .card, .page > .card > * { max-width: 700px; margin-left: auto; margin-right: auto; }
@@ -164,15 +173,14 @@ ol.steps { padding-left: 20px; margin: 6px 0; } ol.steps li { margin-bottom: 6px
 .fin button { padding: 7px 11px; font-size: 13px; }
 .fin button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
 
-/* stage shrinks with scroll (height set inline by applyShrink); ref thumbnail gets out of the way */
-.stage .refthumb.mini, .stage .refthumb.mini + .reflbl { opacity: .0; pointer-events: none; }
 .stage .refthumb, .stage .reflbl { transition: opacity .15s; }
 #cropBtn.on { border-color: var(--accent); color: var(--accent); }
 .detail.cropping .refthumb, .detail.cropping .reflbl { display: none; }
 
 /* crop + level */
 .detail.cropping { overflow: hidden; }
-.detail.cropping .stage { height: calc(100vh - 250px - var(--safe-t) - var(--safe-b)); min-height: 240px; }
+.detail.cropping .editor-main { flex: 1 1 100%; }
+.detail.cropping .stage { height: auto; min-height: 160px; }
 .detail.cropping .stage canvas { touch-action: none; }
 .cropbar { padding: 8px 12px calc(10px + var(--safe-b)); display: grid; gap: 10px; }
 .cropbar .aspects { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; }
@@ -184,6 +192,24 @@ ol.steps { padding-left: 20px; margin: 6px 0; } ol.steps li { margin-bottom: 6px
 .cropbar .level button { padding: 6px 10px; font-size: 13px; }
 .cropbar .row { display: flex; gap: 8px; align-items: center; }
 .cropbar .row .grow { flex: 1; }
+.detail.panel-collapsed .dpanel { flex-basis: 56px; width: 56px; }
+.detail.panel-collapsed .panel-title, .detail.panel-collapsed .edit-actions, .detail.panel-collapsed .tab-label, .detail.panel-collapsed .pager { display: none; }
+.detail.panel-collapsed .panel-head { padding: 7px 4px; }
+.detail.panel-collapsed .panel-topline { justify-content: center; }
+.detail.panel-collapsed .panel-toggle { width: 42px; }
+.detail.panel-collapsed .ptabs { display: flex; flex-direction: column; gap: 4px; padding: 8px 0 0; }
+.detail.panel-collapsed .ptabs button { width: 42px; height: 42px; margin: 0 auto; padding: 0; }
+.detail.cropping .dpanel[hidden] { display: none !important; }
+@media (max-width: 700px) and (orientation: portrait) {
+  .dpanel { flex-basis: min(320px, calc(100vw - 150px)); width: min(320px, calc(100vw - 150px)); }
+  .ptabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .edit-actions button { flex-basis: calc(50% - 5px); }
+  .dhead { gap: 4px; padding-left: 6px; padding-right: 6px; }
+  .dhead button { padding: 5px 7px; font-size: 12px; }
+  .dctl { padding: 5px 4px calc(5px + var(--safe-b)); }
+  .dctl .seg button { padding: 5px 8px; font-size: 11px; }
+  .detail.panel-collapsed .dpanel { flex-basis: 56px; width: 56px; }
+}
 
 /* colour wheels */
 .wheels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 6px; }
