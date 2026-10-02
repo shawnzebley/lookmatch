@@ -109,8 +109,8 @@ const near0 = (...v) => v.every((x) => Math.abs(x) < 3);
 export function lookFade(own, target) {
   if (!target || target.p1 == null || target.p99 == null) return null;
   return {
-    fadeBlacks: Math.max(Math.round(clamp((target.p1 - own.p1) / 0.25, 0, 100)), own.clipLo > 0.002 ? 6 : 0),
-    fadeWhites: Math.max(Math.round(clamp((own.p99 - target.p99) / 0.25, 0, 100)), own.clipHi > 0.002 ? 4 : 0),
+    fadeBlacks: Math.max(Math.round(clamp((target.p1 - own.p1) / 0.25, 0, 60)), own.clipLo > 0.002 ? 6 : 0),
+    fadeWhites: Math.max(Math.round(clamp((own.p99 - target.p99) / 0.25, 0, 60)), own.clipHi > 0.002 ? 4 : 0),
   };
 }
 

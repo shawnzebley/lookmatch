@@ -349,7 +349,7 @@ export function measure(ps, cur, idx) {
   const z = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
   let na = 0, nb = 0, nn = 0;
   const band = Array.from({ length: 8 }, () => ({ w: 0, a: 0, b: 0, c: 0, l: 0 }));
-  const bandBg = Array.from({ length: 8 }, () => ({ w: 0, a: 0, b: 0, c: 0, l: 0 })); // same bands with skin pixels left out
+  const bandBg = Array.from({ length: 8 }, () => ({ w: 0, a: 0, b: 0, c: 0, l: 0 })); // same bands without skin, light sources (L* >= 90) or near-black
   let sl = 0;
   let sa = 0, sb = 0, sc = 0, sn = 0; const skinH = []; let ha = 0, hb = 0, hc = 0, hn = 0;
 
@@ -371,7 +371,7 @@ export function measure(ps, cur, idx) {
       const w = m.bw[o + q];
       if (w > 0) {
         const bd = band[q]; bd.w += w; bd.a += w * a; bd.b += w * b; bd.c += w * c; bd.l += w * l;
-        if (!m.skin[i]) { const bg = bandBg[q]; bg.w += w; bg.a += w * a; bg.b += w * b; bg.c += w * c; bg.l += w * l; }
+        if (!m.skin[i] && l > 8 && l < 90) { const bg = bandBg[q]; bg.w += w; bg.a += w * a; bg.b += w * b; bg.c += w * c; bg.l += w * l; }
       }
     }
     if (m.skin[i]) { sa += a; sb += b; sc += c; sl += l; sn++; skinH.push(Math.atan2(b, a) * 180 / Math.PI); if (m.skin[i] === 2) { ha += a; hb += b; hc += c; hn++; } }
