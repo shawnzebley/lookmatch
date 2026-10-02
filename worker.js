@@ -22,7 +22,7 @@ import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
 import { stylizeRemote } from './lib/deeppreset.js';
-import { autoAdjustResult, hasReferenceCurve } from './engine/auto-adjust.js';
+import { autoAdjustResult, hasReferenceCurve, skinWhiteBalance, presenceFor, highlightRollOff } from './engine/auto-adjust.js';
 
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
@@ -476,6 +476,12 @@ function autoCurves(ps, params) {
   place(q50, ym);
   place(q25, st(q25) - push);
   place(q75, st(q75) + push);
+  // exposure was lifted: pull the highlights down first so the lift stays balanced (kept inside AUTO_SLOPE)
+  const roll = highlightRollOff(params.exposure || 0);
+  if (roll) {
+    const hx = Math.round((Math.max(q75, 150) + wx) / 2), M0 = curveLUT(curve);
+    place(hx, Math.round(255 * M0[Math.round(hx / 255 * 1023)]) - roll);
+  }
 
   // channel curves sit after the light curve, so measure through it (percentiles survive a monotone map)
   const M = curveLUT(curve);
@@ -665,9 +671,21 @@ const handlers = {
     const s = measure(e.ps), t = s.tone, p = t.pct;
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
     const exposure = clamp(Math.log2(lToY(47) / Math.max(0.0001, lToY(p[50]))) * 0.24, -0.35, 0.35);
+    // dark photos can take a bigger lift, because the curve below pulls the highlights down to balance it
+    const lift = exposure > 0 ? clamp(exposure * 1.6, 0, 0.6) : exposure;
     const highlights = clamp(-(p[99] - 94) * 0.22 - (t.clipHi > 0.002 ? 3 : 0), -10, 0);
     const shadows = clamp((5 - p[5]) * 0.22 + (t.clipLo > 0.002 ? 3 : 0), 0, 7);
-    const basic = { exposure, contrast: 0, highlights, shadows, whites: 0, blacks: 0 };
+    const basic = { exposure: lift, contrast: 0, highlights, shadows, whites: 0, blacks: 0 };
+    // white balance on skin, then saturation down / vibrance up (portrait rules)
+    const cur0 = processPixelSet(e.ps, { ...params, ...basic });
+    let sn = 0, sa = 0, sb = 0, cn = 0, cs = 0;
+    const sk = e.ps.skinMask;
+    for (let i = 0; i < e.ps.n; i++) {
+      if (cur0.L[i] > 12 && cur0.L[i] < 95) { cs += Math.hypot(cur0.A[i], cur0.B[i]); cn++; }
+      if (sk && sk[i] >= 191 && cur0.L[i] > 25 && cur0.L[i] < 92) { sa += cur0.A[i]; sb += cur0.B[i]; sn++; }
+    }
+    const wb = sn >= e.ps.n * 0.002 ? skinWhiteBalance(sa / sn, sb / sn) : { temp: 0, tint: 0 };
+    Object.assign(basic, presenceFor(cn ? cs / cn : NaN), wb.temp || wb.tint ? { temp: clamp((params.temp || 0) + wb.temp, -60, 60), tint: clamp((params.tint || 0) + wb.tint, -50, 50) } : {});
     const curves = autoCurves(e.ps, { ...params, ...basic, curve: null, curveR: null, curveG: null, curveB: null });
     return autoAdjustResult(params, { ...basic, ...curves });
   },
