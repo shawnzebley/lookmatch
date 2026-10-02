@@ -156,7 +156,7 @@ async function ensureMask(e, bmp) {
     if (e.faces === undefined) {
       try { e.faces = await detectFaces(bmp); } catch { e.faces = null; }
     }
-    people = await detectPeople(bmp, w, h, e.faces || [], skin);
+    if ((m?.skinFrac || 0) >= 0.0005) people = await detectPeople(bmp, w, h, e.faces || [], skin);
   } catch (err) { console.warn('per-person mask failed', err); }
   const skinPeople = people?.labels || new Uint8Array(w * h);
   const skinPositions = people?.positions || [];
@@ -506,7 +506,7 @@ const handlers = {
     stats.scene = e.scene;
     stats.regions = regionStats(e.ps);
     stats.maskedRegions = referenceRegionTargets(e.ps);
-    stats.matchVersion = 2;
+    stats.matchVersion = 3;
     stats.signature = { halation: halationSignature(e.ps) };
     const thumb = await toJpegBlob(scaledData(bmp, 480), 0.85);
     bmp.close();

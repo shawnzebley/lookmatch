@@ -241,7 +241,7 @@ button.small { padding: 6px 10px; font-size: 13px; }
 .row.wrap { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* editor style card */
-.chips-row { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; margin-top: 10px; padding-bottom: 2px; }
+.chips-row { display: flex; gap: 6px; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; margin-top: 10px; padding-bottom: 2px; }
 .chips-row button { flex: none; padding: 7px 11px; font-size: 13px; display: flex; align-items: center; gap: 6px; }
 .chips-row button img { width: 24px; height: 24px; border-radius: 5px; object-fit: cover; }
 .chips-row button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
