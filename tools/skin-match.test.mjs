@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { applySkinMatchLinear, applySkinMatchRGBA, fitSkinMatch, skinStats } from '../engine/skin-match.js';
-import { SRGB8_TO_LIN, linearToSrgb, labToLin } from '../engine/color.js';
+import { SRGB8_TO_LIN, linearToSrgb, linToLab, labToLin } from '../engine/color.js';
 
 const rgbFor = (L, a, b) => labToLin(L, a, b, [0, 0, 0]);
 const makePs = (n = 30, lab = [55, 12, 18]) => {
@@ -246,4 +246,43 @@ test('RGBA leaves zero-mask and unassigned v2 pixels byte-identical', () => {
   const data = before.slice();
   applySkinMatchRGBA(data, match, new Uint8Array([0, 255]), 4, new Uint8Array([1, 0]), before);
   assert.deepEqual(data, before);
+});
+
+test('RGBA batch matches the single-pixel linear path across people and masks', () => {
+  const ps = makeGroupedPs({ people: [1, 2] }), match = fitSkinMatch(ps, ps, shiftedReference(ps));
+  const n = 36, ch = 4, original = new Uint8Array(n * ch), actual = new Uint8Array(n * ch);
+  const mask = new Uint8Array(n), people = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const j = i * ch, r = 50 + (i * 29) % 190;
+    original[j] = actual[j] = r; original[j + 1] = actual[j + 1] = 40 + (i * 43) % 200;
+    original[j + 2] = actual[j + 2] = 30 + (i * 61) % 210; original[j + 3] = actual[j + 3] = 90 + i;
+    mask[i] = i % 5 === 0 ? 0 : i % 3 === 0 ? 192 : 255;
+    people[i] = i % 7 === 0 ? 0 : 1 + (i % 2);
+  }
+  const expected = actual.slice(), res = [0, 0, 0, 0, 0, 0], lab = [0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    if (!mask[i] || !people[i]) continue;
+    const j = i * ch;
+    res[0] = SRGB8_TO_LIN[expected[j]]; res[1] = SRGB8_TO_LIN[expected[j + 1]]; res[2] = SRGB8_TO_LIN[expected[j + 2]];
+    linToLab(SRGB8_TO_LIN[original[j]], SRGB8_TO_LIN[original[j + 1]], SRGB8_TO_LIN[original[j + 2]], lab);
+    applySkinMatchLinear(res, { skinMatch: match }, mask[i], people[i], lab[0]);
+    expected[j] = Math.round(linearToSrgb(res[0]) * 255); expected[j + 1] = Math.round(linearToSrgb(res[1]) * 255); expected[j + 2] = Math.round(linearToSrgb(res[2]) * 255);
+  }
+  applySkinMatchRGBA(actual, match, mask, ch, people, original);
+  assert.deepEqual(actual, expected);
+});
+
+test('cached person profile observes in-place parameter edits', () => {
+  const source = rgbFor(55, 12, 18), original = [
+    Math.round(linearToSrgb(source[0]) * 255), Math.round(linearToSrgb(source[1]) * 255), Math.round(linearToSrgb(source[2]) * 255), 255,
+  ];
+  const match = { version: 2, people: [{ id: 1, zones: [
+    { center: 30, deltaL: 0, deltaA: 0, deltaB: 0 }, { center: 55, deltaL: 0, deltaA: 0, deltaB: 0 }, { center: 80, deltaL: 0, deltaA: 0, deltaB: 0 },
+  ] }] };
+  const first = Uint8Array.from(original);
+  applySkinMatchRGBA(first, match, new Uint8Array([255]), 4, new Uint8Array([1]), Uint8Array.from(original));
+  match.people[0].zones[1].deltaA = 8;
+  const second = Uint8Array.from(original);
+  applySkinMatchRGBA(second, match, new Uint8Array([255]), 4, new Uint8Array([1]), Uint8Array.from(original));
+  assert.notDeepEqual(second.slice(0, 3), first.slice(0, 3));
 });

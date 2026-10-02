@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-10-01a';
+const APP_VERSION = '2026-10-01b';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -111,6 +111,11 @@ class Pool {
   call(idx, type, args, { priority = false } = {}) {
     const w = this.workers[idx];
     return new Promise((res, rej) => {
+      if (type === 'solve') {
+        const superseded = w.queue.filter((job) => job.type === 'solve' && job.args.id === args.id);
+        w.queue = w.queue.filter((job) => !superseded.includes(job));
+        for (const job of superseded) job.rej(new Error('A newer look replaced this queued match'));
+      }
       const job = { type, args, res, rej };
       priority ? w.queue.unshift(job) : w.queue.push(job);
       this.pump(w);
@@ -573,17 +578,15 @@ function solveArgs(p) {
 // References saved before subject/background existed: measure the split once from the saved thumbnail.
 const upgrading = new Map();
 function ensurePresetRegions(pr) {
-  const measured = pr && pr.stats && pr.stats.regions;
-  const current = measured && measured.subject && measured.subject.tone && measured.subject.bands
-    && measured.background && measured.background.tone && measured.background.bands
-    && pr.stats.signature && Number.isFinite(pr.stats.signature.halation) && pr.stats.matchVersion === 2;
+  const stats = pr?.stats;
+  const current = stats?.matchVersion === 3 && Number.isFinite(stats.signature?.halation);
   if (!pr || pr.lr || !pr.stats || current || !pr.thumb) return Promise.resolve();
   if (!upgrading.has(pr.id)) {
     upgrading.set(pr.id, (async () => {
       try {
         const r = await pool.call(0, 'measureRef', { file: await dataURLToBlob(pr.thumb) }, { priority: true });
         pr.stats.regions = r.stats.regions || null; pr.stats.signature = r.stats.signature || { halation: 0 };
-        pr.stats.maskedRegions = r.stats.maskedRegions; pr.stats.skinMatch = r.stats.skinMatch; pr.stats.matchVersion = 2;
+        pr.stats.maskedRegions = r.stats.maskedRegions; pr.stats.skinMatch = r.stats.skinMatch; pr.stats.matchVersion = 3;
       } catch (e) { pr.stats.regions = null; pr.stats.signature ||= { halation: 0 }; }
       try { await db.putPreset(pr); } catch (e) { /* stays in memory */ }
     })());
@@ -595,11 +598,14 @@ function ensurePresetRegions(pr) {
 const KEEP_KEYS = ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points'];
 const keptEdits = (params) => Object.fromEntries(KEEP_KEYS.filter((k) => params && params[k] != null).map((k) => [k, structuredClone(params[k])]));
 
+const solveRuns = new WeakMap();
 function solvePhoto(p, { priority = false } = {}) {
   if (!solveArgs(p)) return Promise.resolve();
+  const run = (solveRuns.get(p) || 0) + 1; solveRuns.set(p, run);
   const look = lookOf(p);
   p.status = 'solving'; p.solvedLook = look; rerenderMatchSoon();
-  return ensurePresetRegions(presetOf(p)).then(() => pool.call(p.worker, 'solve', { id: p.id, ...solveArgs(p) }, { priority })).then((r) => {
+  return ensurePresetRegions(presetOf(p)).then(() => solveRuns.get(p) === run ? pool.call(p.worker, 'solve', { id: p.id, ...solveArgs(p) }, { priority }) : null).then((r) => {
+    if (!r || solveRuns.get(p) !== run) return null;
     Object.assign(r.params, keptEdits(p.params));
     if (r.model && !r.model.ok) toast(`Model assist failed, matched without it: ${r.model.error}`);
     Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, model: r.model, style: r.style, regions: r.regions, mask: r.mask || p.mask, status: 'done' });
@@ -609,7 +615,7 @@ function solvePhoto(p, { priority = false } = {}) {
     // restyled in the background while its editor is open (style changed for all photos)
     else if (!priority && D && D.p === p && !D.crop) { D.userEdited = false; refreshDetail(); }
     return r;
-  }).catch((e) => { p.status = 'error'; p.error = e.message; p.errRec = logError('style photo', e, p.file); rerenderMatchSoon(); });
+  }).catch((e) => { if (solveRuns.get(p) !== run) return null; p.status = 'error'; p.error = e.message; p.errRec = logError('style photo', e, p.file); rerenderMatchSoon(); });
 }
 
 function runQueue() {
@@ -1368,7 +1374,10 @@ function styleCard(p) {
 function renderStyleCard() {
   if (!D) return;
   const p = D.p, box = $('#styleCard');
+  const pickScrollLeft = $('#dPick', box)?.scrollLeft || 0;
   box.innerHTML = styleCard(p);
+  const picks = $('#dPick', box);
+  if (picks) picks.scrollLeft = pickScrollLeft;
   const resolve = async () => {
     p.style = null; renderStyleCard();
     await solvePhoto(p, { priority: true });

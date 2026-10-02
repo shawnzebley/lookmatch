@@ -5,6 +5,7 @@
 // refined against the photo's own edges with a guided filter so hair and shoulders follow the image.
 import { ImageSegmenter, InteractiveSegmenterLegacy } from './vendor/mediapipe/vision_bundle.mjs';
 import { lazyTask } from './mp.js';
+import { fuseCropProbabilities, personProbabilities } from './engine/mask-refine.js';
 
 export const MASK_SIDE = 1024;
 const MODEL_SIDE = 512; // what the models are fed (they resample to 256 / 512 themselves)
@@ -108,11 +109,16 @@ function refine(prob, pw, ph, guide, w, h) {
 function personProb(seg, img) {
   const r = seg.segment(img);
   try {
-    const cm = r.confidenceMasks, bg = cm[0].getAsFloat32Array();
+    const cm = r.confidenceMasks;
+    const width = cm[0].width || img.width, height = cm[0].height || img.height;
+    const hair = cm[1] && cm[1].getAsFloat32Array();
     const body = cm[2] && cm[2].getAsFloat32Array(), face = cm[3] && cm[3].getAsFloat32Array();
-    const p = new Float32Array(bg.length), sk = new Float32Array(bg.length);
-    for (let i = 0; i < p.length; i++) { p[i] = 1 - bg[i]; sk[i] = body && face ? Math.min(1, body[i] + face[i]) : 0; }
-    return { p, sk };
+    const clothes = cm[4] && cm[4].getAsFloat32Array();
+    // Model classes: 0 background, 1 hair, 2 body skin, 3 face skin, 4 clothes, 5 accessories.
+    // Accessories contribute only beside supported person classes, so hats/glasses stay attached.
+    const accessories = cm[5] && cm[5].getAsFloat32Array();
+    const { foreground: p, skin: sk } = personProbabilities({ hair, body, face, clothes, accessories, width, height });
+    return { p, sk, width, height };
   } finally { r.close(); }
 }
 
@@ -137,7 +143,7 @@ export async function personMask(bmp) {
   const s1 = Math.min(1, MODEL_SIDE / Math.max(W, H));
   const pw = Math.max(1, Math.round(W * s1)), ph = Math.max(1, Math.round(H * s1));
   const p1 = personProb(seg, draw(bmp, 0, 0, W, H, pw, ph));
-  let prob = resample(p1.p, pw, ph, w, h), skin = resample(p1.sk, pw, ph, w, h);
+  let prob = resample(p1.p, p1.width, p1.height, w, h), skin = resample(p1.sk, p1.width, p1.height, w, h);
   // bounding box of what was found
   let x0 = w, y0 = h, x1 = -1, y1 = -1, cnt = 0;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (prob[y * w + x] > 0.5) { cnt++; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
@@ -154,19 +160,21 @@ export async function personMask(bmp) {
     const s2 = Math.min(1, MODEL_SIDE / Math.max(cw * k, chh * k));
     const qw = Math.max(1, Math.round(cw * k * s2)), qh = Math.max(1, Math.round(chh * k * s2));
     const q2 = personProb(seg, draw(bmp, cx0 * k, cy0 * k, cw * k, chh * k, qw, qh));
-    const p2 = resample(q2.p, qw, qh, cw, chh), sk2 = resample(q2.sk, qw, qh, cw, chh);
-    // blend the close look in, fading to the whole-frame pass over the crop's outer band
+    const p2 = resample(q2.p, q2.width, q2.height, cw, chh), sk2 = resample(q2.sk, q2.width, q2.height, cw, chh);
+    // Let the close pass refine/extend the full-frame silhouette locally. It cannot create a
+    // crop-shaped foreground patch where the full-frame pass found no person evidence.
     const fade = Math.max(2, Math.round(0.08 * Math.min(cw, chh)));
-    // sides of the crop that sit on the photo's border need no fade
-    const inf = 1e9;
-    for (let y = 0; y < chh; y++) {
-      for (let x = 0; x < cw; x++) {
-        const edge = Math.min(cx0 > 0 ? x : inf, cy0 > 0 ? y : inf, cx1 < w ? cw - 1 - x : inf, cy1 < h ? chh - 1 - y : inf);
-        const t = Math.min(1, edge / fade);
-        const i = (cy0 + y) * w + cx0 + x;
-        prob[i] = prob[i] + (p2[y * cw + x] - prob[i]) * t;
-        skin[i] = skin[i] + (sk2[y * cw + x] - skin[i]) * t;
-      }
+    const supportRadius = Math.max(3, Math.round(Math.min(cw, chh) * 0.02));
+    fuseCropProbabilities(prob, p2, w, h, { x0: cx0, y0: cy0, cropWidth: cw, cropHeight: chh, fade, supportRadius });
+    // Skin classes only sharpen skin already supported by the full-frame person probability.
+    const skinSupport = new Uint8Array(w * h);
+    for (let i = 0; i < skin.length; i++) skinSupport[i] = prob[i] >= 0.2 ? 1 : 0;
+    for (let y = 0; y < chh; y++) for (let x = 0; x < cw; x++) {
+      const i = (cy0 + y) * w + cx0 + x;
+      if (!skinSupport[i]) continue;
+      const edge = Math.min(cx0 > 0 ? x : 1e9, cy0 > 0 ? y : 1e9, cx1 < w ? cw - 1 - x : 1e9, cy1 < h ? chh - 1 - y : 1e9);
+      const t = Math.min(1, edge / fade), j = y * cw + x;
+      skin[i] += (sk2[j] - skin[i]) * t;
     }
   }
   const data = refine(prob, w, h, guide, w, h);
@@ -193,7 +201,8 @@ export async function tapMask(bmp, x, y) {
     const m = r.confidenceMasks && r.confidenceMasks[0];
     if (!m) return null;
     prob = Float32Array.from(m.getAsFloat32Array());
+    const mw = m.width, mh = m.height;
+    const guide = lumaOf(draw(bmp, 0, 0, W, H, w, h));
+    return { w, h, data: refine(prob, mw, mh, guide, w, h) };
   } finally { r.close(); }
-  const guide = lumaOf(draw(bmp, 0, 0, W, H, w, h));
-  return { w, h, data: refine(prob, pw, ph, guide, w, h) };
 }

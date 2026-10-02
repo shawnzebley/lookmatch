@@ -422,7 +422,7 @@ export function measure(ps, cur, idx) {
   const skin = { source: ps.skinSource, faces: ps.faceCount, frac: sn / N, hue: sh, chroma: sn ? sc / sn : 0, hueSpread: sn ? Math.sqrt(sv / sn) : 0,
     litHue: hn ? Math.atan2(hb / hn, ha / hn) * 180 / Math.PI : 0, litChroma: hn ? hc / hn : 0 };
 
-  return { tone, curve, wb, zones, bands, color, skin, skinMatch: skinStats(ps, cur, idx) };
+  return { tone, curve, wb, zones, bands, color, skin, skinMatch: idx ? null : skinStats(ps, cur) };
 }
 
 // Round everything for printing / storage.
