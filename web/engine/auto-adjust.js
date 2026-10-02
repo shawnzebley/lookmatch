@@ -1,13 +1,7 @@
-// Keep reference-matched tonal targets intact when Auto Adjust is requested.
-export function hasReferenceCurve(params = {}) {
-  return params.curveAuto === 'reference' ||
-    ['subject', 'background'].some((region) => params.local?.[region]?.curveAuto === 'reference');
-}
-
+// Auto Adjust chases the chosen look itself (fade, curves, picked colours, HSL), so a reference match is
+// recalculated rather than preserved; Re-match brings the solver's version back.
 export function autoAdjustResult(params = {}, calculated = {}) {
-  return hasReferenceCurve(params)
-    ? { ...params, preservedReference: true }
-    : { ...calculated, preservedReference: false };
+  return { ...calculated, preservedReference: false };
 }
 
 // Portrait rules for Auto Adjust, taken from a working portrait editor's Lightroom routine. Each is
@@ -84,4 +78,61 @@ export function lookColor(bands = {}, minWeight = 0.03) {
   const hsl = {};
   for (const k of present) if (k !== top) { hsl[`sat_${k}`] = BAND_LOOK[k].sat; hsl[`lum_${k}`] = BAND_LOOK[k].lum; }
   return { point, hsl };
+}
+
+// ---- chasing a chosen look. own = the photo as it stands, target = what the look measures (a reference's
+// stats, or a photographer's nearest published scenes). Every move is capped so one click never overshoots.
+const angDiff = (t, o) => ((t - o + 540) % 360) - 180;
+const near0 = (...v) => v.every((x) => Math.abs(x) < 3);
+
+// Fade only toward the look's black and white ends (a matte look lifts the floor, a soft one drops the top),
+// never below what keeps the photo from clipping.
+// own: { p1, p99, clipLo, clipHi } (L* percentiles, clip fractions); target: { p1, p99 }
+export function lookFade(own, target) {
+  if (!target || target.p1 == null || target.p99 == null) return null;
+  return {
+    fadeBlacks: Math.max(Math.round(clamp((target.p1 - own.p1) / 0.25, 0, 60)), own.clipLo > 0.002 ? 6 : 0),
+    fadeWhites: Math.max(Math.round(clamp((own.p99 - target.p99) / 0.25, 0, 60)), own.clipHi > 0.002 ? 4 : 0),
+  };
+}
+
+// Skin point: own skin { L, a, b } toward the look's skin { hue, chroma } (Lab hue degrees).
+export function lookSkinPoint(own, target) {
+  const C = Math.hypot(own.a, own.b);
+  if (!target || !Number.isFinite(target.hue) || !Number.isFinite(target.chroma) || !(C >= 4)) return null;
+  const h = Math.atan2(own.b, own.a) * 180 / Math.PI;
+  const hue = Math.round(clamp(angDiff(target.hue, h) / 30 * 100, -35, 35));
+  const sat = Math.round(clamp((target.chroma / C - 1) * 100, -30, 30));
+  const lum = own.L < 55 ? 6 : own.L > 80 ? -4 : 0;
+  if (near0(hue, sat, lum)) return null;
+  return { L: own.L, a: own.a, b: own.b, hue, sat, lum, range: 35, auto: true };
+}
+
+// Colour bands toward the look's (hue, saturation, luminance of each band). Skin hues (red, orange) are left
+// to the skin point. The band that has to move most gets a picked point; the others get HSL deltas.
+export function lookBands(own = {}, target = {}) {
+  const moves = [];
+  for (const k of ['yellow', 'green', 'aqua', 'blue', 'purple', 'magenta']) {
+    const o = own[k], t = target[k];
+    if (!o || !t || !(o.weight >= 0.02) || !(o.chroma > 8) || !(t.weight >= 0.01) || !(t.chroma > 5)) continue;
+    const sat = Math.round(clamp((t.chroma / o.chroma - 1) * 70, -35, 35));
+    const hue = Math.round(clamp(angDiff(t.hue, o.hue) / 30 * 100, -40, 40));
+    const lum = Math.round(clamp(((t.lumRel || 0) - (o.lumRel || 0)) * 1.2, -20, 20));
+    if (near0(sat, hue, lum)) continue;
+    moves.push({ k, o, sat, hue, lum, score: o.weight * (Math.abs(sat) + Math.abs(hue) * 0.5 + Math.abs(lum)) });
+  }
+  if (!moves.length) return { point: null, hsl: {} };
+  const top = moves.reduce((m, v) => (v.score > m.score ? v : m));
+  const rad = top.o.hue * Math.PI / 180;
+  const point = { L: top.o.lum, a: top.o.chroma * Math.cos(rad), b: top.o.chroma * Math.sin(rad), hue: top.hue, sat: top.sat, lum: top.lum, range: 40, auto: true };
+  const hsl = {};
+  for (const m of moves) if (m !== top) { hsl[`hue_${m.k}`] = m.hue; hsl[`sat_${m.k}`] = m.sat; hsl[`lum_${m.k}`] = m.lum; }
+  return { point, hsl };
+}
+
+// Overall colour intensity toward the look's mean chroma.
+export function lookPresence(ownChroma, targetChroma) {
+  if (!(ownChroma > 1) || !(targetChroma > 0)) return null;
+  const r = clamp(targetChroma / ownChroma, 0.5, 1.6);
+  return { saturation: Math.round(clamp((r - 1) * 30, -25, 10)), vibrance: Math.round(clamp((r - 1) * 50, -25, 35)) };
 }

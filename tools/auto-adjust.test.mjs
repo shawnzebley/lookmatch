@@ -1,20 +1,10 @@
 import assert from 'node:assert/strict';
 import { autoAdjustResult } from '../engine/auto-adjust.js';
 
-const matched = {
-  exposure: 0.2,
-  curveAuto: 'reference',
-  curve: [[0, 0], [128, 141], [255, 255]],
-  curveR: [[0, 0], [128, 132], [255, 255]],
-  local: { subject: { curveAuto: 'reference', curve: [[0, 0], [128, 120], [255, 255]] } },
-};
-assert.deepEqual(autoAdjustResult(matched), { ...matched, preservedReference: true });
-
+// a reference match is recalculated toward the look, not preserved
 const calculated = { exposure: 0.1, highlights: -1, curve: [[0, 0], [255, 255]] };
+assert.deepEqual(autoAdjustResult({ curveAuto: 'reference', curve: [[0, 0], [128, 141], [255, 255]] }, calculated), { ...calculated, preservedReference: false });
 assert.deepEqual(autoAdjustResult({}, calculated), { ...calculated, preservedReference: false });
-assert.deepEqual(autoAdjustResult({ local: { subject: { curveAuto: 'reference' } } }), {
-  local: { subject: { curveAuto: 'reference' } }, preservedReference: true,
-});
 console.log('auto-adjust checks passed');
 
 import { skinWhiteBalance, presenceFor, highlightRollOff } from '../engine/auto-adjust.js';
@@ -49,3 +39,26 @@ assert.ok(lc.point.auto && lc.point.sat > 0 && Math.abs(lc.point.L - 40) < 1e-9)
 assert.deepEqual(lc.hsl, { sat_green: -10, lum_green: -4 });
 assert.deepEqual(lookColor({}), { point: null, hsl: {} });
 console.log('look rule checks passed');
+
+import { lookFade, lookSkinPoint, lookBands, lookPresence } from '../engine/auto-adjust.js';
+// fade moves only toward the look's ends
+assert.deepEqual(lookFade({ p1: 2, p99: 98, clipLo: 0, clipHi: 0 }, { p1: 10, p99: 90 }), { fadeBlacks: 32, fadeWhites: 32 });
+assert.deepEqual(lookFade({ p1: 12, p99: 85, clipLo: 0, clipHi: 0 }, { p1: 4, p99: 90 }), { fadeBlacks: 0, fadeWhites: 0 });
+assert.equal(lookFade({ p1: 12, p99: 85, clipLo: 0.01, clipHi: 0 }, { p1: 4, p99: 90 }).fadeBlacks, 6);
+assert.equal(lookFade({ p1: 2, p99: 98 }, null), null);
+// skin: rotate and saturate toward the look's skin, small and capped
+const sk = lookSkinPoint({ L: 60, a: 12, b: 22 }, { hue: 45, chroma: 30 });
+assert.ok(sk.auto && sk.hue < 0 && sk.sat > 0 && Math.abs(sk.hue) <= 35 && sk.sat <= 30);
+assert.equal(lookSkinPoint({ L: 60, a: 15, b: 20 }, { hue: 53.13, chroma: 25 }), null);
+// bands: the biggest move becomes the picked point, the rest HSL, skin bands never touched
+const lb = lookBands(
+  { orange: { weight: 0.3, hue: 55, chroma: 25, lum: 60, lumRel: 5 }, blue: { weight: 0.2, hue: -70, chroma: 30, lum: 40, lumRel: -15 }, green: { weight: 0.05, hue: 130, chroma: 20, lum: 50, lumRel: -5 } },
+  { orange: { weight: 0.3, hue: 40, chroma: 40, lum: 60, lumRel: 5 }, blue: { weight: 0.2, hue: -60, chroma: 18, lum: 40, lumRel: -20 }, green: { weight: 0.05, hue: 120, chroma: 12, lum: 50, lumRel: -5 } },
+);
+assert.ok(lb.point.auto && lb.point.sat < 0);
+assert.ok(!Object.keys(lb.hsl).some((k) => k.endsWith('orange')) && lb.hsl.sat_green < 0);
+assert.deepEqual(lookBands({}, {}), { point: null, hsl: {} });
+// intensity
+assert.ok(lookPresence(20, 12).vibrance < 0 && lookPresence(20, 30).vibrance > 0);
+assert.equal(lookPresence(0, 12), null);
+console.log('look-chasing checks passed');
