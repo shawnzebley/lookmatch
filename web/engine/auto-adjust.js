@@ -39,6 +39,23 @@ export function highlightRollOff(exposure) {
   return exposure > 0.08 ? Math.round(clamp(exposure * 22, 0, 12)) : 0;
 }
 
+// Colour contrast on the grading wheels: warm highlights against cool shadows (complementary colours
+// read as extra contrast without touching exposure). Wheels, not RGB curves, because a wheel moves colour
+// only. It fills the gap between the two zones' blue-yellow balance up to GRADE_SEP Lab b* units, split
+// between them, and does nothing once the photo already has that much separation or a zone is nearly empty.
+// Rendered through the pipeline on a neutral ramp, one wheel unit moves a zone's b* by about 0.21.
+// zones: measure().zones ({ shadows, highlights }: b, mass)
+const GRADE_SEP = 4, GRADE_HUE = { shadow: 225, highlight: 40 }, GRADE_SHARE = { shadow: 0.6, highlight: 0.4 };
+const GRADE_PER_B = 4.7, GRADE_MAX = { shadow: 12, highlight: 8 };
+export function colorContrast(zones = {}) {
+  const s = zones.shadows, h = zones.highlights;
+  if (!s || !h || !(s.mass >= 0.02) || !(h.mass >= 0.02) || !Number.isFinite(s.b) || !Number.isFinite(h.b)) return {};
+  const gap = GRADE_SEP - (h.b - s.b);
+  if (gap < 0.5) return {};
+  const sat = (z) => Math.round(clamp(gap * GRADE_SHARE[z] * GRADE_PER_B, 0, GRADE_MAX[z]));
+  return { shadowHue: GRADE_HUE.shadow, shadowSat: sat('shadow'), highlightHue: GRADE_HUE.highlight, highlightSat: sat('highlight') };
+}
+
 // ---- fade, point colour and HSL for the look Auto Adjust aims at: a clean, natural portrait with a soft
 // matte floor. Fade is sized from the measured clipping so it also keeps the photo from blowing or crushing.
 // tone: { clipLo, clipHi, p5, p99 } (fractions, and L* percentiles)
