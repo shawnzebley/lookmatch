@@ -6,7 +6,7 @@ import { fitSkinMatch, applySkinMatchRGBA } from './engine/skin-match.js';
 import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
 import { fitRegions, fitReferenceRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
 import { signature, nearestRegions } from './engine/style.js';
-import { compile, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, curveLUT, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
+import { compile, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, curveLUT, fadeLevels, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
 import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
@@ -22,7 +22,7 @@ import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
 import { stylizeRemote } from './lib/deeppreset.js';
-import { autoAdjustResult, hasReferenceCurve, skinWhiteBalance, presenceFor, highlightRollOff } from './engine/auto-adjust.js';
+import { autoAdjustResult, hasReferenceCurve, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor } from './engine/auto-adjust.js';
 
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
@@ -464,7 +464,9 @@ function autoCurves(ps, params) {
   // points already placed on either side (a quartile that can't fit is left out). The midpoint
   // wins, so contrast never undoes the brightness correction.
   const [sLo, sHi] = AUTO_SLOPE;
-  const curve = [[bx, 0], [wx, 255]];
+  // the curve's ends keep the fade (lifted blacks / softened whites) instead of stretching it back out
+  const fl = fadeLevels(params);
+  const curve = [[bx, Math.min(bx, v8(lToY(100 * fl.lo)))], [wx, Math.max(wx, v8(lToY(100 * fl.hi)))]];
   const place = (x, y) => {
     const j = curve.findIndex((q) => q[0] > x);
     if (j < 1) return;
@@ -675,17 +677,21 @@ const handlers = {
     const lift = exposure > 0 ? clamp(exposure * 1.6, 0, 0.6) : exposure;
     const highlights = clamp(-(p[99] - 94) * 0.22 - (t.clipHi > 0.002 ? 3 : 0), -10, 0);
     const shadows = clamp((5 - p[5]) * 0.22 + (t.clipLo > 0.002 ? 3 : 0), 0, 7);
-    const basic = { exposure: lift, contrast: 0, highlights, shadows, whites: 0, blacks: 0 };
+    const basic = { exposure: lift, contrast: 0, highlights, shadows, whites: 0, blacks: 0, ...fadeFor({ clipLo: t.clipLo, clipHi: t.clipHi, p5: p[5], p99: p[99] }) };
     // white balance on skin, then saturation down / vibrance up (portrait rules)
     const cur0 = processPixelSet(e.ps, { ...params, ...basic });
-    let sn = 0, sa = 0, sb = 0, cn = 0, cs = 0;
+    let sn = 0, sa = 0, sb = 0, sl = 0, cn = 0, cs = 0;
     const sk = e.ps.skinMask;
     for (let i = 0; i < e.ps.n; i++) {
       if (cur0.L[i] > 12 && cur0.L[i] < 95) { cs += Math.hypot(cur0.A[i], cur0.B[i]); cn++; }
-      if (sk && sk[i] >= 191 && cur0.L[i] > 25 && cur0.L[i] < 92) { sa += cur0.A[i]; sb += cur0.B[i]; sn++; }
+      if (sk && sk[i] >= 191 && cur0.L[i] > 25 && cur0.L[i] < 92) { sa += cur0.A[i]; sb += cur0.B[i]; sl += cur0.L[i]; sn++; }
     }
     const wb = sn >= e.ps.n * 0.002 ? skinWhiteBalance(sa / sn, sb / sn) : { temp: 0, tint: 0 };
-    Object.assign(basic, presenceFor(cn ? cs / cn : NaN), wb.temp || wb.tint ? { temp: clamp((params.temp || 0) + wb.temp, -60, 60), tint: clamp((params.tint || 0) + wb.tint, -50, 50) } : {});
+    // colour picker + HSL for the look: a point on skin and one on the most prominent look colour, HSL for the other bands
+    const look = lookColor(s.bands);
+    const sp = sn >= e.ps.n * 0.002 ? skinPoint(sl / sn, sa / sn, sb / sn) : null;
+    const points = [...(params.points || []).filter((q) => !q.auto), ...[sp, look.point].filter(Boolean)];
+    Object.assign(basic, look.hsl, points.length ? { points } : {}, presenceFor(cn ? cs / cn : NaN), wb.temp || wb.tint ? { temp: clamp((params.temp || 0) + wb.temp, -60, 60), tint: clamp((params.tint || 0) + wb.tint, -50, 50) } : {});
     const curves = autoCurves(e.ps, { ...params, ...basic, curve: null, curveR: null, curveG: null, curveB: null });
     return autoAdjustResult(params, { ...basic, ...curves });
   },
