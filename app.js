@@ -1544,7 +1544,7 @@ function openDetail(p) {
     try {
       const sa = solveArgs(p), rs = sa?.refStats;
       // the look Auto Adjust chases: the reference's measured tone, skin and colour bands, or the photographer's finish
-      const look = !sa ? null : rs ? { kind: 'reference', refStats: { tone: { pct: rs.tone?.pct }, bands: rs.bands, bandsBg: rs.bandsBg, skin: rs.skin, color: { meanChroma: rs.color?.meanChroma } } } : { kind: 'photographer', finish: sa.finish };
+      const look = !sa ? null : rs ? { kind: 'reference', refStats: { tone: { pct: rs.tone?.pct }, bands: rs.bands, bandsBg: rs.bandsBg, zones: rs.zones, skin: rs.skin, color: { meanChroma: rs.color?.meanChroma } } } : { kind: 'photographer', finish: sa.finish };
       const r = await pool.call(p.worker, 'autoAdjust', { id: p.id, params: structuredClone(p.params || defaultParams()), look }, { priority: true });
       if (!D || D.p !== p) return;
       const preservedReference = r.preservedReference === true;
