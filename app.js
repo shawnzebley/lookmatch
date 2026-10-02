@@ -1509,7 +1509,7 @@ function openDetail(p) {
     </div></main>
     <aside class="dpanel" id="dbody">
       <div class="panel-head"><div class="panel-topline"><strong class="panel-title">Controls</strong><button class="panel-toggle" id="panelToggle" type="button" aria-label="Collapse controls" aria-expanded="true">‹</button></div>
-        <div class="edit-actions"><button id="clipBtn" class="tog" aria-pressed="false">Clipping</button><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure, then fit the light and RGB curves to this photo">Auto Adjust</button><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
+        <div class="edit-actions"><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure, set fade, fit the curves, then pick and adjust colors for a clean portrait look">Auto Adjust</button><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
         <nav class="ptabs" id="ptabs" aria-label="Editing sections">${PAGES.map(([k, l]) => `<button data-p="${k}" title="${l}" aria-label="${l}"><span class="tab-icon" aria-hidden="true">${({ look: '◉', subject: '◌', light: '☼', color: '◐', retouch: '✦', more: '⋯' })[k]}</span><span class="tab-label">${l}</span></button>`).join('')}</nav>
       </div>
       <div class="pager" id="pager">
@@ -1531,7 +1531,6 @@ function openDetail(p) {
   $('#dExport').onclick = () => exportPhotos([p]);
   $('#dKeep').onclick = () => { p.picked = !p.picked; $('#dKeep').classList.toggle('on', p.picked); $('#dKeep').setAttribute('aria-pressed', String(p.picked)); };
   $('#mode').onclick = (e) => { const m = e.target.dataset.m; if (!m) return; D.mode = m; [...$('#mode').children].forEach((b) => b.classList.toggle('on', b.dataset.m === m)); draw(); };
-  $('#clipBtn').onclick = () => setOverlay(!D.overlay);
   $('#cropBtn').onclick = () => enterCrop();
   $('#reMatch').onclick = async () => {
     $('#reMatch').disabled = true; $('#reMatch').textContent = 'Working…';
@@ -1559,7 +1558,7 @@ function openDetail(p) {
       $('#sliders').querySelectorAll('details.group').forEach((group) => {
         if (visible.has($('summary', group)?.textContent.trim())) group.open = true;
       });
-      toast('Auto Adjust applied. Light and RGB curves are set; Undo puts it back.');
+      toast('Auto Adjust applied: fade, curves, point colors and HSL are set. Undo puts it back.');
     } catch (e) { toast(e.message, 4500); logError('auto adjust', e, p.file); }
     finally { if ($('#autoAdjust')) { $('#autoAdjust').disabled = false; $('#autoAdjust').textContent = 'Auto Adjust'; } }
   };
@@ -1652,14 +1651,6 @@ function finishButtons(p, pr) {
   return Object.entries(FINISH_PROFILES).map(([k, f]) => `<button data-f="${k}" class="${k === cur ? 'on' : ''}">${esc(f.name)}</button>`).join('');
 }
 
-function setOverlay(on) {
-  D.overlay = on;
-  const b = $('#clipBtn');
-  b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on));
-  renderLoss();
-  requestPreview(false);
-}
-
 const SL_LABEL = Object.fromEntries(SLIDERS.map((s) => [s.key, s.label]));
 for (const r of REGIONS) for (const s of LOCAL_SLIDERS) SL_LABEL[`${r}:${s.key}`] = `${r === 'subject' ? 'Subject' : 'Background'} ${s.label.toLowerCase()}`;
 function fmtVal(k, v) { k = k.split(':').pop(); return k === 'exposure' ? `${v > 0 ? '+' : ''}${(+v).toFixed(2)}` : `${v > 0 ? '+' : ''}${Math.round(v)}`; }
@@ -1677,19 +1668,17 @@ function renderLoss() {
   const L = D.p.loss;
   document.querySelectorAll('#sliders .culprit, #grade .culprit').forEach((r) => r.classList.remove('culprit'));
   if (!L) { box.innerHTML = ''; return; }
-  const legend = D.overlay ? `<div class="legend"><span><i style="background:#ff1e1e"></i>blown</span><span><i style="background:#286eff"></i>crushed</span><span><i style="background:#ffb900"></i>clipped color</span><span class="muted">dim = already in original</span></div>` : '';
   if (!L.issues.length) {
     box.className = 'lossbar ok';
-    box.innerHTML = `<div class="lrow"><span>Nothing blown, crushed or flattened by this edit.</span></div>${legend}`;
+    box.innerHTML = `<div class="lrow"><span>Nothing blown, crushed or flattened by this edit.</span></div>`;
     return;
   }
   box.className = `lossbar ${L.worst}`;
   const chips = L.issues.map((i) => `<span class="lchip ${i.level}">${esc(i.text)}</span>`).join('');
   const cul = (L.culprits || []).map((c) => `<button class="lnk" data-k="${c.key}">${esc(SL_LABEL[c.key] || c.key)} ${fmtVal(c.key, c.value)}</button>`).join(', ');
-  box.innerHTML = `<div class="lrow">${chips}</div>${cul ? `<div class="lrow small">Mostly from ${cul}</div>` : ''}${D.overlay ? legend : '<div class="lrow small"><button class="lnk" id="showClip">Show it on the photo</button></div>'}`;
+  box.innerHTML = `<div class="lrow">${chips}</div>${cul ? `<div class="lrow small">Mostly from ${cul}</div>` : ''}`;
   for (const c of L.culprits || []) controlFor(c.key)?.classList.add('culprit');
   box.querySelectorAll('button.lnk[data-k]').forEach((b) => (b.onclick = () => jumpToSlider(b.dataset.k)));
-  if ($('#showClip')) $('#showClip').onclick = () => setOverlay(true);
 }
 
 function jumpToSlider(k) {
@@ -1767,7 +1756,6 @@ function scheduleMeasure(delay = 350) {
     D.lastWorst = r.loss.worst;
     renderLoss();
     // first time an edit goes badly wrong, show where on the photo
-    if (r.loss.worst === 'bad' && !wasBad && !D.overlay && D.userEdited) setOverlay(true);
   }, delay);
 }
 
