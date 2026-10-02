@@ -176,62 +176,121 @@ export function fitSkinMatch(ps, cur, target, { move = 0.65 } = {}) {
   return { deltaL: delta.L, deltaA: delta.a, deltaB: delta.b, target: { L: target.L, a: target.a, b: target.b }, before };
 }
 
-function correctionsAt(match, personId, originalL) {
-  if (match.version !== 2) return match;
-  const person = match.people?.find((p) => p.id === personId);
-  if (!person || !Number.isFinite(originalL)) return null;
-  const zones = [...(person.zones || [])].filter((z) => Number.isFinite(z.center)).sort((a, b) => a.center - b.center);
-  if (!zones.length) return null;
-  if (zones.length === 1) return zones[0];
-  // Bound adjacent correction slopes so the correction itself cannot invert local light/dark detail.
-  const points = zones.map((z) => ({ ...z }));
-  for (let i = 1; i < points.length; i++) {
-    const span = Math.max(1, points[i].center - points[i - 1].center), cap = span * 0.35;
-    for (const [key, d] of [['deltaL', 'L'], ['deltaA', 'a'], ['deltaB', 'b']]) points[i][key] = clamp(points[i][key], points[i - 1][key] - cap, points[i - 1][key] + cap);
+const PROFILE_CACHE = new WeakMap();
+const LAB_TMP = [0, 0, 0], RGB_TMP = [0, 0, 0], CORRECTION_TMP = [0, 0, 0];
+const EMPTY_ZONES = [];
+
+function compileProfile(person, index) {
+  const source = person.zones || EMPTY_ZONES, sorted = source.filter((z) => Number.isFinite(z.center)).slice().sort((a, b) => a.center - b.center);
+  const n = sorted.length, centers = new Float64Array(n), dl = new Float64Array(n), da = new Float64Array(n), db = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const z = sorted[i]; centers[i] = z.center; dl[i] = z.deltaL || 0; da[i] = z.deltaA || 0; db[i] = z.deltaB || 0;
+    if (i) {
+      const cap = Math.max(1, centers[i] - centers[i - 1]) * 0.35;
+      dl[i] = clamp(dl[i], dl[i - 1] - cap, dl[i - 1] + cap);
+      da[i] = clamp(da[i], da[i - 1] - cap, da[i - 1] + cap);
+      db[i] = clamp(db[i], db[i - 1] - cap, db[i - 1] + cap);
+    }
   }
-  if (originalL <= points[0].center) return points[0];
-  if (originalL >= points.at(-1).center) return points.at(-1);
-  let hi = 1;
-  while (points[hi].center < originalL) hi++;
-  const x = points[hi - 1], y = points[hi], t = (originalL - x.center) / (y.center - x.center);
-  return { deltaL: x.deltaL + (y.deltaL - x.deltaL) * t, deltaA: x.deltaA + (y.deltaA - x.deltaA) * t, deltaB: x.deltaB + (y.deltaB - x.deltaB) * t };
+  return { person, index, source, rawZones: source.slice(), refs: sorted, centers, dl, da, db };
 }
 
-function inGamut(rgb) { return rgb.every((x) => Number.isFinite(x) && x >= -1e-8 && x <= 1 + 1e-8); }
+function profileIsCurrent(profile, person, people) {
+  if (profile.person !== person || people[profile.index] !== person || profile.source !== (person.zones || EMPTY_ZONES)) return false;
+  const source = profile.source, refs = profile.refs;
+  // Avoid a sort/copy per pixel while still detecting in-place slider edits and reorderings.
+  if (source.length !== profile.rawZones.length) return false;
+  let finiteCount = 0;
+  for (let i = 0; i < source.length; i++) {
+    if (source[i] !== profile.rawZones[i]) return false;
+    if (Number.isFinite(source[i].center)) finiteCount++;
+  }
+  if (finiteCount !== refs.length) return false;
+  for (let i = 0; i < refs.length; i++) {
+    const z = refs[i];
+    if (!Number.isFinite(z.center)) return false;
+    if (!Object.is(profile.centers[i], z.center) ||
+        !Object.is(profile.rawDL[i], z.deltaL || 0) ||
+        !Object.is(profile.rawDA[i], z.deltaA || 0) ||
+        !Object.is(profile.rawDB[i], z.deltaB || 0)) return false;
+  }
+  return true;
+}
+
+function getProfile(match, personId) {
+  const people = match.people;
+  if (!people) return null;
+  let cache = PROFILE_CACHE.get(match);
+  if (!cache || cache.people !== people) { cache = { people, byId: new Map() }; PROFILE_CACHE.set(match, cache); }
+  let profile = cache.byId.get(personId);
+  if (profile && profile.person.id === personId && profileIsCurrent(profile, profile.person, people)) return profile;
+  let person = null, personIndex = -1;
+  for (let i = 0; i < people.length; i++) if (people[i].id === personId) { person = people[i]; personIndex = i; break; }
+  if (!person) { cache.byId.delete(personId); return null; }
+  profile = compileProfile(person, personIndex);
+  // Keep original deltas for fast mutation validation; compiled arrays contain slope-limited deltas.
+  profile.rawDL = new Float64Array(profile.refs.length); profile.rawDA = new Float64Array(profile.refs.length); profile.rawDB = new Float64Array(profile.refs.length);
+  for (let i = 0; i < profile.refs.length; i++) { profile.rawDL[i] = profile.refs[i].deltaL || 0; profile.rawDA[i] = profile.refs[i].deltaA || 0; profile.rawDB[i] = profile.refs[i].deltaB || 0; }
+  cache.byId.set(personId, profile);
+  return profile;
+}
+
+function correctionFor(profile, originalL, out) {
+  const n = profile.centers.length;
+  if (!n) return false;
+  if (n === 1 || originalL <= profile.centers[0]) { out[0] = profile.dl[0]; out[1] = profile.da[0]; out[2] = profile.db[0]; return true; }
+  const last = n - 1;
+  if (originalL >= profile.centers[last]) { out[0] = profile.dl[last]; out[1] = profile.da[last]; out[2] = profile.db[last]; return true; }
+  let hi = 1;
+  while (profile.centers[hi] < originalL) hi++;
+  const t = (originalL - profile.centers[hi - 1]) / (profile.centers[hi] - profile.centers[hi - 1]);
+  out[0] = profile.dl[hi - 1] + (profile.dl[hi] - profile.dl[hi - 1]) * t;
+  out[1] = profile.da[hi - 1] + (profile.da[hi] - profile.da[hi - 1]) * t;
+  out[2] = profile.db[hi - 1] + (profile.db[hi] - profile.db[hi - 1]) * t;
+  return true;
+}
+
+function inGamut(rgb) { return Number.isFinite(rgb[0]) && Number.isFinite(rgb[1]) && Number.isFinite(rgb[2]) && rgb[0] >= -1e-8 && rgb[0] <= 1 + 1e-8 && rgb[1] >= -1e-8 && rgb[1] <= 1 + 1e-8 && rgb[2] >= -1e-8 && rgb[2] <= 1 + 1e-8; }
 
 export function applySkinMatchLinear(res, p, maskValue, personId = 0, originalL = null) {
   const m = clamp(Number(maskValue) || 0, 0, 255) / 255, match = p?.skinMatch;
   if (!m || !match) return res;
-  const lab = [0, 0, 0]; linToLab(res[0], res[1], res[2], lab);
-  const selected = correctionsAt(match, personId, originalL ?? (match.version === 2 ? NaN : lab[0]));
-  if (!selected) return res;
-  if (!(selected.deltaL || selected.deltaA || selected.deltaB)) return res;
-  const weight = m * easeL(originalL ?? lab[0]);
-  const L = clamp(lab[0] + clamp(selected.deltaL || 0, -LIMITS.L, LIMITS.L) * weight, 0, 100);
-  const a = lab[1] + clamp(selected.deltaA || 0, -LIMITS.a, LIMITS.a) * weight;
-  const b = lab[2] + clamp(selected.deltaB || 0, -LIMITS.b, LIMITS.b) * weight;
-  let rgb = labToLin(L, a, b, [0, 0, 0]);
+  let dl, da, db, light = originalL;
+  if (match.version === 2) {
+    if (!Number.isFinite(originalL)) return res;
+    const profile = getProfile(match, personId);
+    if (!profile || !correctionFor(profile, originalL, CORRECTION_TMP)) return res;
+    dl = CORRECTION_TMP[0]; da = CORRECTION_TMP[1]; db = CORRECTION_TMP[2];
+  } else { dl = match.deltaL || 0; da = match.deltaA || 0; db = match.deltaB || 0; }
+  if (!(dl || da || db)) return res;
+  linToLab(res[0], res[1], res[2], LAB_TMP);
+  if (!Number.isFinite(light)) light = LAB_TMP[0];
+  const weight = m * easeL(light);
+  const L = clamp(LAB_TMP[0] + clamp(dl, -LIMITS.L, LIMITS.L) * weight, 0, 100);
+  const a = LAB_TMP[1] + clamp(da, -LIMITS.a, LIMITS.a) * weight;
+  const b = LAB_TMP[2] + clamp(db, -LIMITS.b, LIMITS.b) * weight;
+  let rgb = labToLin(L, a, b, RGB_TMP);
   if (!inGamut(rgb)) {
     let lo = 0, hi = 1;
-    for (let i = 0; i < 24; i++) { const mid = (lo + hi) / 2; if (inGamut(labToLin(L, a * mid, b * mid, [0, 0, 0]))) lo = mid; else hi = mid; }
-    rgb = labToLin(L, a * lo, b * lo, [0, 0, 0]);
+    for (let i = 0; i < 24; i++) { const mid = (lo + hi) / 2; if (inGamut(labToLin(L, a * mid, b * mid, RGB_TMP))) lo = mid; else hi = mid; }
+    rgb = labToLin(L, a * lo, b * lo, RGB_TMP);
   }
   res[0] = clamp(rgb[0], 0, 1); res[1] = clamp(rgb[1], 0, 1); res[2] = clamp(rgb[2], 0, 1);
-  linToLab(res[0], res[1], res[2], lab); res[3] = lab[0]; res[4] = lab[1]; res[5] = lab[2];
+  linToLab(res[0], res[1], res[2], LAB_TMP); res[3] = LAB_TMP[0]; res[4] = LAB_TMP[1]; res[5] = LAB_TMP[2];
   return res;
 }
 
 export function applySkinMatchRGBA(buf, match, mask, ch = 4, people = null, original = null) {
   if (!mask || !match) return buf;
   const p = { skinMatch: match };
+  const res = [0, 0, 0, 0, 0, 0], origLab = [0, 0, 0];
   for (let i = 0, j = 0; i < mask.length; i++, j += ch) {
     const personId = people?.[i] ?? 0;
     if (mask[i] === 0 || (match.version === 2 && !personId)) continue;
-    const res = [SRGB8_TO_LIN[buf[j]], SRGB8_TO_LIN[buf[j + 1]], SRGB8_TO_LIN[buf[j + 2]], 0, 0, 0];
+    res[0] = SRGB8_TO_LIN[buf[j]]; res[1] = SRGB8_TO_LIN[buf[j + 1]]; res[2] = SRGB8_TO_LIN[buf[j + 2]];
     let originalL = null;
     if (original && Number.isFinite(original[j])) {
-      const k = [SRGB8_TO_LIN[original[j]], SRGB8_TO_LIN[original[j + 1]], SRGB8_TO_LIN[original[j + 2]], 0, 0, 0], lab = [0, 0, 0];
-      linToLab(k[0], k[1], k[2], lab); originalL = lab[0];
+      linToLab(SRGB8_TO_LIN[original[j]], SRGB8_TO_LIN[original[j + 1]], SRGB8_TO_LIN[original[j + 2]], origLab); originalL = origLab[0];
     }
     applySkinMatchLinear(res, p, mask[i], personId, originalL);
     buf[j] = Math.round(linearToSrgb(clamp(res[0], 0, 1)) * 255); buf[j + 1] = Math.round(linearToSrgb(clamp(res[1], 0, 1)) * 255); buf[j + 2] = Math.round(linearToSrgb(clamp(res[2], 0, 1)) * 255);
