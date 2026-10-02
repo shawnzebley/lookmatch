@@ -6,6 +6,7 @@ export function autoAdjustResult(params = {}, calculated = {}) {
 
 // Portrait rules for Auto Adjust, taken from a working portrait editor's Lightroom routine. Each is
 // small on purpose: Auto Adjust is a starting correction, not a look.
+import { labToLin, linearToSrgb } from './color.js';
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const SKIN_HUE = [44, 64]; // Lab hue angle (deg) where skin reads as natural
 
@@ -108,8 +109,8 @@ const near0 = (...v) => v.every((x) => Math.abs(x) < 3);
 export function lookFade(own, target) {
   if (!target || target.p1 == null || target.p99 == null) return null;
   return {
-    fadeBlacks: Math.max(Math.round(clamp((target.p1 - own.p1) / 0.25, 0, 60)), own.clipLo > 0.002 ? 6 : 0),
-    fadeWhites: Math.max(Math.round(clamp((own.p99 - target.p99) / 0.25, 0, 60)), own.clipHi > 0.002 ? 4 : 0),
+    fadeBlacks: Math.max(Math.round(clamp((target.p1 - own.p1) / 0.25, 0, 100)), own.clipLo > 0.002 ? 6 : 0),
+    fadeWhites: Math.max(Math.round(clamp((own.p99 - target.p99) / 0.25, 0, 100)), own.clipHi > 0.002 ? 4 : 0),
   };
 }
 
@@ -119,10 +120,10 @@ export function lookSkinPoint(own, target) {
   const C = Math.hypot(own.a, own.b);
   if (!target || !Number.isFinite(target.hue) || !Number.isFinite(target.chroma) || !(C >= 4)) return null;
   const h = Math.atan2(own.b, own.a) * 180 / Math.PI;
-  const hue = Math.round(clamp(angDiff(target.hue, h) / 30 * 100, -60, 60));
-  const sat = Math.round(clamp((target.chroma / C - 1) * 100, -50, 50));
+  const hue = Math.round(clamp(angDiff(target.hue, h) / 30 * 100, -100, 100));
+  const sat = Math.round(clamp((target.chroma / C - 1) * 100, -100, 100));
   // luminance slider: +-100 is +-20 L*, so close most of the gap to the look's skin brightness
-  const lum = Number.isFinite(target.lum) && target.lum > 10 ? Math.round(clamp((target.lum - own.L) * 4, -50, 50)) : own.L < 55 ? 6 : own.L > 80 ? -4 : 0;
+  const lum = Number.isFinite(target.lum) && target.lum > 10 ? Math.round(clamp((target.lum - own.L) * 5, -100, 100)) : own.L < 55 ? 6 : own.L > 80 ? -4 : 0;
   if (near0(hue, sat, lum)) return null;
   return { L: own.L, a: own.a, b: own.b, hue, sat, lum, range: 35, auto: true };
 }
@@ -136,9 +137,9 @@ export function lookBands(own = {}, target = {}, { skin = true } = {}) {
     if (skin && (k === 'red' || k === 'orange')) continue;
     const o = own[k], t = target[k];
     if (!o || !t || !(o.weight >= 0.02) || !(o.chroma > 8) || !(t.weight >= 0.01) || !(t.chroma > 5)) continue;
-    const sat = Math.round(clamp((t.chroma / o.chroma - 1) * 70, -45, 45));
-    const hue = Math.round(clamp(angDiff(t.hue, o.hue) / 30 * 100, -60, 60));
-    const lum = Math.round(clamp(((t.lumRel || 0) - (o.lumRel || 0)) * 1.5, -30, 30));
+    const sat = Math.round(clamp((t.chroma / o.chroma - 1) * 100, -100, 100));
+    const hue = Math.round(clamp(angDiff(t.hue, o.hue) / 30 * 100, -100, 100));
+    const lum = Math.round(clamp(((t.lumRel || 0) - (o.lumRel || 0)) * 5, -100, 100));
     if (near0(sat, hue, lum)) continue;
     hsl[`hue_${k}`] = hue; hsl[`sat_${k}`] = sat; hsl[`lum_${k}`] = lum;
   }
@@ -148,15 +149,59 @@ export function lookBands(own = {}, target = {}, { skin = true } = {}) {
 // S-curve strength for the master curve: how many curve units the quartiles move apart (shadows down,
 // highlights up) around the midpoint. Never below S_MIN, so every photo gets some S; a flat photo or a
 // punchier look gets more. spread = the photo's own quartile spread, want = the look's (else AUTO default).
-export const S_MIN = 5, S_MAX = 14, S_DEFAULT_SPREAD = 92;
+export const S_MIN = 5, S_MAX = 60, S_DEFAULT_SPREAD = 92;
 export function sCurvePush(spread, want = null) {
-  const target = Number.isFinite(want) ? clamp(want, 70, 130) : S_DEFAULT_SPREAD;
+  const target = Number.isFinite(want) ? want : S_DEFAULT_SPREAD;
   return clamp((target - spread) * 0.3, S_MIN, S_MAX);
 }
 
 // Overall colour intensity toward the look's mean chroma.
 export function lookPresence(ownChroma, targetChroma) {
   if (!(ownChroma > 1) || !(targetChroma > 0)) return null;
-  const r = clamp(targetChroma / ownChroma, 0.5, 1.6);
-  return { saturation: Math.round(clamp((r - 1) * 30, -25, 10)), vibrance: Math.round(clamp((r - 1) * 50, -25, 35)) };
+  const r = targetChroma / ownChroma;
+  return { saturation: Math.round(clamp((r - 1) * 60, -100, 100)), vibrance: Math.round(clamp((r - 1) * 100, -100, 100)) };
+}
+
+// ---- R/G/B channel curves toward a look. Per tonal zone (shadows, midtones, highlights) the photo's colour
+// (Lab a*, b*) is moved onto the look's: how many 0-255 code values each channel has to shift at that zone's
+// curve position for the photo's colour there to land on the look's. The part that is the same in all three
+// channels is dropped, because brightness belongs to the master curve.
+// own, target: measure().zones ({ shadows|midtones|highlights: { a, b, mass } }). Returns
+// { x: [64, 128, 192], d: [[dr, dg, db] x 3] } or null when no zone can be compared.
+export const CHANNEL_ANCHORS = [64, 128, 192];
+const ZONE_L = [27, 54, 78], ZONE_KEYS = ['shadows', 'midtones', 'highlights'];
+const rgb8 = (L, a, b) => labToLin(L, a, b, [0, 0, 0]).map((v) => 255 * linearToSrgb(clamp(v, 0, 1)));
+export function zoneChannelShifts(own = {}, target = {}, minMass = 0.02) {
+  const d = ZONE_KEYS.map((k, i) => {
+    const o = own[k], t = target[k];
+    if (!o || !t || !(o.mass >= minMass) || !(t.mass >= minMass) || ![o.a, o.b, t.a, t.b].every(Number.isFinite)) return [0, 0, 0];
+    const base = rgb8(ZONE_L[i], o.a, o.b), want = rgb8(ZONE_L[i], t.a, t.b);
+    const diff = want.map((v, c) => v - base[c]), mean = (diff[0] + diff[1] + diff[2]) / 3;
+    return diff.map((v) => Math.round((v - mean) * 10) / 10);
+  });
+  return d.some((z) => z.some((v) => Math.abs(v) >= 0.5)) ? { x: CHANNEL_ANCHORS, d } : null;
+}
+
+// Add those shifts to a channel curve (array of [x, y] in 0-255): at each anchor the curve's own value plus the
+// shift, keeping the points in order and the curve rising.
+export function applyChannelShift(pts, evalAt, shifts, channel) {
+  if (!shifts) return pts;
+  const keep = pts.filter(([x]) => x === 0 || x === 255 || shifts.x.every((ax) => Math.abs(x - ax) >= 24));
+  const out = keep.slice();
+  shifts.x.forEach((x, z) => {
+    const dz = shifts.d[z][channel];
+    if (Math.abs(dz) < 0.5) return;
+    out.push([x, Math.round(clamp(evalAt(x) + dz, 1, 254))]);
+  });
+  out.sort((a, b) => a[0] - b[0]);
+  const res = [];
+  for (const q of out) {
+    const prev = res[res.length - 1];
+    if (prev && (q[0] <= prev[0] || q[1] <= prev[1])) {
+      if (q[0] === 255 && q[1] < prev[1]) { res.pop(); res.push(q); }
+      continue;
+    }
+    res.push(q);
+  }
+  return res;
 }

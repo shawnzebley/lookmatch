@@ -70,7 +70,7 @@ console.log('look-chasing checks passed');
 import { sCurvePush, S_MIN, S_MAX } from '../engine/auto-adjust.js';
 // the master curve always gets an S: never under S_MIN, more for a flat photo or a punchier look, capped at S_MAX
 assert.equal(sCurvePush(140), S_MIN);
-assert.ok(sCurvePush(60) > sCurvePush(85) && sCurvePush(10) === S_MAX);
+assert.ok(sCurvePush(60) > sCurvePush(85) && sCurvePush(-300) === S_MAX);
 assert.ok(sCurvePush(90, 120) > sCurvePush(90, null));
 console.log('s-curve checks passed');
 
@@ -84,3 +84,21 @@ assert.deepEqual(colorContrast({ shadows: { b: -2, mass: 0.3 }, highlights: { b:
 assert.deepEqual(colorContrast({ shadows: { b: 0, mass: 0.005 }, highlights: { b: 0, mass: 0.3 } }), {});
 assert.deepEqual(colorContrast({}), {});
 console.log('colour contrast checks passed');
+
+import { zoneChannelShifts, applyChannelShift } from '../engine/auto-adjust.js';
+// R/G/B curves: a warmer look in the highlights lifts red and drops blue there, brightness is left to the master curve
+const zo = { shadows: { a: 0, b: 0, mass: 0.3 }, midtones: { a: 2, b: 4, mass: 0.4 }, highlights: { a: 1, b: 2, mass: 0.2 } };
+const zt = { shadows: { a: 0, b: -6, mass: 0.3 }, midtones: { a: 2, b: 4, mass: 0.4 }, highlights: { a: 3, b: 12, mass: 0.2 } };
+const zs = zoneChannelShifts(zo, zt);
+assert.deepEqual(zs.d[1], [0, 0, 0]);
+assert.ok(zs.d[2][0] > 0 && zs.d[2][2] < 0 && Math.abs(zs.d[2][0] + zs.d[2][1] + zs.d[2][2]) < 0.5);
+assert.ok(zs.d[0][2] > 0 && zs.d[0][0] < 0); // cooler shadows
+assert.equal(zoneChannelShifts(zo, zo), null);
+assert.equal(zoneChannelShifts({}, zt), null);
+assert.equal(zoneChannelShifts({ shadows: { a: 0, b: 0, mass: 0.001 } }, zt), null);
+const line = (x) => x;
+const red = applyChannelShift([[0, 0], [255, 255]], line, zs, 0);
+assert.ok(red.every((q, i) => i === 0 || (q[0] > red[i - 1][0] && q[1] > red[i - 1][1])));
+assert.ok(red.find((q) => q[0] === 192)[1] > 192);
+assert.deepEqual(applyChannelShift([[0, 0], [255, 255]], line, null, 0), [[0, 0], [255, 255]]);
+console.log('channel curve checks passed');
