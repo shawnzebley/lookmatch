@@ -458,8 +458,8 @@ function autoCurves(ps, params, { midL = null, spreadL = null, zoneShift = null 
   const bx = Math.round(clamp(lo - 2, 0, 24)), wx = Math.round(clamp(hi + 2, 230, 255));
   const st = (v) => clamp((v - bx) / (wx - bx) * 255, 0, 255);
   const q25 = pct(lum, n, 0.25), q50 = pct(lum, n, 0.5), q75 = pct(lum, n, 0.75);
-  const midTarget = midL != null ? v8(lToY(midL)) : AUTO_MID;
-  const ym = midL != null ? midTarget : st(q50) + clamp((midTarget - st(q50)) * 0.5, -18, 18);
+  const midTarget = midL != null ? clamp(v8(lToY(midL)), 90, 150) : AUTO_MID;
+  const ym = st(q50) + clamp((midTarget - st(q50)) * 0.5, -18, 18);
   // always an S: the quartiles move apart around the midpoint, more when the photo is flat or the look is punchy
   const wantSpread = spreadL != null ? v8(lToY(spreadL[1])) - v8(lToY(spreadL[0])) : null;
   const push = sCurvePush(st(q75) - st(q25), wantSpread);
@@ -687,11 +687,9 @@ const handlers = {
     const base = { ...params, curve: null, curveR: null, curveG: null, curveB: null, fadeBlacks: 0, fadeWhites: 0, points: (params.points || []).filter((q) => !q.auto) };
     if (look?.kind === 'photographer') { base.finishBlacks = 0; base.finishRolloff = 0; }
     const s = measure(e.ps), t = s.tone, p = t.pct;
-    const exposure = target?.p50 != null
-      ? clamp(Math.log2(lToY(target.p50) / Math.max(0.0001, lToY(p[50]))), -4, 4)
-      : clamp(Math.log2(lToY(47) / Math.max(0.0001, lToY(p[50]))) * 0.24, -0.35, 0.35);
+    const exposure = clamp(Math.log2(lToY(target?.p50 != null ? clamp(target.p50, 35, 65) : 47) / Math.max(0.0001, lToY(p[50]))) * 0.24, -0.35, 0.35);
     // dark photos can take a bigger lift, because the curve below pulls the highlights down to balance it
-    const lift = target?.p50 != null ? exposure : exposure > 0 ? clamp(exposure * 1.6, 0, 0.6) : exposure;
+    const lift = exposure > 0 ? clamp(exposure * 1.6, 0, 0.6) : exposure;
     const highlights = clamp(-(p[99] - 94) * 0.22 - (t.clipHi > 0.002 ? 3 : 0), -10, 0);
     const shadows = clamp((5 - p[5]) * 0.22 + (t.clipLo > 0.002 ? 3 : 0), 0, 7);
     const basic = { exposure: lift, contrast: 0, highlights, shadows, whites: 0, blacks: 0 };
@@ -719,7 +717,7 @@ const handlers = {
     const wheelsFree = !look?.kind && !['shadowSat', 'midtoneSat', 'highlightSat'].some((k) => params[k]);
     if (wheelsFree) Object.assign(basic, colorContrast(own.zones));
     if (look?.kind === 'photographer') { basic.finishBlacks = 0; basic.finishRolloff = 0; }
-    const curves = autoCurves(e.ps, { ...base, ...basic }, { midL: target?.p50 ?? null, spreadL: target?.p25 != null && target?.p75 != null ? [target.p25, target.p75] : null, zoneShift: target?.zones ? zoneChannelShifts(own.zones, target.zones) : null });
+    const curves = autoCurves(e.ps, { ...base, ...basic }, { midL: target?.p50 != null ? clamp(target.p50, 35, 65) : null, spreadL: target?.p25 != null && target?.p75 != null ? [target.p25, target.p75] : null, zoneShift: target?.zones ? zoneChannelShifts(own.zones, target.zones) : null });
     return autoAdjustResult(params, { ...basic, ...curves });
   },
 
