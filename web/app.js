@@ -1509,7 +1509,7 @@ function openDetail(p) {
     </div></main>
     <aside class="dpanel" id="dbody">
       <div class="panel-head"><div class="panel-topline"><strong class="panel-title">Controls</strong><button class="panel-toggle" id="panelToggle" type="button" aria-label="Collapse controls" aria-expanded="true">‹</button></div>
-        <div class="edit-actions"><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure, set fade, fit the curves, then pick and adjust colors for a clean portrait look">Auto Adjust</button><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
+        <div class="edit-actions"><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure, set fade, fit the curves, then pick and adjust colors toward the chosen look (or a clean portrait look)">Auto Adjust</button><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
         <nav class="ptabs" id="ptabs" aria-label="Editing sections">${PAGES.map(([k, l]) => `<button data-p="${k}" title="${l}" aria-label="${l}"><span class="tab-icon" aria-hidden="true">${({ look: '◉', subject: '◌', light: '☼', color: '◐', retouch: '✦', more: '⋯' })[k]}</span><span class="tab-label">${l}</span></button>`).join('')}</nav>
       </div>
       <div class="pager" id="pager">
@@ -1542,7 +1542,10 @@ function openDetail(p) {
   $('#autoAdjust').onclick = async () => {
     const btn = $('#autoAdjust'); btn.disabled = true; btn.textContent = 'Adjusting…';
     try {
-      const r = await pool.call(p.worker, 'autoAdjust', { id: p.id, params: structuredClone(p.params || defaultParams()) }, { priority: true });
+      const sa = solveArgs(p), rs = sa?.refStats;
+      // the look Auto Adjust chases: the reference's measured tone, skin and colour bands, or the photographer's finish
+      const look = !sa ? null : rs ? { kind: 'reference', refStats: { tone: { pct: rs.tone?.pct }, bands: rs.bands, skin: rs.skin, color: { meanChroma: rs.color?.meanChroma } } } : { kind: 'photographer', finish: sa.finish };
+      const r = await pool.call(p.worker, 'autoAdjust', { id: p.id, params: structuredClone(p.params || defaultParams()), look }, { priority: true });
       if (!D || D.p !== p) return;
       const preservedReference = r.preservedReference === true;
       delete r.preservedReference;
@@ -1558,7 +1561,7 @@ function openDetail(p) {
       $('#sliders').querySelectorAll('details.group').forEach((group) => {
         if (visible.has($('summary', group)?.textContent.trim())) group.open = true;
       });
-      toast('Auto Adjust applied: fade, curves, point colors and HSL are set. Undo puts it back.');
+      toast('Auto Adjust applied: fade, curves, point colors and HSL are set toward the look. Undo puts it back.');
     } catch (e) { toast(e.message, 4500); logError('auto adjust', e, p.file); }
     finally { if ($('#autoAdjust')) { $('#autoAdjust').disabled = false; $('#autoAdjust').textContent = 'Auto Adjust'; } }
   };

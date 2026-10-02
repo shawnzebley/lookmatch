@@ -3,7 +3,7 @@ import { prepare, measure, regionStats, regionUsable, halationSignature } from '
 import { solve, solvePreset } from './engine/solver.js';
 import { referenceRegionTargets, solveMaskedReference } from './engine/masked-reference.js';
 import { fitSkinMatch, applySkinMatchRGBA } from './engine/skin-match.js';
-import { fitFinish, FINISH_PROFILES } from './engine/finish.js';
+import { fitFinish, FINISH_PROFILES, styleTargets } from './engine/finish.js';
 import { fitRegions, fitReferenceRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
 import { signature, nearestRegions } from './engine/style.js';
 import { compile, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, curveLUT, fadeLevels, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
@@ -22,7 +22,7 @@ import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
 import { stylizeRemote } from './lib/deeppreset.js';
-import { autoAdjustResult, hasReferenceCurve, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor } from './engine/auto-adjust.js';
+import { autoAdjustResult, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor, lookFade, lookSkinPoint, lookBands, lookPresence } from './engine/auto-adjust.js';
 
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
@@ -429,7 +429,7 @@ function cullInfo(e, bmp) {
 // and a warm cast is only partly taken out (warm light usually reads as intended).
 const AUTO_MID = 118, AUTO_QSPREAD = 92, AUTO_RGB_MAX = 18, AUTO_SLOPE = [0.5, 1.8];
 const AUTO_GREY_FRAC = 0.15, AUTO_GREY_C = [10, 26], AUTO_WARM_KEEP = 0.4;
-function autoCurves(ps, params) {
+function autoCurves(ps, params, { midL = null } = {}) {
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const cur = processPixelSet(ps, params);
   const n = ps.n;
@@ -458,7 +458,8 @@ function autoCurves(ps, params) {
   const bx = Math.round(clamp(lo - 2, 0, 24)), wx = Math.round(clamp(hi + 2, 230, 255));
   const st = (v) => clamp((v - bx) / (wx - bx) * 255, 0, 255);
   const q25 = pct(lum, n, 0.25), q50 = pct(lum, n, 0.5), q75 = pct(lum, n, 0.75);
-  const ym = st(q50) + clamp((AUTO_MID - st(q50)) * 0.5, -18, 18);
+  const midTarget = midL != null ? clamp(v8(lToY(midL)), 90, 150) : AUTO_MID;
+  const ym = st(q50) + clamp((midTarget - st(q50)) * 0.5, -18, 18);
   const push = clamp((AUTO_QSPREAD - (st(q75) - st(q25))) * 0.3, -8, 14);
   // Place the midpoint first, then the quartiles around it, each kept inside AUTO_SLOPE of the
   // points already placed on either side (a quartile that can't fit is left out). The midpoint
@@ -665,34 +666,51 @@ const handlers = {
   // Correct only measured problems; Auto Adjust is a starting correction, not a look. The basic
   // sliders stay gentle and the curves do the work: autoCurves fits the light curve and the R/G/B
   // curves to this photo as edited so far (white balance, HSL, local edits), minus its old curves.
-  async autoAdjust({ id, params = {} }) {
-    if (hasReferenceCurve(params)) {
-      return autoAdjustResult(params);
-    }
+  async autoAdjust({ id, params = {}, look = null }) {
     const e = await ensurePrepared(id);
-    const s = measure(e.ps), t = s.tone, p = t.pct;
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    const exposure = clamp(Math.log2(lToY(47) / Math.max(0.0001, lToY(p[50]))) * 0.24, -0.35, 0.35);
+    // What the chosen look measures, if there is one: tone ends, middle, skin, colour bands, intensity.
+    // A photographer's finish already carries its black/white lift, so Auto Adjust takes that over as fade.
+    let target = null;
+    if (look?.kind === 'reference' && look.refStats?.tone?.pct) {
+      const r = look.refStats;
+      target = { p1: r.tone.pct[1], p50: r.tone.pct[50], p99: r.tone.pct[99], bands: r.bands, skin: r.skin, chroma: r.color?.meanChroma };
+    } else if (look?.kind === 'photographer' && FINISH_PROFILES[look.finish]?.p1 != null) {
+      const T = styleTargets(e.ps, FINISH_PROFILES[look.finish], false);
+      target = { p1: T.p1, p99: T.p99 };
+    }
+    // start from the current edit with the pieces Auto Adjust owns cleared (the curves, fade, its own picked points)
+    const base = { ...params, curve: null, curveR: null, curveG: null, curveB: null, fadeBlacks: 0, fadeWhites: 0, points: (params.points || []).filter((q) => !q.auto) };
+    if (look?.kind === 'photographer') { base.finishBlacks = 0; base.finishRolloff = 0; }
+    const s = measure(e.ps), t = s.tone, p = t.pct;
+    const exposure = clamp(Math.log2(lToY(target?.p50 != null ? clamp(target.p50, 35, 65) : 47) / Math.max(0.0001, lToY(p[50]))) * 0.24, -0.35, 0.35);
     // dark photos can take a bigger lift, because the curve below pulls the highlights down to balance it
     const lift = exposure > 0 ? clamp(exposure * 1.6, 0, 0.6) : exposure;
     const highlights = clamp(-(p[99] - 94) * 0.22 - (t.clipHi > 0.002 ? 3 : 0), -10, 0);
     const shadows = clamp((5 - p[5]) * 0.22 + (t.clipLo > 0.002 ? 3 : 0), 0, 7);
-    const basic = { exposure: lift, contrast: 0, highlights, shadows, whites: 0, blacks: 0, ...fadeFor({ clipLo: t.clipLo, clipHi: t.clipHi, p5: p[5], p99: p[99] }) };
-    // white balance on skin, then saturation down / vibrance up (portrait rules)
-    const cur0 = processPixelSet(e.ps, { ...params, ...basic });
-    let sn = 0, sa = 0, sb = 0, sl = 0, cn = 0, cs = 0;
+    const basic = { exposure: lift, contrast: 0, highlights, shadows, whites: 0, blacks: 0 };
+    // the photo as it stands with the basic correction: everything below is measured from it
+    const cur0 = processPixelSet(e.ps, { ...base, ...basic });
+    const own = measure(e.ps, cur0);
+    let sn = 0, sa = 0, sb = 0, sl = 0;
     const sk = e.ps.skinMask;
-    for (let i = 0; i < e.ps.n; i++) {
-      if (cur0.L[i] > 12 && cur0.L[i] < 95) { cs += Math.hypot(cur0.A[i], cur0.B[i]); cn++; }
-      if (sk && sk[i] >= 191 && cur0.L[i] > 25 && cur0.L[i] < 92) { sa += cur0.A[i]; sb += cur0.B[i]; sl += cur0.L[i]; sn++; }
-    }
-    const wb = sn >= e.ps.n * 0.002 ? skinWhiteBalance(sa / sn, sb / sn) : { temp: 0, tint: 0 };
-    // colour picker + HSL for the look: a point on skin and one on the most prominent look colour, HSL for the other bands
-    const look = lookColor(s.bands);
-    const sp = sn >= e.ps.n * 0.002 ? skinPoint(sl / sn, sa / sn, sb / sn) : null;
-    const points = [...(params.points || []).filter((q) => !q.auto), ...[sp, look.point].filter(Boolean)];
-    Object.assign(basic, look.hsl, points.length ? { points } : {}, presenceFor(cn ? cs / cn : NaN), wb.temp || wb.tint ? { temp: clamp((params.temp || 0) + wb.temp, -60, 60), tint: clamp((params.tint || 0) + wb.tint, -50, 50) } : {});
-    const curves = autoCurves(e.ps, { ...params, ...basic, curve: null, curveR: null, curveG: null, curveB: null });
+    for (let i = 0; i < e.ps.n; i++) if (sk && sk[i] >= 191 && cur0.L[i] > 25 && cur0.L[i] < 92) { sa += cur0.A[i]; sb += cur0.B[i]; sl += cur0.L[i]; sn++; }
+    const haveSkin = sn >= e.ps.n * 0.002;
+    // fade: the look's black and white ends, else a light matte floor sized from the measured clipping
+    const clip = { clipLo: own.tone.clipLo, clipHi: own.tone.clipHi };
+    Object.assign(basic, lookFade({ p1: own.tone.pct[1], p99: own.tone.pct[99], ...clip }, target) || fadeFor({ ...clip, p5: own.tone.pct[5], p99: own.tone.pct[99] }));
+    // colour picker + HSL: toward the look's skin and colour bands, else the default clean-portrait look
+    const lc = target?.bands ? lookBands(own.bands, target.bands) : lookColor(own.bands);
+    const sp = !haveSkin ? null : target?.skin ? lookSkinPoint({ L: sl / sn, a: sa / sn, b: sb / sn }, target.skin) : skinPoint(sl / sn, sa / sn, sb / sn);
+    const points = [...base.points, ...[sp, lc.point].filter(Boolean)];
+    const hsl = {};
+    for (const [k, v] of Object.entries(lc.hsl)) hsl[k] = clamp(target?.bands ? (params[k] || 0) + v : v, -45, 45);
+    // white balance on skin only when there is no look skin to chase; presence from the look's intensity
+    const wb = haveSkin && !target?.skin ? skinWhiteBalance(sa / sn, sb / sn) : { temp: 0, tint: 0 };
+    const pres = (target?.chroma && look?.kind === 'reference' ? lookPresence(own.color.meanChroma, target.chroma) : null) || presenceFor(own.color.meanChroma);
+    Object.assign(basic, hsl, points.length ? { points } : {}, pres, wb.temp || wb.tint ? { temp: clamp((params.temp || 0) + wb.temp, -60, 60), tint: clamp((params.tint || 0) + wb.tint, -50, 50) } : {});
+    if (look?.kind === 'photographer') { basic.finishBlacks = 0; basic.finishRolloff = 0; }
+    const curves = autoCurves(e.ps, { ...base, ...basic }, { midL: target?.p50 != null ? clamp(target.p50, 35, 65) : null });
     return autoAdjustResult(params, { ...basic, ...curves });
   },
 
