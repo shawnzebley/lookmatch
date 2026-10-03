@@ -11,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-10-02a';
+const APP_VERSION = '2026-10-03a';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -334,7 +334,7 @@ function resetPhotoLook(p) {
   const retained = keptEdits(p.params);
   p.params = { ...defaultParams(), ...retained };
   p.solved = null; p.solvedLook = NONE_LOOK; p.finish = undefined; p.finishStrength = undefined; p.strength = 100;
-  p.style = null; p.regions = null; p.targets = null; p.after = null; p.loss = null; p.model = null;
+  p.style = null; p.regions = null; p.targets = null; p.after = null; p.loss = null; p.model = null; p.acceptance = null;
   delete p.error; delete p.errRec;
   if (p.before) p.status = 'done';
   return Object.keys(retained).length > 0;
@@ -371,8 +371,11 @@ function setLook(l) {
   if (l.kind === 'preset') { S.presetId = l.id; localStorage.setItem('lm_preset', l.id); }
   const pr = l.kind === 'preset' ? presetById(l.id) : null;
   for (const ph of S.photos) {
-    ph.look = null; ph.finish = undefined; ph.strength = pr ? pr.strength : 100;
-    if (['done', 'exported', 'ready'].includes(ph.status)) ph.status = 'ready';
+    // Invalidate an in-flight solve before changing its inputs; its result must
+    // never be committed after the global style has moved on.
+    cancelPhotoSolve(ph);
+    ph.look = null; ph.finish = undefined; ph.finishStrength = undefined; ph.strength = pr ? pr.strength : 100;
+    if (ph.before && ['done', 'exported', 'ready', 'solving', 'error'].includes(ph.status)) ph.status = 'ready';
   }
   if (S.photos.length === 1) S.autoOpen = true;
   runQueue(); renderMatch();
@@ -412,6 +415,10 @@ function statusLabel(p) {
   if (isNoneLook(lookOf(p))) return p.params ? 'edit' : 'open to edit';
   if (p.params && !lookOf(p)) return 'edit';
   if (p.status === 'ready' && !lookOf(p)) return 'open to edit';
+  if (['done', 'exported'].includes(p.status) && referenceCheckArgs(p).refStats) {
+    const label = p.acceptance?.status === 'accepted' ? 'match checked' : p.acceptance?.status === 'rejected' ? 'needs review' : 'unverified';
+    return p.status === 'exported' ? `exported · ${label}` : label;
+  }
   return { loading: 'reading', ready: 'queued', solving: 'styling', done: 'done', error: 'error', exporting: 'exporting', exported: 'exported' }[p.status] || p.status;
 }
 
@@ -564,7 +571,7 @@ function renderMatch() {
     <div class="seg wide" id="styleSeg"><button data-k="photographer" class="${kind === 'photographer' ? 'on' : ''}">Photographer</button><button data-k="preset" class="${kind === 'preset' ? 'on' : ''}">Reference photo</button><button data-k="none" class="${isNoneLook(look) ? 'on' : ''}">None</button></div>
     <p class="muted small step-note">${isNoneLook(look) ? 'Use the photo as it was captured.' : kind === 'photographer' ? 'What that photographer would do to each of your photos, read from the published shots most like each scene.' : 'Copy the look of one photo onto yours. Your saved references and Lightroom presets are here.'}</p>
     </section>`);
-  const pick = (l) => { if (!sameLook(l, S.look)) setLook(l); };
+  const pick = (l) => setLook(l);
   if (kind !== 'none') style.append(kind === 'photographer' ? photographerCards(look, pick) : referenceCards(look, pick));
   $('#styleSeg', style).onclick = (e) => {
     const k = e.target.dataset.k; if (!k) return;
@@ -643,8 +650,34 @@ function ensurePresetRegions(pr) {
 const KEEP_KEYS = ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points'];
 const keptEdits = (params) => Object.fromEntries(KEEP_KEYS.filter((k) => params && params[k] != null).map((k) => [k, structuredClone(params[k])]));
 
+function referenceCheckArgs(p) {
+  const args = solveArgs(p);
+  return { refStats: args?.lrParams ? null : args?.refStats || null, strength: args?.strength ?? 1 };
+}
+
+const acceptanceRuns = new WeakMap();
+function invalidateAcceptance(p) {
+  p.acceptance = null;
+  const revision = (acceptanceRuns.get(p) || 0) + 1;
+  acceptanceRuns.set(p, revision);
+  return revision;
+}
+
+function acceptanceNote(p) {
+  if (!referenceCheckArgs(p).refStats) return '';
+  const a = p.acceptance;
+  const heading = a?.status === 'accepted' ? 'Reference checks passed' : a?.status === 'rejected' ? 'Reference match needs review' : 'Reference match unverified';
+  const checks = a?.checks.filter(c => c.status !== 'pass') || [];
+  const labels = [...new Set(checks.map(c => c.label))];
+  const summary = labels.slice(0, 3).map(esc).join('<br>');
+  return `<div class="small" role="status" style="margin:8px 0"><b>${heading}</b>${summary ? `<br>${summary}${labels.length > 3 ? `<br>And ${labels.length - 3} more checks.` : ''}` : a ? '' : '<br>Checks are pending.'}
+    <br><span class="muted">${!a ? 'Preview checks pending.' : a.scope === 'export-sample' ? 'Checked a sample of the exported JPEG.' : 'Checked rendered preview pixels.'} Visual review is still needed.</span>
+    ${a ? `<details><summary>Check measurements</summary><p class="muted">Tolerances are provisional.</p>${a.checks.map(c => `<p><b>${esc(c.label)}: ${esc(c.status)}</b><br>${esc(c.reason || '')}</p>`).join('')}</details>` : ''}</div>`;
+}
+
 const solveRuns = new WeakMap();
 function cancelPhotoSolve(p) {
+  invalidateAcceptance(p);
   solveRuns.set(p, (solveRuns.get(p) || 0) + 1);
   const w = pool.workers[p.worker];
   if (!w) return;
@@ -657,19 +690,31 @@ function solvePhoto(p, { priority = false } = {}) {
   if (!solveArgs(p)) return Promise.resolve();
   const run = (solveRuns.get(p) || 0) + 1; solveRuns.set(p, run);
   const look = lookOf(p);
+  const geometry = JSON.stringify(p.geom || null), maskVersion = p.mask?.ver;
+  invalidateAcceptance(p);
   p.status = 'solving'; p.solvedLook = look; rerenderMatchSoon();
-  return ensurePresetRegions(presetOf(p)).then(() => solveRuns.get(p) === run ? pool.call(p.worker, 'solve', { id: p.id, ...solveArgs(p) }, { priority }) : null).then((r) => {
-    if (!r || solveRuns.get(p) !== run) return null;
+  if (D?.p === p) renderStyleCard();
+  return ensurePresetRegions(presetOf(p)).then(() => solveRuns.get(p) === run ? pool.call(p.worker, 'solve', { id: p.id, ...solveArgs(p), kept: keptEdits(p.params) }, { priority }) : null).then(async (r) => {
+    if (!r || solveRuns.get(p) !== run || JSON.stringify(p.geom || null) !== geometry || p.mask?.ver !== maskVersion) return null;
+    const beforeKept = JSON.stringify(keptEdits(r.params));
     Object.assign(r.params, keptEdits(p.params));
+    if (JSON.stringify(keptEdits(r.params)) !== beforeKept) {
+      Object.assign(r, await pool.call(p.worker, 'measureParams', { id: p.id, params: r.params, ...referenceCheckArgs(p) }, { priority }));
+      if (solveRuns.get(p) !== run || JSON.stringify(p.geom || null) !== geometry || p.mask?.ver !== maskVersion) return null;
+    }
     if (r.model && !r.model.ok) toast(`Model assist failed, matched without it: ${r.model.error}`);
-    Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, scene: r.scene, timings: r.timings, guardScale: r.guardScale, model: r.model, style: r.style, regions: r.regions, mask: r.mask || p.mask, status: 'done' });
+    Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, acceptance: r.acceptance || null, scene: r.scene, timings: r.timings, guardScale: r.guardScale, model: r.model, style: r.style, regions: r.regions, mask: r.mask || p.mask, status: 'done' });
     rerenderMatchSoon();
     // one photo in, style picked: go straight to the editor
     if (S.autoOpen && S.photos.length === 1 && !D && S.tab === 'match') { S.autoOpen = false; openDetail(p); }
     // restyled in the background while its editor is open (style changed for all photos)
     else if (!priority && D && D.p === p && !D.crop) { D.userEdited = false; refreshDetail(); }
     return r;
-  }).catch((e) => { if (solveRuns.get(p) !== run) return null; p.status = 'error'; p.error = e.message; p.errRec = logError('style photo', e, p.file); rerenderMatchSoon(); });
+  }).catch((e) => {
+    if (solveRuns.get(p) !== run) return null;
+    p.status = 'error'; p.error = e.message; p.errRec = logError('style photo', e, p.file); rerenderMatchSoon();
+    if (D?.p === p) renderStyleCard();
+  });
 }
 
 function runQueue() {
@@ -1272,12 +1317,19 @@ function renderSyncCard() {
       else delete next.skinMatch;
       if (!o.light) for (const k of SYNC_OWN) next[k] = q.params ? q.params[k] ?? 0 : 0;
       if (!o.heals) next.heals = q.params && q.params.heals ? q.params.heals : [];
+      invalidateAcceptance(q);
       Object.assign(q, { params: next, solved: structuredClone(next), look: p.look, solvedLook: lookOf(p), finish: p.finish, finishStrength: p.finishStrength, strength: p.strength, split: p.split, status: 'done', synced: true });
     }
     rerenderMatchSoon();
     toast(`Synced to ${qs.length} photo${qs.length > 1 ? 's' : ''}`, 2500);
     // refresh each photo's checks with its new settings
-    await Promise.all(qs.map((q) => pool.call(q.worker, 'measureParams', { id: q.id, params: { ...q.params }, auto: null }).then((r) => { q.after = r.after; q.loss = r.loss; }).catch(() => {})));
+    await Promise.all(qs.map((q) => {
+      const revision = acceptanceRuns.get(q), snapshot = editSnap(q);
+      return pool.call(q.worker, 'measureParams', { id: q.id, params: { ...q.params }, auto: null, ...referenceCheckArgs(q) }).then((r) => {
+        if (acceptanceRuns.get(q) !== revision || editSnap(q) !== snapshot) return;
+        q.after = r.after; q.loss = r.loss; q.acceptance = r.acceptance || null;
+      }).catch(() => { if (acceptanceRuns.get(q) === revision) q.acceptance = null; });
+    }));
     rerenderMatchSoon();
     if ($('#syGo')) $('#syGo').disabled = false;
   };
@@ -1285,6 +1337,7 @@ function renderSyncCard() {
 
 async function maskOp(args) {
   const p = D.p;
+  invalidateAcceptance(p);
   const busy = args.op === 'add' || args.op === 'remove' || args.op === 'retry';
   if (busy) toast(args.op === 'add' ? 'Finding what you tapped…' : args.op === 'remove' ? 'Taking it out…' : 'Looking for people and faces again…', 30000);
   try {
@@ -1425,9 +1478,12 @@ function styleCard(p) {
         ${fk !== 'off' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : ''}`
     : '<p class="muted small" style="margin:8px 0 0">Pick a reference to copy its look onto this photo.</p>'}`;
   }
+  const status = p.status === 'solving'
+    ? '<p class="muted small" role="status" style="margin:8px 0 0">Applying style…</p>'
+    : p.status === 'error' ? `<p class="small" role="alert" style="margin:8px 0 0;color:var(--bad)">Could not apply style: ${esc(p.error || 'Unknown error')}</p>` : '';
   const others = S.photos.length > 1;
   return `<h3>Style</h3><div class="seg wide" id="dSeg"><button data-k="photographer" class="${kind === 'photographer' ? 'on' : ''}">Photographer</button><button data-k="preset" class="${kind === 'preset' ? 'on' : ''}">Reference photo</button><button data-k="none" class="${isNoneLook(look) ? 'on' : ''}">None</button></div>
-    ${body}${others && look && !isNoneLook(look) ? '<div class="row" style="margin-top:10px"><button id="lookAll">Use this style on all photos</button></div>' : ''}`;
+    ${status}${acceptanceNote(p)}${body}${others && look && !isNoneLook(look) ? '<div class="row" style="margin-top:10px"><button id="lookAll">Use this style on all photos</button></div>' : ''}`;
 }
 
 function renderStyleCard() {
@@ -1455,8 +1511,7 @@ function renderStyleCard() {
     if (b.dataset.a === 'ref') return $('#pickRef').click();
     const [kind, id] = b.dataset.l.split(':');
     const l = kind === 'photographer' ? { kind, key: id } : { kind, id };
-    if (sameLook(l, lookOf(p))) return;
-    p.look = l; p.finish = undefined;
+    p.look = l; p.finish = undefined; p.finishStrength = undefined;
     if (kind === 'preset') p.strength = presetById(id)?.strength ?? 100;
     resolve();
   };
@@ -1473,9 +1528,14 @@ function renderStyleCard() {
     S.look = l;
     try { localStorage.setItem(LOOK_KEY, JSON.stringify(l)); } catch (e) { /* private mode */ }
     for (const ph of S.photos) {
-      if (ph === p) { ph.look = null; continue; }
+      cancelPhotoSolve(ph);
+      if (ph === p) {
+        ph.look = null;
+        if (ph.before && ['solving', 'error'].includes(ph.status)) ph.status = 'ready';
+        continue;
+      }
       Object.assign(ph, { look: null, finish: p.finish, finishStrength: p.finishStrength, strength: p.strength, split: p.split });
-      if (['done', 'exported', 'ready'].includes(ph.status)) ph.status = 'ready';
+      if (ph.before && ['done', 'exported', 'ready', 'solving', 'error'].includes(ph.status)) ph.status = 'ready';
     }
     runQueue();
     toast(`${lookName(l)} on all ${S.photos.length} photos`);
@@ -1673,13 +1733,13 @@ function renderLoss() {
   if (!L) { box.innerHTML = ''; return; }
   if (!L.issues.length) {
     box.className = 'lossbar ok';
-    box.innerHTML = `<div class="lrow"><span>Nothing blown, crushed or flattened by this edit.</span></div>`;
+    box.innerHTML = `<div class="lrow"><span>No measured clipping or detail-loss warnings in the preview.</span></div>${acceptanceNote(D.p)}`;
     return;
   }
   box.className = `lossbar ${L.worst}`;
   const chips = L.issues.map((i) => `<span class="lchip ${i.level}">${esc(i.text)}</span>`).join('');
   const cul = (L.culprits || []).map((c) => `<button class="lnk" data-k="${c.key}">${esc(SL_LABEL[c.key] || c.key)} ${fmtVal(c.key, c.value)}</button>`).join(', ');
-  box.innerHTML = `<div class="lrow">${chips}</div>${cul ? `<div class="lrow small">Mostly from ${cul}</div>` : ''}`;
+  box.innerHTML = `<div class="lrow">${chips}</div>${acceptanceNote(D.p)}${cul ? `<div class="lrow small">Mostly from ${cul}</div>` : ''}`;
   for (const c of L.culprits || []) controlFor(c.key)?.classList.add('culprit');
   box.querySelectorAll('button.lnk[data-k]').forEach((b) => (b.onclick = () => jumpToSlider(b.dataset.k)));
 }
@@ -1747,17 +1807,21 @@ document.addEventListener('keydown', (e) => {
 let measureT;
 function scheduleMeasure(delay = 350) {
   clearTimeout(measureT);
+  if (!D) return;
+  const scheduledPhoto = D.p, revision = invalidateAcceptance(scheduledPhoto);
   measureT = setTimeout(async () => {
-    if (!D) return;
+    if (!D || D.p !== scheduledPhoto || acceptanceRuns.get(scheduledPhoto) !== revision) return;
     commitEdit();
     const p = D.p;
-    const r = await pool.call(p.worker, 'measureParams', { id: p.id, params: { ...p.params }, auto: p.solved || null }, { priority: true });
-    if (!D || D.p !== p) return;
-    p.after = r.after; p.loss = r.loss;
+    const snapshot = JSON.stringify(p.params), reference = referenceCheckArgs(p);
+    const r = await pool.call(p.worker, 'measureParams', { id: p.id, params: { ...p.params }, auto: p.solved || null, ...reference }, { priority: true });
+    if (!D || D.p !== p || acceptanceRuns.get(p) !== revision || JSON.stringify(p.params) !== snapshot || JSON.stringify(referenceCheckArgs(p)) !== JSON.stringify(reference)) return;
+    p.after = r.after; p.loss = r.loss; p.acceptance = r.acceptance || null;
     $('#nums').innerHTML = numbersTable(p);
     const wasBad = D.lastWorst === 'bad';
     D.lastWorst = r.loss.worst;
     renderLoss();
+    renderStyleCard(); rerenderMatchSoon();
     // first time an edit goes badly wrong, show where on the photo
   }, delay);
 }
@@ -1981,6 +2045,7 @@ function bindCropBar() {
     const changed = JSON.stringify(geom) !== JSON.stringify(p.geom || null);
     exitCrop();
     if (!changed) return requestPreview(false);
+    invalidateAcceptance(p);
     p.geom = geom;
     $('#cropBtn').classList.toggle('on', !!geom);
     try {
@@ -2144,6 +2209,7 @@ async function exportPhotos(list) {
   const date = new Date().toISOString().slice(0, 10);
   let doneN = 0;
   const errors = [];
+  const reviewNotes = [];
   try {
     if (dest === 'drive') {
       const root = await drive.folder('LookMatch');
@@ -2154,6 +2220,8 @@ async function exportPhotos(list) {
         p.status = 'exporting'; rerenderMatchSoon();
         try {
           const r = await pool.call(p.worker, 'export', exportArgs(p));
+          p.acceptance = r.acceptance || null;
+          if (p.acceptance && !p.acceptance.accepted) reviewNotes.push(`${p.name}: ${p.acceptance.status === 'rejected' ? 'needs review' : 'unverified'}`);
           status(`${p.name}: uploading…`);
           const b = baseName(p.name);
           await drive.upload(r.jpeg, `${b}_lookmatch.jpg`, dir, 'image/jpeg');
@@ -2175,6 +2243,8 @@ async function exportPhotos(list) {
           p.status = 'exporting'; rerenderMatchSoon();
           try {
             const r = await pool.call(p.worker, 'export', exportArgs(p));
+            p.acceptance = r.acceptance || null;
+            if (p.acceptance && !p.acceptance.accepted) reviewNotes.push(`${p.name}: ${p.acceptance.status === 'rejected' ? 'needs review' : 'unverified'}`);
             const b = baseName(p.name);
             files.push(new File([r.jpeg], `${b}_lookmatch.jpg`, { type: 'image/jpeg' }));
             if (r.lrCopy) files.push(new File([r.lrCopy], `${b}_lightroom.jpg`, { type: 'image/jpeg' }));
@@ -2191,12 +2261,13 @@ async function exportPhotos(list) {
   } catch (e) { errors.push(e.message); }
   wake?.release?.().catch?.(() => {});
   if (errors.length) status(`${$('#expStatus', sheet).textContent} Problems: ${errors.join(' · ')}`);
+  if (reviewNotes.length) status(`${$('#expStatus', sheet).textContent} Reference checks: ${reviewNotes.join(' · ')}.`);
   $('#expActs', sheet).innerHTML = '<button class="primary" data-close>Close</button>';
   $('#expActs [data-close]', sheet).onclick = closeSheet;
 }
 
 function exportArgs(p) {
-  return { id: p.id, params: p.params, geom: p.geom || null, quality: S.settings.quality, lightroom: S.settings.lightroom, lrMode: S.settings.lrMode, name: baseName(p.name) };
+  return { id: p.id, params: p.params, geom: p.geom || null, quality: S.settings.quality, lightroom: S.settings.lightroom, lrMode: S.settings.lrMode, name: baseName(p.name), ...referenceCheckArgs(p) };
 }
 
 // iOS only allows the share sheet from a tap, so each batch waits for one.
