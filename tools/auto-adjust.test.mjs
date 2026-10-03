@@ -1,10 +1,38 @@
 import assert from 'node:assert/strict';
-import { autoAdjustResult, referenceCurveContrast, referenceFinish } from '../engine/auto-adjust.js';
+import { autoAdjustBase, autoAdjustResult, referenceCurveContrast, referenceFinish } from '../engine/auto-adjust.js';
 
 // a reference match is recalculated toward the look, not preserved
 const calculated = { exposure: 0.1, highlights: -1, curve: [[0, 0], [255, 255]] };
 assert.deepEqual(autoAdjustResult({ curveAuto: 'reference', curve: [[0, 0], [128, 141], [255, 255]] }, calculated), { ...calculated, preservedReference: false });
 assert.deepEqual(autoAdjustResult({}, calculated), { ...calculated, preservedReference: false });
+const mapping = { matrix: [[1, 0, 0], [0, 1, 0], [0, 0, 1]] };
+const oldParams = {
+  curve: [[0, 0], [255, 255]], curveR: [[0, 0], [128, 140], [255, 255]],
+  curveG: [[0, 0], [255, 255]], curveB: [[0, 0], [255, 255]], curveSaturation: 145,
+  curveAuto: 'reference', saturation: 22, vibrance: -13, fadeBlacks: 20, fadeWhites: 15,
+  points: [{ auto: true, hue: 10 }, { auto: false, hue: 20 }], exposure: 0.3,
+  local: {
+    subject: { curve: [[0, 0], [255, 255]], curveAuto: 'reference', curveAmount: 70, saturation: 8, vibrance: 5, referenceTransfer: mapping, exposure: 0.2 },
+    background: { curveR: [[0, 0], [255, 255]], curveAuto: 'auto', saturation: -4, vibrance: 3, hue_blue: 7 },
+  },
+};
+const autoBase = autoAdjustBase(oldParams);
+assert.notEqual(autoBase, oldParams);
+assert.notEqual(autoBase.local, oldParams.local);
+assert.equal(oldParams.curveSaturation, 145); // input remains untouched
+assert.equal(autoBase.curve, null); assert.equal(autoBase.curveR, null); assert.equal(autoBase.curveG, null); assert.equal(autoBase.curveB, null);
+assert.equal(autoBase.curveSaturation, 100); assert.equal(autoBase.curveAuto, null);
+assert.equal(autoBase.saturation, 0); assert.equal(autoBase.vibrance, 0);
+assert.equal(autoBase.fadeBlacks, 0); assert.equal(autoBase.fadeWhites, 0);
+assert.deepEqual(autoBase.points, [{ auto: false, hue: 20 }]);
+assert.equal(autoBase.exposure, oldParams.exposure);
+assert.equal(autoBase.local.subject.referenceTransfer, mapping);
+assert.equal(autoBase.local.subject.curve, undefined); assert.equal(autoBase.local.subject.curveAuto, undefined);
+assert.equal(autoBase.local.subject.saturation, 0); assert.equal(autoBase.local.subject.vibrance, 0);
+assert.equal(autoBase.local.subject.curveAmount, 70); assert.equal(autoBase.local.subject.exposure, 0.2);
+assert.equal(autoBase.local.background.curveR, undefined); assert.equal(autoBase.local.background.curveAuto, undefined);
+assert.equal(autoBase.local.background.saturation, 0); assert.equal(autoBase.local.background.vibrance, 0);
+assert.equal(autoBase.local.background.hue_blue, 7);
 console.log('auto-adjust checks passed');
 
 // The reference contrast step is always negative before curve fitting, and responds to the

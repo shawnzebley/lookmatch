@@ -4,6 +4,28 @@ export function autoAdjustResult(params = {}, calculated = {}) {
   return { ...calculated, preservedReference: false };
 }
 
+// Remove carried look state before fitting new Auto Adjust curves, while retaining unrelated edits
+// and any per-region reference transfer mappings.
+export function autoAdjustBase(params = {}) {
+  const base = {
+    ...params,
+    curve: null, curveR: null, curveG: null, curveB: null,
+    curveSaturation: 100, curveAuto: null,
+    saturation: 0, vibrance: 0,
+    fadeBlacks: 0, fadeWhites: 0,
+    points: (params.points || []).filter((q) => !q.auto),
+  };
+  if (params.local) {
+    base.local = Object.fromEntries(Object.entries(params.local).map(([region, value]) => {
+      if (!value) return [region, value];
+      const local = { ...value, saturation: 0, vibrance: 0 };
+      for (const key of ['curve', 'curveR', 'curveG', 'curveB', 'curveAuto']) delete local[key];
+      return [region, local];
+    }));
+  }
+  return base;
+}
+
 // Portrait rules for Auto Adjust, taken from a working portrait editor's Lightroom routine. Each is
 // small on purpose: Auto Adjust is a starting correction, not a look.
 import { labToLin, linearToSrgb, lToY } from './color.js';
