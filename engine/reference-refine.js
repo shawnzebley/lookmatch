@@ -94,7 +94,16 @@ export function refineReference(ps, params, targets, render, { skinTarget = null
         for (const key of ['deltaL', 'deltaA', 'deltaB']) fit[key] += previous[key] || 0;
       }
       const candidate = { ...best, skinMatch: fit };
-      if (skinError(ps, render(candidate), skinTarget, fit, strength) >= skinError(ps, current, skinTarget, fit, strength)) break;
+      if (skinError(ps, render(candidate), skinTarget, fit, strength) >= skinError(ps, current, skinTarget, fit, strength)) {
+        // A self-reference may need no correction, but acceptance still needs the fitted correspondence.
+        if (!previous) {
+          const identity = structuredClone(fit);
+          const zones = identity.version === 2 ? identity.people.flatMap((p) => p.zones) : [identity];
+          for (const zone of zones) for (const key of ['deltaL', 'deltaA', 'deltaB']) zone[key] = 0;
+          best.skinMatch = identity;
+        }
+        break;
+      }
       best = candidate;
     }
   }
