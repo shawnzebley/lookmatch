@@ -28,6 +28,9 @@ import { autoAdjustResult, sCurvePush, skinWhiteBalance, presenceFor, highlightR
 const SOLVE_SIDE = 512;
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
 const cache = new Map();
+// the photo open in the editor on this worker, if any: touch() won't evict its prepared data
+// no matter how stale, so switching its reference/style never forces a full re-decode + re-segment.
+let pinnedId = null;
 
 function canvas(w, h) {
   const c = new OffscreenCanvas(w, h);
@@ -135,8 +138,10 @@ async function toJpegBlob(img, quality = 0.9) {
 function touch(id) {
   const e = cache.get(id);
   if (e) e.lastUse = performance.now();
-  // keep at most 3 prepared photos per worker; stats/params live in the main thread
-  const entries = [...cache.entries()].filter(([, v]) => v.ps).sort((a, b) => b[1].lastUse - a[1].lastUse);
+  // keep at most 3 prepared photos per worker; stats/params live in the main thread.
+  // the pinned (open-in-editor) photo is excluded from both the budget and eviction, so
+  // batch-touching other photos on this worker can't knock the one being edited cold.
+  const entries = [...cache.entries()].filter(([k, v]) => v.ps && k !== pinnedId).sort((a, b) => b[1].lastUse - a[1].lastUse);
   for (const [, v] of entries.slice(3)) { v.ps = null; v.display = null; v.gdisplay = null; v.sample = null; if (v.mask) v.mask.canvases = {}; }
   return e;
 }
@@ -1000,6 +1005,11 @@ const handlers = {
   },
 
   async unload({ id }) { cache.delete(id); return {}; },
+
+  // main thread calls these on opening/closing the editor, so this worker never evicts the
+  // photo on screen to make room for others it's asked to prepare in the background.
+  async pin({ id }) { pinnedId = id; return {}; },
+  async unpin({ id }) { if (pinnedId === id) pinnedId = null; return {}; },
 };
 
 onmessage = async (ev) => {

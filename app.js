@@ -1549,6 +1549,7 @@ function renderStyleCard() {
 const PAGES = [['look', 'Look'], ['subject', 'Subject'], ['light', 'Light'], ['color', 'Color'], ['retouch', 'Retouch'], ['more', 'More']];
 function openDetail(p) {
   p.params ||= defaultParams();
+  pool.call(p.worker, 'pin', { id: p.id }, { priority: true }).catch(() => {});
   const el = $('#detail');
   el.hidden = false;
   el.classList.remove('cropping');
@@ -1942,6 +1943,7 @@ function bindStage() {
 
 function closeDetail() {
   clearTimeout(measureT);
+  if (D) pool.call(D.p.worker, 'unpin', { id: D.p.id }, { priority: true }).catch(() => {});
   const el = $('#detail');
   el.onscroll = null; el.classList.remove('cropping');
   el.hidden = true; el.innerHTML = '';
