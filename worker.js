@@ -9,6 +9,7 @@ import { signature, nearestRegions } from './engine/style.js';
 import { compile, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, curveLUT, fadeLevels, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
 import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
+import { referenceAcceptance } from './engine/reference-acceptance.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
 import { exifSegment, xmpSegment, insertSegments, isJpeg, jpegOrientation } from './engine/jpegmeta.js';
 import { isIdentityGeom, geomKey, geomSize, drawTransform, mapPolys, lightroomCrop, autoLevel, toSource } from './engine/geom.js';
@@ -259,6 +260,7 @@ async function analyze(e, bmp) {
   }
   e.fullW = bmp.width; e.fullH = bmp.height;
   const d = scaledData(bmp, SOLVE_SIDE, e.geom);
+  e.solveImage = d;
   e.ps = prepare(d, { faces: mapPolys(e.faces, bmp.width, bmp.height, e.geom), subject: maskFor(e, d.width, d.height, e.geom), skin: maskFor(e, d.width, d.height, e.geom, 0, null, 'skin') });
   e.ps.skinPeople = maskFor(e, d.width, d.height, e.geom, 0, null, 'skinPeople') || new Uint8Array(e.ps.n);
   e.ps.skinPositions = mapPositions(e.mask?.skinPositions, bmp.width, bmp.height, e.geom);
@@ -303,6 +305,25 @@ function renderInto(src, params, mask = null, skin = null, heals = null, people 
   if (params.halation) applyHalation(out, src.width, src.height, params.halation);
   if (hasSpatialFinish(params)) applyFinish(out, src.width, src.height, params);
   return { width: src.width, height: src.height, data: out };
+}
+
+// Acceptance uses the same quantized rendering and finishing passes as the preview,
+// with the original masks kept fixed for all before/after comparisons.
+function renderedMeasurements(e, params, refStats = null, strength = 1) {
+  const src = e.solveImage;
+  const heals = hasHeals(params) ? healsToOut(params.heals, e.fullW, e.fullH, e.geom, dispScale(e, src.width, e.geom)) : null;
+  const out = renderInto(src, params, e.ps.subject, e.ps.skinMask, heals, e.ps.skinPeople);
+  const cur = prepare(out);
+  const acceptance = refStats ? referenceAcceptance(e.ps, cur, refStats, { strength, skinMatch: params.skinMatch }) : null;
+  const loss = lossReport(e.ps, cur, params);
+  if (acceptance) {
+    if (!acceptance.accepted) {
+      loss.issues.push({ kind: 'reference-acceptance', level: acceptance.status === 'rejected' ? 'bad' : 'warn', text: acceptance.status === 'rejected' ? 'Reference match needs review' : 'Reference match unverified' });
+    }
+    if (acceptance.status === 'rejected') loss.worst = 'bad';
+    else if (acceptance.status === 'unverified' && loss.worst === 'ok') loss.worst = 'warn';
+  }
+  return { after: measure(e.ps, cur), loss, acceptance };
 }
 
 // output px per photo px for a display of the photo's geometry g that is dw wide
@@ -724,9 +745,10 @@ const handlers = {
   // modelUrl + refThumb (the reference's saved thumbnail) turn on model assist: the Deep Preset Space
   // restyles this photo toward the reference, and the solver then chases that result's measured
   // targets instead of the reference's own. Any failure falls back to the plain reference targets.
-  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true, modelUrl = null, refThumb = null }) {
+  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true, modelUrl = null, refThumb = null, kept = {} }) {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
+    const acceptanceReference = !lrParams ? refStats : null;
     let model = null;
     if (modelUrl && refThumb && refStats && !lrParams) {
       try {
@@ -784,16 +806,16 @@ const handlers = {
         if (r) { res.params = r.params; regions = { ...r.regions, from }; }
       }
     }
-    const cur = processPixelSet(e.ps, res.params);
-    const after = measure(e.ps, cur);
-    const loss = lossReport(e.ps, cur, res.params);
-    return { model, params: res.params, targets: res.targets, before: o, after, loss, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
+    // Retained manual edits must be present before the acceptance checks run.
+    for (const key of ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points']) if (kept[key] != null) res.params[key] = kept[key];
+    const checked = renderedMeasurements(e, res.params, acceptanceReference, strength);
+    return { model, params: res.params, targets: res.targets, before: o, ...checked, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
   },
 
-  async measureParams({ id, params, auto = null }) {
+  async measureParams({ id, params, auto = null, refStats = null, strength = 1 }) {
     const e = await ensurePrepared(id);
-    const cur = processPixelSet(e.ps, params);
-    const loss = lossReport(e.ps, cur, params);
+    const checked = renderedMeasurements(e, params, refStats, strength);
+    const loss = checked.loss;
     if (loss.issues.length) {
       // rank the sliders responsible on a 15k-pixel sample (fast enough to run on every slider release)
       if (!e.sample) {
@@ -806,7 +828,7 @@ const handlers = {
       if (hasLocal(params) && e.ps.subject) for (const r of REGIONS) for (const s of LOCAL_SLIDERS) keys.push(`${r}:${s.key}`);
       loss.culprits = culprits(e.ps, params, (q, idx, c) => processPixelSet(e.ps, q, idx, c), e.sample, scratch, keys, auto);
     }
-    return { after: measure(e.ps, cur), loss };
+    return checked;
   },
 
   // plain: the whole photo without crop/level (the crop tool draws its own frame over it)
@@ -841,7 +863,7 @@ const handlers = {
     return { edited, original, transfer: [edited, ...(original ? [original] : [])] };
   },
 
-  async export({ id, params, geom = undefined, quality = 92, lightroom = false, lrMode = 'sliders', name = 'photo' }) {
+  async export({ id, params, geom = undefined, quality = 92, lightroom = false, lrMode = 'sliders', name = 'photo', refStats = null, strength = 1 }) {
     const e = cache.get(id);
     if (!e) throw new Error('photo not loaded');
     const g = geom === undefined ? e.geom : (isIdentityGeom(geom) ? null : geom);
@@ -849,6 +871,12 @@ const handlers = {
     const bmp = await openBitmap(e, id);
     const W = bmp.width, H = bmp.height;
     const [OW, OH] = geomSize(W, H, g);
+    let acceptanceSource = null;
+    if (refStats) {
+      const source = scaledData(bmp, SOLVE_SIDE, g);
+      acceptanceSource = prepare(source, { subject: maskFor(e, source.width, source.height, g), skin: maskFor(e, source.width, source.height, g, 0, null, 'skin') });
+      acceptanceSource.skinPeople = maskFor(e, source.width, source.height, g, 0, null, 'skinPeople') || new Uint8Array(acceptanceSource.n);
+    }
     const luts = buildLUTs(params, 33);
     const masked = !luts.lut && e.mask && e.mask.frac >= 0.0005;
     const rgba = new Uint8ClampedArray(OW * OH * 4);
@@ -898,6 +926,13 @@ const handlers = {
     add.push(xmpSegment(`<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:CreatorTool="LookMatch"/></rdf:RDF></x:xmpmeta><?xpacket end="w"?>`));
     jpg = insertSegments(jpg, add);
     const out = { jpeg: new Blob([jpg], { type: 'image/jpeg' }), width: OW, height: OH, ms: { render: t1 - t0, encode: t2 - t1 } };
+    if (acceptanceSource) {
+      const exported = await createImageBitmap(out.jpeg);
+      try {
+        const cur = prepare(scaledData(exported, SOLVE_SIDE));
+        out.acceptance = { ...referenceAcceptance(acceptanceSource, cur, refStats, { strength, skinMatch: params.skinMatch }), scope: 'export-sample' };
+      } finally { exported.close(); }
+    }
     if (lightroom) {
       const crop = lightroomCrop(g, W, H, origJpeg ? jpegOrientation(orig) : 1);
       out.xmp = xmpPreset(params, `LookMatch ${name}`, lrMode, crop);

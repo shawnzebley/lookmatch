@@ -161,7 +161,8 @@ export function culprits(ps, params, process, idx, cur, keys, auto = null) {
   // Sliders the user moved away from the auto match are suspects first (revert to the auto value);
   // if the user changed nothing, every non-zero slider is a suspect (revert to 0).
   let suspects = auto ? keys.filter((k) => !k.endsWith('Hue') && Math.abs(getK(params, k) - getK(auto, k)) > 1e-6) : [];
-  const revertTo = (k) => (suspects.length ? getK(auto, k) : 0);
+  const useAuto = suspects.length > 0;
+  const revertTo = (k) => (useAuto ? getK(auto, k) : 0);
   if (!suspects.length) suspects = keys.filter((k) => getK(params, k) && !k.endsWith('Hue'));
   const out = [];
   for (const k of suspects) {
