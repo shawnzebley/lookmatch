@@ -1,10 +1,7 @@
 import { linToLab, labToLin, linearToSrgb, SRGB8_TO_LIN } from './color.js';
 
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
-const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
-const easeL = (L) => smooth(12, 30, L) * (1 - smooth(80, 95, L));
 const ZONE_NAMES = ['shadow', 'midtone', 'lit'];
-const LIMITS = { L: 12, a: 10, b: 12 };
 
 function arrays(ps, cur) {
   return { L: cur?.L || ps?.L, a: cur?.A || cur?.a || ps?.A || ps?.a, b: cur?.B || cur?.b || ps?.B || ps?.b };
@@ -111,14 +108,15 @@ function pairPeople(source, reference) {
 }
 
 function fitZone(ps, cur, indices, target, move, zoneName, center) {
-  if (!target || target.pixels < 20) return null;
+  if (!target || target.pixels < 20 || !['L', 'a', 'b'].every((k) => Number.isFinite(target[k]))) return null;
   const v = arrays(ps, cur), before = summarize(indices.map((i) => ({ L: v.L[i], a: v.a[i], b: v.b[i] })), center);
-  if (!before) return null;
+  const original = summarize(indices.map((i) => ({ L: ps.L[i], a: (ps.A || ps.a)[i], b: (ps.B || ps.b)[i] })), center);
+  if (!before || !original) return null;
   const delta = { L: 0, a: 0, b: 0 }, goal = {};
-  for (const k of ['L', 'a', 'b']) goal[k] = before[k] + (target[k] - before[k]) * move;
+  for (const k of ['L', 'a', 'b']) goal[k] = original[k] + (target[k] - original[k]) * move;
   for (let iteration = 0; iteration < 4 && move > 0; iteration++) {
     const sim = indices.map((i) => {
-      const w = easeL(ps.L[i]);
+      const w = 1;
       const l = clamp(v.L[i] + delta.L * w, 0, 100);
       const a = v.a[i] + delta.a * w, b = v.b[i] + delta.b * w;
       let rgb = labToLin(l, a, b, [0, 0, 0]);
@@ -131,7 +129,7 @@ function fitZone(ps, cur, indices, target, move, zoneName, center) {
       return { L: lab[0], a: lab[1], b: lab[2] };
     });
     const got = { L: median(sim.map((x) => x.L)), a: median(sim.map((x) => x.a)), b: median(sim.map((x) => x.b)) };
-    for (const k of ['L', 'a', 'b']) delta[k] = clamp(delta[k] + goal[k] - got[k], -LIMITS[k], LIMITS[k]);
+    for (const k of ['L', 'a', 'b']) delta[k] += goal[k] - got[k];
   }
   return { name: zoneName, center, deltaL: delta.L, deltaA: delta.a, deltaB: delta.b, target: { L: target.L, a: target.a, b: target.b }, before };
 }
@@ -142,7 +140,7 @@ function personIndices(ps, id) {
   return out;
 }
 
-export function fitSkinMatch(ps, cur, target, { move = 0.65 } = {}) {
+export function fitSkinMatch(ps, cur, target, { move = 1 } = {}) {
   if (!Number.isFinite(move) || !target) return null;
   const m = clamp(move, 0, 1);
   const stats = skinStats(ps, cur);
@@ -169,9 +167,10 @@ export function fitSkinMatch(ps, cur, target, { move = 0.65 } = {}) {
   const v = arrays(ps, cur), indices = [];
   for (let i = 0; i < ps.skinMask.length; i++) if (ps.skinMask[i] >= 191 && Number.isFinite(v.L[i]) && Number.isFinite(v.a[i]) && Number.isFinite(v.b[i])) indices.push(i);
   const before = stats, delta = { L: 0, a: 0, b: 0 };
+  const original = skinStats(ps, ps);
   for (let iteration = 0; iteration < 4 && m > 0; iteration++) {
-    const got = { L: median(indices.map((i) => clamp(v.L[i] + delta.L * easeL(v.L[i]), 0, 100))), a: median(indices.map((i) => v.a[i] + delta.a * easeL(v.L[i]))), b: median(indices.map((i) => v.b[i] + delta.b * easeL(v.L[i]))) };
-    for (const k of ['L', 'a', 'b']) delta[k] = clamp(delta[k] + (before[k] + (target[k] - before[k]) * m - got[k]), -LIMITS[k], LIMITS[k]);
+    const got = { L: median(indices.map((i) => clamp(v.L[i] + delta.L, 0, 100))), a: median(indices.map((i) => v.a[i] + delta.a)), b: median(indices.map((i) => v.b[i] + delta.b)) };
+    for (const k of ['L', 'a', 'b']) delta[k] += (original[k] + (target[k] - original[k]) * m - got[k]);
   }
   return { deltaL: delta.L, deltaA: delta.a, deltaB: delta.b, target: { L: target.L, a: target.a, b: target.b }, before };
 }
@@ -185,12 +184,6 @@ function compileProfile(person, index) {
   const n = sorted.length, centers = new Float64Array(n), dl = new Float64Array(n), da = new Float64Array(n), db = new Float64Array(n);
   for (let i = 0; i < n; i++) {
     const z = sorted[i]; centers[i] = z.center; dl[i] = z.deltaL || 0; da[i] = z.deltaA || 0; db[i] = z.deltaB || 0;
-    if (i) {
-      const cap = Math.max(1, centers[i] - centers[i - 1]) * 0.35;
-      dl[i] = clamp(dl[i], dl[i - 1] - cap, dl[i - 1] + cap);
-      da[i] = clamp(da[i], da[i - 1] - cap, da[i - 1] + cap);
-      db[i] = clamp(db[i], db[i - 1] - cap, db[i - 1] + cap);
-    }
   }
   return { person, index, source, rawZones: source.slice(), refs: sorted, centers, dl, da, db };
 }
@@ -255,20 +248,20 @@ function inGamut(rgb) { return Number.isFinite(rgb[0]) && Number.isFinite(rgb[1]
 export function applySkinMatchLinear(res, p, maskValue, personId = 0, originalL = null) {
   const m = clamp(Number(maskValue) || 0, 0, 255) / 255, match = p?.skinMatch;
   if (!m || !match) return res;
-  let dl, da, db, light = originalL;
+  let dl, da, db;
   if (match.version === 2) {
     if (!Number.isFinite(originalL)) return res;
     const profile = getProfile(match, personId);
     if (!profile || !correctionFor(profile, originalL, CORRECTION_TMP)) return res;
     dl = CORRECTION_TMP[0]; da = CORRECTION_TMP[1]; db = CORRECTION_TMP[2];
   } else { dl = match.deltaL || 0; da = match.deltaA || 0; db = match.deltaB || 0; }
+  if (![dl, da, db].every(Number.isFinite)) return res;
   if (!(dl || da || db)) return res;
   linToLab(res[0], res[1], res[2], LAB_TMP);
-  if (!Number.isFinite(light)) light = LAB_TMP[0];
-  const weight = m * easeL(light);
-  const L = clamp(LAB_TMP[0] + clamp(dl, -LIMITS.L, LIMITS.L) * weight, 0, 100);
-  const a = LAB_TMP[1] + clamp(da, -LIMITS.a, LIMITS.a) * weight;
-  const b = LAB_TMP[2] + clamp(db, -LIMITS.b, LIMITS.b) * weight;
+  const weight = m;
+  const L = clamp(LAB_TMP[0] + dl * weight, 0, 100);
+  const a = LAB_TMP[1] + da * weight;
+  const b = LAB_TMP[2] + db * weight;
   let rgb = labToLin(L, a, b, RGB_TMP);
   if (!inGamut(rgb)) {
     let lo = 0, hi = 1;

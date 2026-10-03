@@ -1,17 +1,15 @@
 import { SLIDERS, CURVE_SATURATION, defaultParams, compile, LOCAL_SLIDERS, REGIONS, CURVE_KEYS, curveLUT, isIdentityCurve } from './engine/pipeline.js';
 import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
-import { FINISH_PROFILES } from './engine/finish.js';
 import { srgbToLinear, linearToSrgb } from './engine/color.js';
 import { PCTS } from './engine/measure.js';
 import { hsvToRgb, wheelHueToAB, abToWheelHue, labToLin } from './engine/color.js';
-import { profileSummary } from './engine/style.js';
 import { isIdentityGeom, maxRect, towardValid, fitAfterTurn, validRect, geomSize } from './engine/geom.js';
 import { SKIN_SMOOTH_DEFAULT, photoToOut } from './engine/retouch.js';
 import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-10-03a';
+const APP_VERSION = '2026-10-03b';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -175,13 +173,12 @@ function renderPresets() {
   for (const p of S.presets) {
     const el = h(`<div class="preset ${S.look && S.look.kind === 'preset' && S.look.id === p.id ? 'sel' : ''}">
       <div class="ph"><img src="${p.thumb}" alt=""><div style="min-width:0"><div class="nm">${esc(p.name)}</div>
-      <div class="muted small">Default strength ${p.strength}%</div>${presetChips(p.stats, p)}</div></div>
+      <div class="muted small">Default match strength ${p.strength}%</div>${presetChips(p.stats, p)}</div></div>
       <div class="row">
         <button class="primary" data-a="use">Use</button>
         <button data-a="rename">Rename</button>
         <button data-a="dup">Duplicate</button>
         <button data-a="strength">Strength</button>
-        <button data-a="finish">Finish: ${esc(FINISH_PROFILES[p.finish || 'off']?.name || 'Off')}</button>
         <button class="danger" data-a="del">Delete</button>
       </div></div>`);
     el.onclick = async (e) => {
@@ -199,14 +196,6 @@ function renderPresets() {
       if (a === 'strength') {
         const s = await ask('Default match strength (0–100)', String(p.strength), 'number');
         if (s !== null && s !== '') { p.strength = Math.max(0, Math.min(100, Math.round(+s))); await db.putPreset(p); backupPreset(p); renderPresets(); }
-      }
-      if (a === 'finish') {
-        const keys = Object.keys(FINISH_PROFILES);
-        p.finish = keys[(keys.indexOf(p.finish || 'off') + 1) % keys.length];
-        await db.putPreset(p); backupPreset(p); renderPresets();
-        for (const ph of S.photos) if (presetOf(ph) === p && !ph.finish && (ph.status === 'done' || ph.status === 'exported')) ph.status = 'ready';
-        runQueue();
-        toast(`Finish: ${FINISH_PROFILES[p.finish].name}`);
       }
       if (a === 'del') {
         if (await confirmSheet(`Delete “${p.name}”?`, 'Photos already exported are not affected.', 'Delete')) {
@@ -313,21 +302,30 @@ async function restorePresets() {
 }
 
 // ---------------------------------------------------------------- looks
-// A look is a photographer's style ({ kind: 'photographer', key }) or a saved reference
-// ({ kind: 'preset', id }: a photo's measured look, or an imported Lightroom preset).
+// A look is plain editing or a saved photo reference / imported Lightroom preset.
 // S.look applies to every photo; p.look overrides it for one photo (set in the editor).
 const LOOK_KEY = 'lm_look';
-const PHOTOGRAPHERS = Object.keys(FINISH_PROFILES).filter((k) => k !== 'off');
 const NONE_LOOK = Object.freeze({ kind: 'none' });
 const isNoneLook = (l) => l?.kind === 'none';
 const presetById = (id) => S.presets.find((q) => q.id === id) || null;
-const lookValid = (l) => !!l && (isNoneLook(l) || (l.kind === 'photographer' ? !!FINISH_PROFILES[l.key] : l.kind === 'preset' && !!presetById(l.id)));
-const lookOf = (p) => (isNoneLook(p.look) ? NONE_LOOK : lookValid(p.look) ? p.look : isNoneLook(S.look) ? NONE_LOOK : lookValid(S.look) ? S.look : null);
+const normalizeLook = (l) => l?.kind === 'photographer' ? NONE_LOOK : l;
+if (S.look?.kind === 'photographer') {
+  S.look = NONE_LOOK;
+  try { localStorage.setItem(LOOK_KEY, JSON.stringify(NONE_LOOK)); } catch (e) { /* private mode */ }
+}
+const lookValid = (l) => !!l && (isNoneLook(l) || (l.kind === 'preset' && !!presetById(l.id)));
+const lookOf = (p) => {
+  if (p.look?.kind === 'photographer') {
+    p.look = NONE_LOOK;
+    p.finish = undefined;
+    p.finishStrength = undefined;
+  }
+  const ownLook = normalizeLook(p.look);
+  const globalLook = normalizeLook(S.look);
+  return isNoneLook(ownLook) ? NONE_LOOK : lookValid(ownLook) ? ownLook : isNoneLook(globalLook) ? NONE_LOOK : lookValid(globalLook) ? globalLook : null;
+};
 const presetOf = (p) => { const l = lookOf(p); return l && l.kind === 'preset' ? presetById(l.id) : null; };
-const lookName = (l) => (!l ? '' : isNoneLook(l) ? 'Plain photo' : l.kind === 'photographer' ? FINISH_PROFILES[l.key].name : presetById(l.id)?.name || 'reference');
-const sameLook = (a, b) => !!a && !!b && a.kind === b.kind && (isNoneLook(a) || (a.key || a.id) === (b.key || b.id));
-// photographer finish in effect for a photo: the photographer itself, or the one added on top of a reference
-const finishKeyOf = (p) => { const l = lookOf(p); if (!l || isNoneLook(l)) return 'off'; return l.kind === 'photographer' ? l.key : p.finish || presetById(l.id)?.finish || 'off'; };
+const lookName = (l) => (!l ? '' : isNoneLook(l) ? 'Plain photo' : presetById(l.id)?.name || 'reference');
 
 function resetPhotoLook(p) {
   cancelPhotoSolve(p);
@@ -379,34 +377,6 @@ function setLook(l) {
   }
   if (S.photos.length === 1) S.autoOpen = true;
   runQueue(); renderMatch();
-}
-
-// plain-words summary of a photographer's published work (medians of the measured set)
-function describePhotographer(key) {
-  const f = FINISH_PROFILES[key];
-  const s = profileSummary(f.data) || { p50: null, p1: f.p1, p99: f.p99, chroma: f.chroma, sh: f.sh, hi: f.hi };
-  const tone = (ab) => (!ab || ab[1] == null ? null : ab[1] > 5.5 ? 'warm' : ab[1] < 1.5 ? 'cool' : 'neutral');
-  const bits = [];
-  if (s.p50 != null) bits.push(s.p50 < 28 ? 'low-key' : s.p50 > 50 ? 'bright' : 'mid-key');
-  bits.push(s.p1 < 2.5 ? 'deep blacks' : s.p1 > 5.5 ? 'matte blacks' : 'firm blacks');
-  bits.push(s.p99 < 82 ? 'dim highlights' : s.p99 < 90 ? 'soft highlights' : 'clean whites');
-  bits.push(s.chroma < 12 ? 'muted colour' : s.chroma > 16 ? 'rich colour' : 'natural colour');
-  if (tone(s.sh)) bits.push(`${tone(s.sh)} shadows`);
-  if (tone(s.hi) && tone(s.hi) !== tone(s.sh)) bits.push(`${tone(s.hi)} highlights`);
-  if (s.sep != null && s.sep >= 4) bits.push('subject lit above the background');
-  if (s.logC != null && s.logC >= 0.25) bits.push('colourful subject, quieter background');
-  if ((f.vignette || 0) <= -25) bits.push('vignette');
-  return { text: bits.join(' · '), s };
-}
-// three dots: the photographer's shadow, midtone and highlight colour (chroma doubled so it reads at dot size)
-function toneDots(s) {
-  const dot = (L, ab) => {
-    if (!ab || ab[0] == null) return '';
-    const o = [0, 0, 0]; labToLin(L, ab[0] * 2, ab[1] * 2, o);
-    const c = o.map((v) => Math.round(255 * linearToSrgb(Math.min(1, Math.max(0, v)))));
-    return `<i style="background:rgb(${c.join(',')})"></i>`;
-  };
-  return `<span class="dots">${dot(22, s.sh)}${dot(50, s.mid)}${dot(80, s.hi)}</span>`;
 }
 
 // ---------------------------------------------------------------- edit view: 1 photos, 2 style
@@ -485,19 +455,6 @@ function cullBar() {
   return bar;
 }
 
-function photographerCards(current, onPick) {
-  const list = h('<div class="pcards"></div>');
-  for (const k of PHOTOGRAPHERS) {
-    const f = FINISH_PROFILES[k], { text, s } = describePhotographer(k);
-    const on = current && current.kind === 'photographer' && current.key === k;
-    const b = h(`<button class="pcard ${on ? 'on' : ''}"><div class="pc-top"><b>${esc(f.name)}</b>${toneDots(s)}</div>
-      <div class="pc-desc">${esc(text)}</div><div class="pc-src muted">${s.n || f.n} published photos · ${esc(f.source)}</div></button>`);
-    b.onclick = () => onPick({ kind: 'photographer', key: k });
-    list.append(b);
-  }
-  return list;
-}
-
 function referenceCards(current, onPick) {
   const wrap = h('<div></div>');
   if (S.presets.length) {
@@ -550,7 +507,7 @@ function renderMatch() {
     photos.append(strip);
     if (total > 1) photos.append(cullBar());
     const line = isNoneLook(look) ? 'Plain photo selected. Tap a photo to edit.'
-      : !look ? 'Tap a photo to edit without a reference, or pick a style below.'
+      : !look ? 'Tap a photo to edit, or choose a reference photo below.'
         : done < total ? `Styling like ${esc(lookName(look))}… ${done} of ${total}`
         : `${total === 1 ? 'Done.' : `All ${total} done.`} Tap a photo to fine-tune, crop or export.`;
     photos.append(h(`<p class="muted small step-note">${line}</p>`));
@@ -565,14 +522,14 @@ function renderMatch() {
   };
 
   // 2. style
-  const kind = S.styleTab || look?.kind || 'photographer';
+  const kind = S.styleTab === 'none' ? 'none' : 'preset';
   const style = h(`<section class="step ${total && !look ? 'attention' : ''}" id="stepStyle"><div class="step-h"><span class="n">2</span><h2>Style</h2>
       <div class="grow"></div>${look ? `<span class="muted small">Using ${esc(lookName(look))}</span>` : ''}</div>
-    <div class="seg wide" id="styleSeg"><button data-k="photographer" class="${kind === 'photographer' ? 'on' : ''}">Photographer</button><button data-k="preset" class="${kind === 'preset' ? 'on' : ''}">Reference photo</button><button data-k="none" class="${isNoneLook(look) ? 'on' : ''}">None</button></div>
-    <p class="muted small step-note">${isNoneLook(look) ? 'Use the photo as it was captured.' : kind === 'photographer' ? 'What that photographer would do to each of your photos, read from the published shots most like each scene.' : 'Copy the look of one photo onto yours. Your saved references and Lightroom presets are here.'}</p>
+    <div class="seg wide" id="styleSeg"><button data-k="preset" class="${kind === 'preset' && !isNoneLook(look) ? 'on' : ''}">Reference photo</button><button data-k="none" class="${isNoneLook(look) || kind === 'none' ? 'on' : ''}">None</button></div>
+    <p class="muted small step-note">${isNoneLook(look) ? 'Use the photo as it was captured.' : 'Match each photo to an individual reference, or import a Lightroom preset.'}</p>
     </section>`);
   const pick = (l) => setLook(l);
-  if (kind !== 'none') style.append(kind === 'photographer' ? photographerCards(look, pick) : referenceCards(look, pick));
+  if (kind !== 'none') style.append(referenceCards(look, pick));
   $('#styleSeg', style).onclick = (e) => {
     const k = e.target.dataset.k; if (!k) return;
     if (k === 'none') { S.styleTab = 'none'; if (!isNoneLook(S.look)) setLook(NONE_LOOK); else renderMatch(); return; }
@@ -619,12 +576,10 @@ async function addPhotos(files) {
 function solveArgs(p) {
   const look = lookOf(p);
   if (!look || isNoneLook(look)) return null;
-  const finishStrength = (p.finishStrength ?? 100) / 100;
   const split = p.split !== false;
-  if (look.kind === 'photographer') return { refStats: null, lrParams: {}, strength: 1, finish: look.key, finishStrength, pull: 0.25, split };
   const pr = presetById(look.id);
   const assist = S.settings.modelUrl && !pr.lr && pr.thumb;
-  return { refStats: pr.stats, lrParams: pr.lr ? pr.lrParams : null, strength: p.strength / 100, finish: p.finish || pr.finish || 'off', finishStrength, split, ...(assist ? { modelUrl: S.settings.modelUrl, refThumb: pr.thumb } : {}) };
+  return { refStats: pr.stats, lrParams: pr.lr ? pr.lrParams : null, strength: p.strength / 100, finish: 'off', split, ...(assist ? { modelUrl: S.settings.modelUrl, refThumb: pr.thumb } : {}) };
 }
 
 // References saved before subject/background existed: measure the split once from the saved thumbnail.
@@ -747,7 +702,7 @@ function numbersTable(p) {
   const b = p.before, a = p.after, T = p.targets, r = pr?.stats;
   if (!b || !a) return '';
   if (!T) {
-    // photographer looks and Lightroom presets have no single reference to measure against
+    // No saved reference is available for this match.
     const st = p.style, row2 = (label, bv, av, tv = '') => `<tr><td>${label}</td><td>${bv}</td><td>${av}</td><td>${tv}</td></tr>`;
     const newClip2 = (Math.max(0, a.tone.clipHi - b.tone.clipHi) * 100).toFixed(2) + ' / ' + (Math.max(0, a.tone.clipLo - b.tone.clipLo) * 100).toFixed(2);
     return `<table class="nums"><tr><th></th><th>Before</th><th>After</th><th>${st ? 'Theirs' : ''}</th></tr>
@@ -1028,7 +983,7 @@ function regionNote(p) {
   const L = g.local, part = (r) => LOCAL_SLIDERS.filter((s) => L[r][s.key]).map((s) => `${s.label.toLowerCase()} ${s.key === 'exposure' ? signed(L[r][s.key], 2) : signed(L[r][s.key])}`).join(', ');
   const moves = REGIONS.map((r) => (part(r) ? `${r === 'subject' ? 'Subject' : 'Background'}: ${part(r)}` : '')).filter(Boolean).join(' · ');
   const f = g.from || {};
-  const basis = f.kind === 'photographer' ? `From the ${f.k} of ${f.n} published ${esc(f.name)} photos with a person in them that are closest to this one.` : 'From the reference photo\'s own subject and background.';
+  const basis = 'From the reference photo’s own subject and background.';
   return `<div class="style"><ul>${li.map((t) => `<li>${esc(t)}</li>`).join('')}</ul>${moves ? `<p class="muted small">${esc(moves)}</p>` : ''}<p class="muted small">${basis}</p></div>`;
 }
 
@@ -1424,65 +1379,27 @@ function bindWheels() {
   });
 }
 
-// ---------------------------------------------------------------- "what would they do"
-const HUE_NAMES = [[12, 'red'], [28, 'red-orange'], [45, 'orange'], [58, 'amber'], [75, 'yellow'], [105, 'yellow-green'], [150, 'green'], [172, 'green-teal'], [195, 'teal'], [215, 'cyan-blue'], [250, 'blue'], [275, 'violet'], [310, 'purple'], [340, 'magenta'], [361, 'red']];
-const hueName = (h) => { h = ((h % 360) + 360) % 360; return HUE_NAMES.find(([lim]) => h < lim)[1]; };
-const warmth = (h) => (h >= 10 && h < 70 ? 'warmer' : h >= 170 && h < 260 ? 'cooler' : null);
-
-function styleNote(p) {
-  const key = finishKeyOf(p);
-  const f = FINISH_PROFILES[key];
-  if (!f || key === 'off') return '';
-  const st = p.style;
-  if (!st || p.status === 'solving') return `<p class="muted small" style="margin:8px 0 0">Working out what ${esc(f.name)} would do…</p>`;
-  const li = [];
-  if (st.blacks > 0) li.push(`Deepen blacks: darkest 1% from L* ${f1(st.start.p1)} to ${f1(st.after.p1)}`);
-  else if (st.fade > 0.5) li.push(`Matte blacks: lift the darkest 1% to L* ${f1(st.after.p1)}`);
-  if (st.rolloff > 0) li.push(`Roll off highlights: brightest 1% from ${f1(st.start.p99)} to ${f1(st.after.p99)}`);
-  if (st.mono) li.push('Black and white photo: tone only, no colour grade');
-  else if (st.wheels) {
-    for (const [z, label] of WHEELS) {
-      const w = st.wheels[z];
-      if (!w || w.move.amount < 1) continue;
-      const wm = warmth(w.move.hue);
-      li.push(`${label}: push toward ${hueName(w.move.hue)}${wm ? ` (${wm})` : ''}, strength ${Math.round(w.move.amount)}`);
-    }
-    if (Math.abs(st.sat) >= 3) li.push(`${st.sat < 0 ? 'Mute' : 'Boost'} colour ${Math.abs(st.sat)}% (mean chroma ${f1(st.before.chroma)} → ${f1(st.after.chroma)}, theirs ${f1(st.target.chroma)})`);
-  }
-  if (st.vignette) li.push(`Vignette ${st.vignette}`);
-  if (st.grain) li.push(`Grain ${st.grain}`);
-  if (!li.length) li.push('Almost nothing: this photo already sits where their work does');
-  const basis = st.basis === 'nearest'
-    ? `From the ${st.k} of ${st.n} published ${esc(f.name)} photos whose scenes are closest to this one (${esc(f.source)}).`
-    : `From all ${st.n} published ${esc(f.name)} photos (${esc(f.source)}).`;
-  return `<div class="style"><div class="st-h">What ${esc(f.name)} would do here</div><ul>${li.map((t) => `<li>${esc(t)}</li>`).join('')}</ul><p class="muted small">${basis}</p></div>`;
-}
-
 const strengthRow = (id, label, v, max) => `<div class="strength"><span class="muted small slbl">${label}</span><input type="range" id="${id}" min="0" max="${max}" step="5" value="${v}"><output id="${id}Out">${v}%</output></div>`;
 
 // The editor's style selection applies to this photo only.
 function styleCard(p) {
-  const look = lookOf(p), kind = (D && D.styleKind) || look?.kind || 'photographer';
-  const pr = presetOf(p), fk = finishKeyOf(p);
+  const look = lookOf(p), requestedKind = (D && D.styleKind) || look?.kind || 'preset';
+  const kind = requestedKind === 'none' ? 'none' : 'preset';
+  const pr = presetOf(p);
   let body;
   if (kind === 'none') {
     body = '<p class="muted small" style="margin:8px 0 0">Use the photo as it was captured. Manual edits remain available below.</p>';
-  } else if (kind === 'photographer') {
-    body = `<div class="chips-row" id="dPick">${PHOTOGRAPHERS.map((k) => `<button data-l="photographer:${k}" class="${look?.kind === 'photographer' && look.key === k ? 'on' : ''}">${esc(FINISH_PROFILES[k].name)}</button>`).join('')}</div>
-      ${look?.kind === 'photographer' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : '<p class="muted small" style="margin:8px 0 0">Pick one to restyle this photo.</p>'}`;
   } else {
     body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
-      <p class="muted small" style="margin:8px 0 0">Reference matching fits separate light and RGB curves for the subject and background, then matches each person’s skin brightness and color. It adds halation when it detects glow around lights.</p>
-      ${pr ? `${strengthRow('str', 'Match', p.strength, 100)}
-        <div class="sub">Add a photographer's finish on top</div><div class="fin" id="fin">${finishButtons(p, pr)}</div>
-        ${fk !== 'off' ? `<div id="finNote">${styleNote(p)}</div>${strengthRow('fstr', 'Style', p.finishStrength ?? 100, 150)}` : ''}`
+      <p class="muted small" style="margin:8px 0 0">Match this photo to the selected reference. It fits each person’s skin brightness and color to the reference; check measurements and preview.</p>
+      ${pr ? `${strengthRow('str', 'Match', p.strength, 100)}<button id="workflowNeedham" class="ghost small" style="margin-top:8px">Needham workflow</button>`
     : '<p class="muted small" style="margin:8px 0 0">Pick a reference to copy its look onto this photo.</p>'}`;
   }
   const status = p.status === 'solving'
     ? '<p class="muted small" role="status" style="margin:8px 0 0">Applying style…</p>'
     : p.status === 'error' ? `<p class="small" role="alert" style="margin:8px 0 0;color:var(--bad)">Could not apply style: ${esc(p.error || 'Unknown error')}</p>` : '';
   const others = S.photos.length > 1;
-  return `<h3>Style</h3><div class="seg wide" id="dSeg"><button data-k="photographer" class="${kind === 'photographer' ? 'on' : ''}">Photographer</button><button data-k="preset" class="${kind === 'preset' ? 'on' : ''}">Reference photo</button><button data-k="none" class="${isNoneLook(look) ? 'on' : ''}">None</button></div>
+  return `<h3>Style</h3><div class="seg wide" id="dSeg"><button data-k="preset" class="${kind === 'preset' && !isNoneLook(look) ? 'on' : ''}">Reference photo</button><button data-k="none" class="${isNoneLook(look) || kind === 'none' ? 'on' : ''}">None</button></div>
     ${status}${acceptanceNote(p)}${body}${others && look && !isNoneLook(look) ? '<div class="row" style="margin-top:10px"><button id="lookAll">Use this style on all photos</button></div>' : ''}`;
 }
 
@@ -1510,13 +1427,17 @@ function renderStyleCard() {
     if (!b) return;
     if (b.dataset.a === 'ref') return $('#pickRef').click();
     const [kind, id] = b.dataset.l.split(':');
-    const l = kind === 'photographer' ? { kind, key: id } : { kind, id };
+    const l = { kind, id };
     p.look = l; p.finish = undefined; p.finishStrength = undefined;
     if (kind === 'preset') p.strength = presetById(id)?.strength ?? 100;
     resolve();
   };
-  if ($('#fin', box)) $('#fin', box).onclick = (e) => { const k = e.target.closest('button')?.dataset.f; if (!k) return; p.finish = k; resolve(); };
-  for (const [id, key] of [['str', 'strength'], ['fstr', 'finishStrength']]) {
+  if ($('#workflowNeedham', box)) $('#workflowNeedham', box).onclick = () => openSheet(`<h2>Needham workflow</h2>
+    <p class="muted small">A manual finishing checklist based on Gerard Needham’s published preset and curve guidance. It does not recreate a specific video look.</p>
+    <ol><li>Use the selected reference to set the palette.</li><li>Refine the tone curve and RGB color separation.</li><li>Review exposure, white balance and contrast, then adjust match strength.</li></ol>
+    <p class="muted small">Sources: <a href="https://gerardneedham.com/products/analog-curve-collection" target="_blank" rel="noopener">Analog Curve Collection</a> · <a href="https://www.youtube.com/watch?v=BEJgKPJI9uY" target="_blank" rel="noopener">Gerard Needham skin tones video</a></p>
+    <div class="acts"><button class="primary" data-close>Done</button></div>`);
+  for (const [id, key] of [['str', 'strength']]) {
     const r = $(`#${id}`, box);
     if (!r) continue;
     r.oninput = () => ($(`#${id}Out`, box).textContent = `${r.value}%`);
@@ -1604,8 +1525,8 @@ function openDetail(p) {
     const btn = $('#autoAdjust'); btn.disabled = true; btn.textContent = 'Adjusting…';
     try {
       const sa = solveArgs(p), rs = sa?.refStats;
-      // the look Auto Adjust chases: the reference's measured tone, skin and colour bands, or the photographer's finish
-      const look = !sa ? null : rs ? { kind: 'reference', refStats: { tone: { pct: rs.tone?.pct }, bands: rs.bands, bandsBg: rs.bandsBg, zones: rs.zones, skin: rs.skin, color: { meanChroma: rs.color?.meanChroma } } } : { kind: 'photographer', finish: sa.finish };
+      // the reference's measured tone, skin and colour bands guide Auto Adjust
+      const look = rs ? { kind: 'reference', refStats: { tone: { pct: rs.tone?.pct }, bands: rs.bands, bandsBg: rs.bandsBg, zones: rs.zones, skin: rs.skin, color: { meanChroma: rs.color?.meanChroma } } } : null;
       const r = await pool.call(p.worker, 'autoAdjust', { id: p.id, params: structuredClone(p.params || defaultParams()), look }, { priority: true });
       if (!D || D.p !== p) return;
       const preservedReference = r.preservedReference === true;
@@ -1709,11 +1630,6 @@ window.addEventListener('resize', () => {
   syncEditorLayout();
   if (D.crop) drawCrop();
 });
-
-function finishButtons(p, pr) {
-  const cur = p.finish || pr?.finish || 'off';
-  return Object.entries(FINISH_PROFILES).map(([k, f]) => `<button data-f="${k}" class="${k === cur ? 'on' : ''}">${esc(f.name)}</button>`).join('');
-}
 
 const SL_LABEL = Object.fromEntries(SLIDERS.map((s) => [s.key, s.label]));
 for (const r of REGIONS) for (const s of LOCAL_SLIDERS) SL_LABEL[`${r}:${s.key}`] = `${r === 'subject' ? 'Subject' : 'Background'} ${s.label.toLowerCase()}`;

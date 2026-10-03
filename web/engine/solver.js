@@ -2,9 +2,8 @@
 // Staged bounded Levenberg-Marquardt: tone -> white balance -> color -> tone/WB touch-up.
 
 import { PCTS, BANDS, measure } from './measure.js';
-import { SLIDERS, SLIDER_BY_KEY, defaultParams, toneMapL, toneRaw, exposeX, toneMaxSlope, toneReversal, fadeLevels, curveLUT, isIdentityCurve, processPixelSet, clampParams } from './pipeline.js';
+import { SLIDER_BY_KEY, defaultParams, toneMapL, exposeX, fadeLevels, curveLUT, isIdentityCurve, processPixelSet, clampParams } from './pipeline.js';
 import { wheelHueToAB, abToWheelHue, wrapDeg, linearToSrgb, lToY } from './color.js';
-import { brightenFactor } from './scene.js';
 
 // ---------------- generic bounded LM (projected), finite-difference Jacobian --------------------
 function solveLinear(A, b) {
@@ -77,87 +76,10 @@ export function lm(fn, x0, lo, hi, { iters = 25, h = null, lambda0 = 1e-2 } = {}
 }
 
 // ---------------- targets ----------------------------------------------------------------------
-const hinge = (v, lo, hi) => (v < lo ? lo - v : v > hi ? v - hi : 0);
-
-// How much of the reference's tone shape to copy, by percentile. The ends (black point, white point,
-// fades, crushed or rolled-off highlights) receive full weight. The quarter tones receive substantial
-// reference weight while retaining some source distribution for differences in scene content.
-export const TONE_SHAPE = { 1: 1, 5: 0.5, 10: 0.2, 25: 0.75, 50: 1, 75: 0.75, 90: 0.2, 95: 0.5, 99: 1 };
-
-// Zone tints and HSL bands mix the grade with whatever colors were in the scene. Only part of the
-// measured difference is trusted as the edit (tested on tools/solver_eval.mjs).
-export const ZONE_MOVE = 0.5;
-export const BAND_MOVE = 0.5;
-
-// How far toward the reference's brightness, and how much of that survives when the photo is darker.
-// 2026-09-27: the old 0.5 pull x a dark-photo factor down to 0.15 x the same factor again on every
-// brightening move left a dim photo matched to a high-key reference (Pepsi) within 2 L* of where it
-// started. A reference's brightness is a large part of its look, so most of it is now kept.
-export const BRIGHTNESS_PULL = 0.75;
-// The reference's black and white points are copied as absolute values, not stretched around the new
-// median: a reference whose whites stop at 88 L* should put this photo's whites near 88, not at 74.
-export const END_ABS = { 1: 1, 5: 0.5, 95: 0.5, 99: 1 };
-// Most the overall colourfulness may be multiplied by (was 1.5: a 4x more colourful reference got 1.5x).
-export const CHROMA_CAP = 2.2;
-// How much duller a colour gets when the reference doesn't have it at all.
-export const ABSENT_BAND_DULL = 0.2;
-// Brightening target shape: 1 = what Exposure alone would do to this photo's tones, 0 = linear stretch.
-export const OWN_MODEL = 1;
-export const OWN_EV_CAP = 1.5;
-// Tone-stage cost per slider direction (x the base regularization). Exposure is the plain way to
-// brighten; Shadows up, Contrast down, Whites down and faded blacks flatten a photo, so they cost more.
-export const TONE_REG = {
-  exposure: [0.5, 0.5], contrast: [2, 1], highlights: [1, 1], shadows: [1, 2.5],
-  whites: [1.5, 1], blacks: [1, 1.5], fadeBlacks: [1, 2], fadeWhites: [1, 1],
-};
-// Brightening with Highlights pushed up blows out skin and sky; the usual portrait move is the
-// opposite: pull Highlights down, then raise Exposure, for an even tone. Cost of exposure+ x highlights+.
-export const BRIGHTEN_HI_UP = 3;
-// Saturation cut that may pair with Vibrance up at no extra cost.
-export const SAT_DOWN_FREE = 15;
-
-export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNESS_PULL, scene = null, toneShape = TONE_SHAPE, zoneMove = ZONE_MOVE, bandMove = BAND_MOVE, endAbs = END_ABS, chromaCap = CHROMA_CAP, ownModel = OWN_MODEL } = {}) {
+export function computeTargets(o, ref, { strength = 1 } = {}) {
   const s = Math.min(1, Math.max(0, strength));
-  const o50 = o.tone.pct[50], r50 = ref.tone.pct[50];
-  // weight relative look over absolute brightness: only part of the way to the reference's median,
-  // and less when the photo is a low-key / night frame being pulled up.
-  let pull = brightnessPull;
-  let lift = 1; // how much of any brightening move to keep (dark scenes stay darker all through the range)
-  if (o50 < r50) {
-    const byImage = Math.min(1, Math.max(0.45, (o50 - 4) / 20));
-    const byScene = brightenFactor(scene);
-    // camera settings, when present, decide whether "dark" means a dark scene or an underexposed bright one
-    const f = byScene == null ? byImage : byScene;
-    pull *= f;
-    lift = Math.max(0.6, Math.sqrt(f));
-  }
-  const anchor = o50 + pull * (r50 - o50);
-  // Brightening: the exposure that moves this photo's median to the new median (up to the solver's cap).
-  // The photo's own shape is then what that exposure does to every tone, not a linear stretch around the
-  // median (a linear stretch doubles the darks and squeezes the highs, and only Shadows + negative
-  // Contrast can make that: the flat, lifted-black look on a dark gym wall).
-  let ev = 0;
-  if (anchor > o50 + 0.5 && ownModel > 0) {
-    let lo = 0, hi = OWN_EV_CAP;
-    for (let it = 0; it < 30; it++) { const m = (lo + hi) / 2; if (100 * exposeX(o50, { exposure: m }) < anchor) lo = m; else hi = m; }
-    ev = lo;
-  }
-  const below = anchor / Math.max(1, r50), above = (100 - anchor) / Math.max(1, 100 - r50);
-  const pct = {};
-  for (const p of PCTS) {
-    const d = ref.tone.pct[p] - r50;
-    let full = Math.min(100, Math.max(0, anchor + d * (d < 0 ? below : above)));
-    // black / white point as the reference has them, but never across the new median
-    const ea = endAbs[p] || 0;
-    if (ea) full += ea * ((p < 50 ? Math.min(ref.tone.pct[p], anchor - 2) : Math.max(ref.tone.pct[p], anchor + 2)) - full);
-    // this photo's own shape, moved to the new median
-    const dO = o.tone.pct[p] - o50;
-    let own = Math.min(100, Math.max(0, anchor + dO * (dO < 0 ? anchor / Math.max(1, o50) : (100 - anchor) / Math.max(1, 100 - o50))));
-    if (ev > 0) own = ownModel * 100 * exposeX(o.tone.pct[p], { exposure: ev }) + (1 - ownModel) * own;
-    const w = toneShape[p] ?? 1;
-    const move = own + w * (full - own) - o.tone.pct[p];
-    pct[p] = o.tone.pct[p] + s * move * (move > 0 ? lift : 1);
-  }
+  const anchor = o.tone.pct[50] + s * (ref.tone.pct[50] - o.tone.pct[50]);
+  const pct = Object.fromEntries(PCTS.map((p) => [p, o.tone.pct[p] + s * (ref.tone.pct[p] - o.tone.pct[p])]));
   const wbConf = Math.min(1, o.wb.confidence / 0.4) * Math.min(1, ref.wb.confidence / 0.4);
   const sw = s * wbConf;
   const wb = { a: o.wb.a + sw * (ref.wb.a - o.wb.a), b: o.wb.b + sw * (ref.wb.b - o.wb.b), weight: 0.3 + 0.7 * wbConf };
@@ -165,40 +87,30 @@ export function computeTargets(o, ref, { strength = 1, brightnessPull = BRIGHTNE
   for (const z of ['shadows', 'midtones', 'highlights']) {
     const mass = Math.min(o.zones[z].mass, ref.zones[z].mass);
     if (mass < 0.02) continue;
-    const zs = s * zoneMove;
+    const zs = s;
     zones[z] = { a: o.zones[z].a + zs * (ref.zones[z].a - o.zones[z].a), b: o.zones[z].b + zs * (ref.zones[z].b - o.zones[z].b), weight: Math.sqrt(Math.min(1, mass / 0.1)) };
   }
   const bands = {};
   for (const b of BANDS) {
     const ob = o.bands[b], rb = ref.bands[b];
-    // a colour this photo has and the reference doesn't: hold it, a little duller, so the overall
-    // colourfulness target is met in the reference's colours (a teal floor stayed teal and got
-    // louder under a warm, teal-free reference)
-    if (ob.weight >= 0.008 && rb.weight < 0.008) {
-      bands[b] = { hue: ob.hue, chroma: ob.chroma * (1 - ABSENT_BAND_DULL * s), lumRel: ob.lumRel, weight: Math.sqrt(Math.min(1, ob.weight / 0.05)) };
-      continue;
-    }
     if (ob.weight < 0.008 || rb.weight < 0.008) continue;
-    const dh = Math.max(-25, Math.min(25, wrapDeg(rb.hue - ob.hue)));
-    const ratio = Math.max(0.5, Math.min(1.6, rb.chroma / Math.max(1, ob.chroma)));
+    const dh = wrapDeg(rb.hue - ob.hue);
     bands[b] = {
-      hue: ob.hue + s * bandMove * dh,
-      chroma: ob.chroma * Math.pow(ratio, s * bandMove),
-      lumRel: ob.lumRel + s * bandMove * Math.max(-15, Math.min(15, rb.lumRel - ob.lumRel)),
+      hue: wrapDeg(ob.hue + s * dh),
+      chroma: ob.chroma + s * (rb.chroma - ob.chroma),
+      lumRel: ob.lumRel + s * (rb.lumRel - ob.lumRel),
       weight: Math.sqrt(Math.min(1, Math.min(ob.weight, rb.weight) / 0.05)),
     };
   }
-  const cr = (a, b) => Math.max(0.55, Math.min(chromaCap, b / Math.max(0.5, a)));
   const color = {
-    meanChroma: o.color.meanChroma * Math.pow(cr(o.color.meanChroma, ref.color.meanChroma), s),
-    lowChroma: o.color.lowChroma * Math.pow(cr(o.color.lowChroma, ref.color.lowChroma), s),
+    meanChroma: o.color.meanChroma + s * (ref.color.meanChroma - o.color.meanChroma),
+    lowChroma: o.color.lowChroma + s * (ref.color.lowChroma - o.color.lowChroma),
   };
   const clip = {
     hi: Math.max(o.tone.clipHi, ref.tone.clipHi) + 0.001,
     lo: Math.max(o.tone.clipLo, ref.tone.clipLo) + 0.001,
   };
-  const skin = { hue: o.skin.hue, chroma: o.skin.chroma, spread: o.skin.hueSpread, litHue: o.skin.litHue, litChroma: o.skin.litChroma, active: o.skin.source === 'faces' ? o.skin.frac > 0.0004 : o.skin.frac > 0.005 };
-  return { tone: { pct }, wb, zones, bands, color, clip, skin, strength: s, anchor };
+  return { tone: { pct }, wb, zones, bands, color, clip, strength: s, anchor };
 }
 
 // ---------------- stage residuals ------------------------------------------------------------------
@@ -206,7 +118,7 @@ const TONE_KEYS = ['exposure', 'contrast', 'highlights', 'shadows', 'whites', 'b
 const WB_KEYS = ['temp', 'tint'];
 const HSL_KEYS = [...BANDS.map((b) => `hue_${b}`), ...BANDS.map((b) => `sat_${b}`), ...BANDS.map((b) => `lum_${b}`)];
 
-function capRange(key) { const s = SLIDER_BY_KEY[key]; return s.cap; }
+function capRange(key) { const s = SLIDER_BY_KEY[key]; return s.ui; }
 
 function rng(seed) { let x = seed >>> 0 || 1; return () => { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; return (x >>> 0) / 4294967296; }; }
 
@@ -217,19 +129,6 @@ function sampleIdx(n, count, pred, seed = 7) {
   // partial Fisher-Yates
   for (let i = 0; i < Math.min(count, out.length); i++) { const j = i + Math.floor(r() * (out.length - i)); [out[i], out[j]] = [out[j], out[i]]; }
   return Int32Array.from(out.slice(0, count));
-}
-
-function skinResiduals(st, t) {
-  if (!t.skin.active || st.skin.frac < 0.0003) return [0, 0, 0, 0, 0, 0];
-  return [
-    // believable skin hue window (Lab hue angle); a photo already outside it (colored stage light) may not get worse
-    hinge(st.skin.hue, Math.min(35, t.skin.hue - 2), Math.max(64, t.skin.hue + 2)) / 1.5,
-    hinge(wrapDeg(st.skin.hue - t.skin.hue), -6, 6) / 1.5, // don't swing skin more than ~6 degrees
-    hinge(st.skin.chroma / Math.max(1, t.skin.chroma), 0.68, 1.4) * 15,
-    Math.max(0, st.skin.hueSpread - t.skin.spread - 2) / 1,  // blotchy skin = hue spread grows
-    hinge(wrapDeg(st.skin.litHue - t.skin.litHue), -6, 6) / 1.5,          // lit side of faces
-    hinge(st.skin.litChroma / Math.max(1, t.skin.litChroma), 0.75, 1.4) * 40,
-  ];
 }
 
 // Convert the fitted non-exposure tone map into an editable master point curve. The curve's x values
@@ -285,7 +184,7 @@ function rgbCurvesFromOffsets(offsets, amount = 1) {
 function fitReferenceRgbCurves(ps, T, params, sample, current) {
   if (T.strength <= 0) return null;
   const base = { ...params };
-  const evaluate = (offsets, commit = false) => {
+  const evaluate = (offsets) => {
     const curves = rgbCurvesFromOffsets(offsets);
     const candidate = { ...base, ...Object.fromEntries(curves) };
     processPixelSet(ps, candidate, sample, current);
@@ -299,21 +198,16 @@ function fitReferenceRgbCurves(ps, T, params, sample, current) {
       if (target && have) residuals.push((have.a - target.a) / 0.8 * target.weight, (have.b - target.b) / 0.8 * target.weight);
     }
     for (const q of [25, 50, 75]) residuals.push((st.tone.pct[q] - T.tone.pct[q]) / (q === 50 ? 2 : 3));
-    residuals.push(...skinResiduals(st, T));
-    residuals.push(Math.max(0, st.tone.clipHi - T.clip.hi) * 3000, Math.max(0, st.tone.clipLo - T.clip.lo) * 3000);
-    // Keep the editable channel curves close to identity unless they improve measured targets.
-    offsets.forEach((v) => residuals.push(v / 12));
-    if (commit) return { candidate, stats: st };
     return residuals;
   };
-  const initial = new Array(9).fill(0), bound = new Array(9).fill(16);
-  const fitted = lm((x) => evaluate(x), initial, bound.map((v) => -v), bound, { iters: 10, lambda0: 0.08 });
+  const initial = new Array(9).fill(0);
+  const lo = ['curveR', 'curveG', 'curveB'].flatMap(() => RGB_CURVE_X.map((x) => 1 - x));
+  const hi = ['curveR', 'curveG', 'curveB'].flatMap(() => RGB_CURVE_X.map((x) => 254 - x));
+  const fitted = lm((x) => evaluate(x), initial, lo, hi, { iters: 10, lambda0: 0.08 });
   if (!fitted.x.some((v) => Math.abs(v) > 0.75)) return null;
   const before = evaluate(initial).reduce((sum, v) => sum + v * v, 0);
   const after = evaluate(fitted.x).reduce((sum, v) => sum + v * v, 0);
   if (!(after < before - 1e-5)) return null;
-  const { stats } = evaluate(fitted.x, true);
-  if (stats.tone.clipHi > T.clip.hi - 0.0006 || stats.tone.clipLo > T.clip.lo - 0.0006) return null;
   return { curves: Object.fromEntries(rgbCurvesFromOffsets(fitted.x)), evals: fitted.evals };
 }
 
@@ -326,68 +220,15 @@ export function solve(ps, o, ref, opts = {}) {
   const t0 = performance.now();
   const T = computeTargets(o, ref, opts);
   const params = defaultParams();
-  const reg = opts.regularization ?? 1;
-  const toneReg = opts.toneReg ?? TONE_REG;
-
-  // sorted luminance sample for fast tone-stage clipping estimates
-  const lumSample = sampleIdx(ps.n, 3000, null, 11);
-  const Ls = Float64Array.from(lumSample, (i) => ps.L[i]);
 
   // ---- stage A: tone (quantile mapping is exact for a monotonic luminance curve)
   let toneBias = Object.fromEntries(PCTS.map((p) => [p, 0]));
-  // Noise: stretching the darkest tones of a high-ISO frame turns sensor noise into blotches.
-  const iso = opts.scene?.iso || 0;
-  const noisy = iso >= 3200 || (!iso && o.tone.pct[50] < 12);
-  const darkSlopeCap = !noisy ? Infinity : iso >= 8000 ? 1.35 : 1.6;
-  const darkSlope = (p, fl) => { let mx = 0, prev = toneMapL(0, p, fl); for (let L = 2; L <= 30; L += 2) { const v = toneMapL(L, p, fl); mx = Math.max(mx, (v - prev) / 2); prev = v; } return mx; };
-  // faces: keep their brightness. Copying rolled-off highlights must not drag a face that happens to be
-  // the brightest thing in a dark frame down to mid-grey (it reads as grey, lifeless skin).
-  const litSkin = [], allSkin = [];
-  for (let i = 0; i < ps.n; i += 3) { if (ps.masks.skin[i] === 2) litSkin.push(ps.L[i]); if (ps.masks.skin[i]) allSkin.push(ps.L[i]); }
-  const mean = (a) => a.reduce((x, y) => x + y, 0) / Math.max(1, a.length);
-  const litSkin0 = mean(litSkin), allSkin0 = mean(allSkin);
-  const brightSkin = litSkin.slice().sort((a, b) => a - b).slice(Math.floor(litSkin.length * 0.8));
-  const brightSkin0 = mean(brightSkin);
-  const faceWeight = ps.skinSource === 'faces' ? 1 : 0.5;
-  let clipBias = { hi: 0, lo: 0 };
-  // risk set: bright pixels whose channels can hit the gamut edge; run through the full pipeline in the tone stage
-  const riskAll = [];
-  for (let i = 0; i < ps.n; i++) if (Math.max(ps.lr[i], ps.lg[i], ps.lb[i]) > 0.35) riskAll.push(i);
-  const riskShare = riskAll.length / ps.n;
-  const riskIdx = sampleIdx(ps.n, 600, (i) => Math.max(ps.lr[i], ps.lg[i], ps.lb[i]) > 0.35, 29);
-  const riskCur = { L: new Float32Array(ps.n), A: new Float32Array(ps.n), B: new Float32Array(ps.n), lr: new Float32Array(ps.n), lg: new Float32Array(ps.n), lb: new Float32Array(ps.n) };
-  const riskClip = (p) => {
-    if (!riskIdx.length) return 0;
-    processPixelSet(ps, p, riskIdx, riskCur);
-    let c = 0;
-    for (const i of riskIdx) { const m = Math.max(riskCur.lr[i], riskCur.lg[i], riskCur.lb[i]); c += 1 / (1 + Math.exp(-(m - 0.993) / 0.002)); }
-    return (c / riskIdx.length) * riskShare;
-  };
-  let origNearWhite = 0; for (let i = 0; i < Ls.length; i++) if (Ls[i] >= 97) origNearWhite++; origNearWhite /= Ls.length;
-  const nearWhite = (p) => { let c = 0; for (let i = 0; i < Ls.length; i++) { const v = toneRaw(Ls[i], p); c += 1 / (1 + Math.exp(-(v - 97) / 0.5)); } return c / Ls.length; };
-  const predictClip = (p) => { let h = 0, l = 0; for (let i = 0; i < Ls.length; i++) { const v = toneRaw(Ls[i], p); h += 1 / (1 + Math.exp(-(v - 99.2) / 0.4)); l += 1 / (1 + Math.exp((v - 0.6) / 0.3)); } return { hi: h / Ls.length, lo: l / Ls.length }; };
-  let useRisk = false;
   const toneStage = () => {
     const lo = TONE_KEYS.map((k) => capRange(k)[0]), hi = TONE_KEYS.map((k) => capRange(k)[1]);
     const fn = (x) => {
       const p = { ...params }; TONE_KEYS.forEach((k, i) => (p[k] = x[i]));
       const fl = fadeLevels(p);
       const r = PCTS.map((q) => (toneMapL(o.tone.pct[q], p, fl) + toneBias[q] - T.tone.pct[q]) / (q === 50 ? 2 : 1.5));
-      const { hi: hiL, lo: loC } = predictClip(p);
-      const hiC = useRisk ? Math.max(hiL, riskClip(p)) : hiL + clipBias.hi;
-      r.push(Math.max(0, hiC - T.clip.hi) * 3000, Math.max(0, loC + clipBias.lo - T.clip.lo) * 3000);
-      r.push(Math.max(0, toneMaxSlope(p) - 2.2) * 6);
-      r.push(toneReversal(p) * 8);
-      r.push(Number.isFinite(darkSlopeCap) ? Math.max(0, darkSlope(p, fl) - darkSlopeCap) * 12 : 0);
-      if (litSkin.length > 20) {
-        const lit1 = litSkin.reduce((a, L) => a + toneMapL(L, p, fl), 0) / litSkin.length + toneBias[50] * 0;
-        const all1 = allSkin.reduce((a, L) => a + toneMapL(L, p, fl), 0) / allSkin.length;
-        const br1 = brightSkin.reduce((a, L) => a + toneMapL(L, p, fl), 0) / Math.max(1, brightSkin.length);
-        r.push(faceWeight * hinge(lit1 - litSkin0, -4, 14) / 1.2, faceWeight * hinge(all1 - allSkin0, -5, 14) / 1.2, faceWeight * hinge(br1 - brightSkin0, -6, 14) / 1.2);
-      } else r.push(0, 0, 0);
-      r.push(Math.max(0, nearWhite(p) - origNearWhite - 0.004) * 600);
-      TONE_KEYS.forEach((k, i) => { const c = capRange(k), w = toneReg[k] || [1, 1]; r.push(1.8 * reg * w[x[i] < 0 ? 0 : 1] * x[i] / (c[1] - c[0])); });
-      r.push((opts.brightenHiUp ?? BRIGHTEN_HI_UP) * reg * Math.max(0, x[0]) * Math.max(0, x[2]) / 100);
       return r;
     };
     const res = lm(fn, TONE_KEYS.map((k) => params[k]), lo, hi, { iters: 40 });
@@ -395,10 +236,9 @@ export function solve(ps, o, ref, opts = {}) {
     return res;
   };
 
-  // ---- stage B: white balance on the photo's neutral pixels (+ skin guard)
+  // ---- stage B: white balance on supported neutral pixels
   const neutralIdx = sampleIdx(ps.n, 2500, (i) => ps.masks.neutral[i], 13);
-  const skinIdx = sampleIdx(ps.n, 1500, (i) => ps.masks.skin[i], 17);
-  const wbIdx = Int32Array.from([...neutralIdx, ...skinIdx]);
+  const wbIdx = neutralIdx;
   const cur = { L: new Float32Array(ps.n), A: new Float32Array(ps.n), B: new Float32Array(ps.n), lr: new Float32Array(ps.n), lg: new Float32Array(ps.n), lb: new Float32Array(ps.n) };
   const wbStage = () => {
     const lo = WB_KEYS.map((k) => capRange(k)[0]), hi = WB_KEYS.map((k) => capRange(k)[1]);
@@ -409,9 +249,6 @@ export function solve(ps, o, ref, opts = {}) {
       const st = measure(ps, cur, wbIdx);
       return [
         (st.wb.a - T.wb.a) / 0.6 * w, (st.wb.b - T.wb.b) / 0.6 * w,
-        ...skinResiduals(st, T),
-        useRisk ? Math.max(0, riskClip(p) - T.clip.hi) * 3000 : 0,
-        0.3 * reg * x[0] / 100, 0.3 * reg * x[1] / 100,
       ];
     };
     const res = lm(fn, WB_KEYS.map((k) => params[k]), lo, hi, { iters: 20 });
@@ -425,21 +262,26 @@ export function solve(ps, o, ref, opts = {}) {
   const CKEYS = ['saturation', 'vibrance', 'su', 'sv', 'mu', 'mv', 'hu', 'hv', ...HSL_KEYS];
   const toParams = (x, base) => {
     const p = { ...base };
+    const gradeAB = [];
     p.saturation = x[0]; p.vibrance = x[1];
     for (let z = 0; z < 3; z++) {
       const u = x[2 + z * 2], v = x[3 + z * 2];
-      const sat = Math.hypot(u, v);
-      p[`${ZN[z]}Sat`] = Math.min(35, sat);
-      p[`${ZN[z]}Hue`] = sat > 1e-6 ? abToWheelHueFast(u, v) : 0;
+      const magnitude = Math.hypot(u, v);
+      const scale = magnitude > 100 ? 100 / magnitude : 1;
+      const a = u * scale, b = v * scale, sat = Math.hypot(a, b);
+      p[`${ZN[z]}Sat`] = sat;
+      p[`${ZN[z]}Hue`] = sat > 1e-6 ? abToWheelHueFast(a, b) : 0;
+      gradeAB.push([a, b]);
     }
-    p._gradeAB = [[x[2], x[3]], [x[4], x[5]], [x[6], x[7]]];
+    p._gradeAB = gradeAB;
     HSL_KEYS.forEach((k, i) => (p[k] = x[8 + i]));
     return p;
   };
   const colorStage = (iters) => {
     const lo = [], hi = [];
     CKEYS.forEach((k) => {
-      if (/^[smh][uv]$/.test(k)) { lo.push(-35); hi.push(35); }
+      if (/^[smh][uv]$/.test(k)) { lo.push(-100); hi.push(100); }
+      else if (HSL_KEYS.includes(k) && !T.bands[BANDS[HSL_KEYS.indexOf(k) % BANDS.length]]) { lo.push(0); hi.push(0); }
       else { const c = capRange(k); lo.push(c[0]); hi.push(c[1]); }
     });
     const x0 = CKEYS.map((k, i) => {
@@ -467,24 +309,11 @@ export function solve(ps, o, ref, opts = {}) {
       }
       r.push((st.color.meanChroma - T.color.meanChroma) / 0.8, (st.color.lowChroma - T.color.lowChroma) / 0.8);
       r.push((st.wb.a - T.wb.a) / 0.8 * T.wb.weight, (st.wb.b - T.wb.b) / 0.8 * T.wb.weight);
-      r.push(...skinResiduals(st, T));
-      r.push(Math.max(0, st.tone.clipHi - T.clip.hi) * 3000, Math.max(0, st.tone.clipLo - T.clip.lo) * 3000);
-      // Saturation up with Vibrance down pushes skin harder than the muted colours: discourage it.
-      // The reverse (Saturation a little down, Vibrance up) is the usual portrait move: it lifts muted
-      // colours and keeps skin natural, so it costs nothing extra.
-      // Past a slight cut (SAT_DOWN_FREE) the pair is a chroma reshaper, not that move: back to full cost.
-      r.push(3 * reg * Math.max(0, x[0]) * Math.max(0, -x[1]) / 2500, 8 * reg * Math.max(0, -x[0] - SAT_DOWN_FREE) * Math.max(0, x[1]) / 2500);
-      // neighbouring HSL bands must not diverge (that is what makes skin blotchy)
-      for (let g = 0; g < 3; g++) for (let bnd = 0; bnd < 8; bnd++) {
-        const i1 = 8 + g * 8 + bnd, i2 = 8 + g * 8 + ((bnd + 1) % 8);
-        const skinPair = bnd === 0 || bnd === 1; // red-orange, orange-yellow: skin straddles these
-        r.push((skinPair ? 6 : 2) * reg * (x[i1] - x[i2]) / (hi[i1] - lo[i1]));
-      }
+      // Small normalized ridge term stabilizes weakly identified color dimensions without narrowing UI ranges.
       x.forEach((v, i) => {
-        // HSL sliders for bands with no target (or little pixel support) are held near zero
-        let w = i < 2 ? 0.4 : i < 8 ? 0.3 : 0.8;
-        if (i >= 8) { const band = BANDS[(i - 8) % 8]; if (!T.bands[band]) w = 1.2; else w /= Math.max(0.3, T.bands[band].weight); }
-        r.push(w * reg * v / (hi[i] - lo[i]));
+        const key = CKEYS[i];
+        const range = /^[smh][uv]$/.test(key) ? 100 : Math.max(...SLIDER_BY_KEY[key].ui.map(Math.abs));
+        r.push(0.03 * v / range);
       });
       return r;
     };
@@ -508,35 +337,12 @@ export function solve(ps, o, ref, opts = {}) {
   const mid = measure(ps, cur, toneIdx);
   const flp = fadeLevels(params);
   for (const q of PCTS) toneBias[q] = mid.tone.pct[q] - toneMapL(o.tone.pct[q], params, flp);
-  const pc = predictClip(params);
-  clipBias = { hi: Math.max(0, mid.tone.clipHi - pc.hi), lo: Math.max(0, mid.tone.clipLo - pc.lo) };
-  useRisk = true;
   toneStage();
   wbStage();
   const tE = performance.now();
 
-  // ---- guardrail: if real clipping still exceeds what's allowed, scale the edit back until it doesn't
-  const guardIdx = sampleIdx(ps.n, 12000, null, 31);
-  const clipOf = (p) => { processPixelSet(ps, p, guardIdx, cur); const st = measure(ps, cur, guardIdx); return st.tone; };
-  const scaled = (k) => { const q = { ...params }; for (const sl of SLIDERS) if (!sl.hue && sl.key !== 'temp' && sl.key !== 'tint') q[sl.key] = params[sl.key] * k; return q; };
+  // Clip rates remain available in the reference targets as diagnostics; they never limit fitting.
   let guardK = 1;
-  const over = (c) => c.clipHi > T.clip.hi - 0.0006 || c.clipLo > T.clip.lo - 0.0006;
-  const BRIGHT = (k, v) => (k === 'exposure' || k === 'highlights' || k === 'whites' || k === 'contrast' || k.startsWith('lum_')) && v > 0
-    || (k === 'blacks' || k === 'shadows') && v < 0;
-  const scaledBright = (k2) => { const q = { ...params }; for (const sl of SLIDERS) if (BRIGHT(sl.key, params[sl.key])) q[sl.key] = params[sl.key] * k2; return q; };
-  if (over(clipOf(params))) {
-    if (!over(clipOf(scaledBright(0)))) {
-      let lo = 0, hi = 1;
-      for (let it = 0; it < 7; it++) { const m = (lo + hi) / 2; if (over(clipOf(scaledBright(m)))) hi = m; else lo = m; }
-      Object.assign(params, scaledBright(lo));
-      guardK = 0.999; // partial, targeted
-    } else {
-      let lo = 0, hi = 1;
-      for (let it = 0; it < 7; it++) { const m = (lo + hi) / 2; if (over(clipOf(scaled(m)))) hi = m; else lo = m; }
-      guardK = lo;
-      Object.assign(params, scaled(lo));
-    }
-  }
 
   // Keep overall brightness in Exposure and express the reference-matched tonal shape as a real,
   // editable master curve. Refit color with that curve active because master curves also change the
@@ -555,30 +361,9 @@ export function solve(ps, o, ref, opts = {}) {
   const rgbFit = fitReferenceRgbCurves(ps, T, params, sampleIdx(ps.n, 7000, null, 47), cur);
   if (rgbFit) { Object.assign(params, rgbFit.curves); rgbCurveEvals = rgbFit.evals; }
 
-  // Curves can move a few saturated pixels closer to clipping. Attenuate generated master and RGB
-  // curves together until the existing clip budget holds.
-  const blendCurve = (amount) => matchedCurve.map(([x, y]) => [x, Math.round(x + (y - x) * amount)]);
-  const blendRgb = (amount) => Object.fromEntries(['curveR', 'curveG', 'curveB'].map((key) => [
-    key, (params[key] || [[0, 0], [255, 255]]).map(([x, y]) => [x, Math.round(x + (y - x) * amount)]),
-  ]));
-  const blendAll = (amount) => ({ ...params, curve: blendCurve(amount), ...blendRgb(amount) });
-  if ((!isIdentityCurve(matchedCurve) || rgbFit) && over(clipOf(params))) {
-    if (over(clipOf(blendAll(0)))) {
-      Object.assign(params, blendAll(0));
-      guardK = Math.min(guardK, 0.999);
-    } else {
-      let lo = 0, hi = 1;
-      for (let it = 0; it < 8; it++) {
-        const amount = (lo + hi) / 2;
-        if (over(clipOf(blendAll(amount)))) hi = amount;
-        else lo = amount;
-      }
-      Object.assign(params, blendAll(lo));
-      guardK = Math.min(guardK, lo);
-    }
-  }
+  // Keep fitted curves at their full strength; clipping remains a diagnostic.
   const tF = performance.now();
-  const final = clampParams(params, true);
+  const final = clampParams(params);
   for (const k of Object.keys(final)) if (SLIDER_BY_KEY[k] && !SLIDER_BY_KEY[k].hue) final[k] = Math.round(final[k] * (k === 'exposure' ? 100 : 1)) / (k === 'exposure' ? 100 : 1);
   return {
     params: final,

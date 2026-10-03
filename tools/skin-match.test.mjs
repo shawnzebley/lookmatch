@@ -48,8 +48,7 @@ test('midtone match preserves light-to-shadow ordering', () => {
     return r[3];
   });
   assert.ok(out.every((x, i) => i === 0 || x > out[i - 1]));
-  assert.ok(out[0] - Ls[0] < out[1] - Ls[1]);
-  assert.ok(out[3] - Ls[3] < out[2] - Ls[2]);
+  for (let i = 0; i < Ls.length; i++) assert.ok(Math.abs(out[i] - Ls[i] - 10) < 0.01);
 });
 
 test('out-of-gamut chroma is reduced without clipping RGB', () => {

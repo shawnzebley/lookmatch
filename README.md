@@ -5,10 +5,14 @@ Copies the look of a reference photo onto other photos. A preset stores the refe
 Every incoming photo is measured and solved on its own.
 
 When both photos have usable subject/background masks, each region's reference targets are fitted
-directly after isolation, before photographer finishes. Subject and background each have editable
+directly after isolation. Subject and background each have editable
 master and RGB curves; the 25th and 75th tone percentiles contribute to the reference match.
-Skin has separate masked Lab color and brightness targets, with bounded corrections that ease off
-in deep shadows and highlights. Auto Adjust preserves reference-matched settings; use Re-match
+Skin has separate masked Lab color and brightness targets at the selected strength, including
+shadows and highlights. After fitting, two passes refine tone, white balance and color against
+the actual rendered pixels; skin is then fitted and re-rendered up to three times after finishing.
+Reference matching uses full editable slider ranges, with no source-skin preservation penalties
+or automatic clipping backoff. Numerical validity and output gamut mapping remain necessary.
+Auto Adjust preserves reference-matched settings; use Re-match
 to calculate them again. Without usable region masks, matching falls back to whole-photo targets.
 
 ## Layout
@@ -16,12 +20,12 @@ to calculate them again. Without usable region masks, matching falls back to who
   - `measure.js` — stats for any image (preview-size); fixed pixel masks so edited images compare like with like
   - `masked-reference.js`, `skin-match.js` — independent region fits and masked reference skin color/brightness in measurement, preview and export
   - `pipeline.js` — Lightroom-style sliders as deterministic global ops, compiled to a 33³ LUT
-  - `solver.js` — staged bounded Levenberg–Marquardt: tone → white balance → color → touch-up, with clipping, banding and skin guards
+  - `solver.js` — staged Levenberg–Marquardt: tone → white balance → color → touch-up, inside editable slider ranges
+  - `reference-refine.js` — rendered-pixel tone/color refinement followed by final skin correction
   - `transfer.js` — color transfer (histogram match + Monge-Kantorovich), baked to a LUT. Test-only for now: lost to the solver on every look in tools/compare.mjs
   - `xmp.js`, `jpegmeta.js` — Lightroom settings (embedded XMP and .xmp preset, crop fields), EXIF carry-over
   - `geom.js` — crop + level: turned-frame crop rectangle, validity, largest-fit rectangle, auto level, Lightroom crop fields
-  - `finish.js`, `style.js`, `style-data.js` — "if <photographer> edited this photo": nearest published scenes -> black point, roll-off, colour-wheel grade, intensity, vignette, grain
-  - `regions.js` — subject vs background: how much brighter, warmer and more colourful the subject sits than its background (a reference's own split, or a photographer's similar published photos), fitted with local exposure / temp / tint / saturation per region (`params.local`)
+  - `finish.js`, `style.js`, `style-data.js`, `regions.js` — legacy experimental fitting modules; photographer styles are no longer offered by the app
   - `retouch.js` — skin pass on the skin mask (Texture / Clarity / skin tone) and Heal spots (copy a nearby patch, keep the spot's own light at its edge, opacity), preview and tiled export alike
   - `cull.js` — focus score out of 10 (edge steepness on the face), eyes open/closed from face blendshapes, scene signatures and grouping, keeper score
 - `web/segment.js`, `web/mp.js` — subject masks in the worker: MediaPipe Selfie Multiclass finds people, Magic Touch picks the object under a tap; guided-filter refined against the photo's edges
@@ -33,8 +37,8 @@ JPEG, PNG, HEIC, and HEIF/HIF (Fujifilm 10-bit). The browser's own decoder goes 
 is decoded with libheif (web/vendor/libheif, loaded only then) and kept as a q97 JPEG for the session.
 
 ## Checks built in
-- Face outlines (MediaPipe Face Landmarker, in the worker) drive the skin guard; skin-colored areas are the fallback.
-- Camera settings (exifr) give scene EV, so dark scenes stay dark and underexposed daylight may brighten.
+- Face and pose segmentation supply correctable skin masks for person-specific fitting and checks.
+- Camera settings (exifr) are retained as scene metadata; they do not override reference brightness.
 - `engine/loss.js`: blown, crushed, clipped color, lost detail, banding, reversed tones, blotchy color, dulled faces — with slider blame.
 
 ## Test scripts
@@ -61,6 +65,8 @@ python3 tools/fit_color_map.py scratch/cmp deeppreset && node tools/loss_png.mjs
 
 Skin matching measures confident visible skin separately for each detected person, with shadow, midtone and lit-skin targets from the reference. One reference person supplies a style to all source people; multiple reference people are paired by image position, not identity. The details table shows the pairing and measured brightness/color. Ambiguous body pixels are excluded; missed poses use facial skin only. Automatic person targets stay with their own photo when settings are synced.
 
-Reference acceptance checks are independent of the solver's aggregate score. A reference result is marked checked only when every required measurement passes: per-person/per-zone brightness error at most 4 L*, skin a*/b* distance at most 5 Lab units, new clipped skin pixels at most 0.5% per person, loss of local skin luminance detail at most 5% of supported source-detail neighborhoods, and subject/background separation error at most 4 L*. Targets follow the selected strength from the original toward the reference; the fitter's partial movement does not relax acceptance. These are provisional product tolerances, not perceptual guarantees or published standards.
+Reference acceptance checks are independent of the solver's aggregate score. A reference result is marked checked only when every required measurement passes: per-person/per-zone brightness error at most 4 L*, skin a*/b* distance at most 5 Lab units, new clipped skin pixels at most 0.5% per person, loss of local skin luminance detail at most 5% of supported source-detail neighborhoods, and subject/background separation error at most 4 L*. Targets follow the selected strength from the original toward the reference. These are provisional product tolerances, not perceptual guarantees or published standards.
 
-Checks measure the actual 8-bit preview after skin correction, retouching, and finishing, rather than the solver's float prediction. Export rechecks a 512-pixel-long-side sample decoded from the encoded JPEG; this does not certify every full-resolution pixel. A failed dimension yields “needs review”; missing masks, face correspondence, target statistics, or measurement support yields “unverified.” Results remain editable and can be exported manually, with the review status reported. Photographer-only styles and imported Lightroom presets do not receive a reference-match certification. Automated acceptance still requires visual review for lighting, composition, and photographer style.
+Checks measure the actual 8-bit preview after skin correction, retouching, and finishing, rather than the solver's float prediction. Export rechecks a 512-pixel-long-side sample decoded from the encoded JPEG; this does not certify every full-resolution pixel. A failed dimension yields “needs review”; missing masks, face correspondence, target statistics, or measurement support yields “unverified.” These checks report problems without limiting the edit or blocking export. Imported Lightroom presets do not receive reference-match certification. Visual review is still required.
+
+The **Needham workflow** button opens a manual checklist with Gerard Needham's own curve guidance and skin-tone video links. It uses the selected reference as the palette target and explains tone curves, RGB color separation, and final exposure/white-balance/contrast review. It is based on published written guidance; no video transcript or creator-specific preset has been verified or encoded.

@@ -70,7 +70,7 @@ export const SLIDER_BY_KEY = Object.fromEntries(SLIDERS.map((s) => [s.key, s]));
 // sliders inside each region (like a Lightroom mask's local sliders). The colour wheels add in Lab.
 export const REGIONS = ['subject', 'background'];
 export const LOCAL_SLIDERS = [
-  { key: 'exposure', label: 'Exposure', group: 'Light', ui: [-2, 2], step: 0.01 },
+  { key: 'exposure', label: 'Exposure', group: 'Light', ui: [-3, 3], step: 0.01 },
   { key: 'contrast', label: 'Contrast', group: 'Light', ui: [-100, 100] },
   { key: 'highlights', label: 'Highlights', group: 'Light', ui: [-100, 100] },
   { key: 'shadows', label: 'Shadows', group: 'Light', ui: [-100, 100] },
@@ -83,9 +83,9 @@ export const LOCAL_SLIDERS = [
 ];
 for (const b of BANDS) {
   const B = b[0].toUpperCase() + b.slice(1);
-  LOCAL_SLIDERS.push({ key: `hue_${b}`, label: `${B} hue`, group: 'HSL hue', ui: [-50, 50] });
-  LOCAL_SLIDERS.push({ key: `sat_${b}`, label: `${B} sat`, group: 'HSL saturation', ui: [-50, 50] });
-  LOCAL_SLIDERS.push({ key: `lum_${b}`, label: `${B} lum`, group: 'HSL luminance', ui: [-50, 50] });
+  LOCAL_SLIDERS.push({ key: `hue_${b}`, label: `${B} hue`, group: 'HSL hue', ui: [-100, 100] });
+  LOCAL_SLIDERS.push({ key: `sat_${b}`, label: `${B} sat`, group: 'HSL saturation', ui: [-100, 100] });
+  LOCAL_SLIDERS.push({ key: `lum_${b}`, label: `${B} lum`, group: 'HSL luminance', ui: [-100, 100] });
 }
 export const LOCAL_WHEEL_KEYS = ['shadowHue', 'shadowSat', 'midtoneHue', 'midtoneSat', 'highlightHue', 'highlightSat'];
 const ZONES3 = ['shadow', 'midtone', 'highlight'];
@@ -370,6 +370,20 @@ export function compile(p) {
 
     let curveBaseChroma = null;
     if (anyCurve) {
+      // Enter the bounded curve domain by mapping chroma at fixed luminance/hue.
+      // Independent channel clipping here would whiten bright colors before the curve.
+      if (r < 0 || g < 0 || b < 0 || r > 1 || g > 1 || b > 1) {
+        linToLab(r, g, b, lab);
+        const light = Math.max(0, Math.min(100, lab[0]));
+        let lo = 0, hi = 1;
+        for (let it = 0; it < 16; it++) {
+          const m = (lo + hi) / 2;
+          labToLin(light, lab[1] * m, lab[2] * m, out);
+          if (out.some((v) => v < 0 || v > 1)) hi = m; else lo = m;
+        }
+        labToLin(light, lab[1] * lo, lab[2] * lo, out);
+        [r, g, b] = out;
+      }
       if (curveSaturation !== 1) {
         linToLab(Math.min(1, Math.max(0, r)), Math.min(1, Math.max(0, g)), Math.min(1, Math.max(0, b)), lab);
         curveBaseChroma = Math.hypot(lab[1], lab[2]);

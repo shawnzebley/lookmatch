@@ -13,7 +13,10 @@ try {
   const page = await browser.newPage({ viewport: { width: 430, height: 932 }, isMobile: true, hasTouch: true });
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
+  await page.addInitScript(() => localStorage.setItem('lm_look', JSON.stringify({ kind: 'photographer', key: 'legacy' })));
   await page.goto(url);
+  assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('lm_look'))), { kind: 'none' });
+  assert.equal(await page.locator('#styleSeg [data-k=photographer]').count(), 0);
   await page.evaluate(() => {
     for (const entry of window.__lm.pool.workers) entry.addEventListener('message', event => {
       if (event.data.ok === false) console.error(event.data.stack);
@@ -27,6 +30,11 @@ try {
   await page.waitForSelector('#npSave', { state: 'detached' });
   await page.setInputFiles('#pickPhotos', portrait);
   await page.waitForFunction(() => window.__lm.S.photos[0]?.status === 'done' && window.__lm.D()?.edit, null, { timeout: 90000 });
+  await page.locator('#ptabs [data-p=look]').click();
+  await page.click('#workflowNeedham');
+  await page.waitForSelector('h2:text-is("Needham workflow")');
+  assert.equal(await page.locator('a[href="https://gerardneedham.com/products/analog-curve-collection"]').count(), 1);
+  await page.locator('[data-close]').click();
   const results = await page.evaluate(async () => {
     const { S, pool } = window.__lm, p = S.photos[0], reference = S.presets.find(r => r.name === 'Acceptance self-reference').stats;
     const args = { id: p.id, refStats: reference, strength: 1 };
