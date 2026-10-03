@@ -23,7 +23,7 @@ import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
 import { stylizeRemote } from './lib/deeppreset.js';
-import { autoAdjustResult, sCurvePush, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor, lookFade, lookSkinPoint, lookBands, lookPresence, colorContrast, zoneChannelShifts, applyChannelShift, referenceCurveContrast, referenceFinish } from './engine/auto-adjust.js';
+import { autoAdjustResult, autoAdjustBase, sCurvePush, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor, lookFade, lookSkinPoint, lookBands, lookPresence, colorContrast, zoneChannelShifts, applyChannelShift, referenceCurveContrast, referenceFinish } from './engine/auto-adjust.js';
 
 const SOLVE_SIDE = 512;
 
@@ -521,9 +521,12 @@ function autoCurves(ps, params, { midL = null, spreadL = null, zoneShift = null 
   const q25 = pct(lum, n, 0.25), q50 = pct(lum, n, 0.5), q75 = pct(lum, n, 0.75);
   const midTarget = midL != null ? clamp(v8(lToY(midL)), 90, 150) : AUTO_MID;
   const ym = st(q50) + clamp((midTarget - st(q50)) * 0.5, -18, 18);
-  // always an S: the quartiles move apart around the midpoint, more when the photo is flat or the look is punchy
+  // Reference quartiles follow the measured spread, including flatter targets. Only the
+  // no-reference portrait correction adds the default S-curve.
   const wantSpread = spreadL != null ? v8(lToY(spreadL[1])) - v8(lToY(spreadL[0])) : null;
-  const push = sCurvePush(st(q75) - st(q25), wantSpread);
+  const push = spreadL != null
+    ? clamp((wantSpread - (st(q75) - st(q25))) / 2, -18, 18)
+    : sCurvePush(st(q75) - st(q25), wantSpread);
   // Place the midpoint first, then the quartiles around it, each kept inside AUTO_SLOPE of the
   // points already placed on either side (a quartile that can't fit is left out). The midpoint
   // wins, so contrast never undoes the brightness correction.
@@ -553,7 +556,8 @@ function autoCurves(ps, params, { midL = null, spreadL = null, zoneShift = null 
   const M = curveLUT(curve);
   const lit = (v) => 255 * M[Math.round(v / 255 * 1023)];
   const warm = nn && sb / nn > 0 && sa / nn > -2;
-  const k = nn >= n * 0.02 ? 0.8 * clamp((AUTO_GREY_C[1] - greyC) / (AUTO_GREY_C[1] - AUTO_GREY_C[0]), 0, 1) * (warm ? 1 - AUTO_WARM_KEEP : 1) : 0;
+  // A reference owns its color cast; do not neutralize it before fitting its zone colors.
+  const k = spreadL != null ? 0 : nn >= n * 0.02 ? 0.8 * clamp((AUTO_GREY_C[1] - greyC) / (AUTO_GREY_C[1] - AUTO_GREY_C[0]), 0, 1) * (warm ? 1 - AUTO_WARM_KEEP : 1) : 0;
   const anchors = [0.05, 0.5, 0.95].map((q) => neu.map((h) => lit(pct(h, nn, q))));
   const [curveR, curveG, curveB] = [0, 1, 2].map((c) => {
     const pts = [[0, 0]];
@@ -742,7 +746,7 @@ const handlers = {
       target = { p1: r.tone.pct[1], p25: r.tone.pct[25], p50: r.tone.pct[50], p75: r.tone.pct[75], p99: r.tone.pct[99], bands: r.bandsBg || r.bands, skin: r.skin, chroma: r.color?.meanChroma, zones: r.zones };
     }
     // start from the current edit with the pieces Auto Adjust owns cleared (the curves, fade, its own picked points)
-    const base = { ...params, curve: null, curveR: null, curveG: null, curveB: null, fadeBlacks: 0, fadeWhites: 0, points: (params.points || []).filter((q) => !q.auto) };
+    const base = autoAdjustBase(params);
     if (target) {
       // Reference workflow: establish palette first, lower basic contrast, fit light/RGB curves,
       // then review exposure and skin white balance from the actual post-curve pixels.
@@ -762,7 +766,9 @@ const handlers = {
       const points = [...base.points, ...[sp, lc.point].filter(Boolean)];
       for (const [k, v] of Object.entries(lc.hsl)) palette[k] = clamp((params[k] || 0) + v, -100, 100);
       palette.points = points;
-      Object.assign(palette, lookPresence(own.color.meanChroma, target.chroma) || {});
+      palette.saturation = 0;
+      palette.vibrance = 0;
+      palette.curveSaturation = 100;
       const paletteParams = { ...paletteBase, ...palette };
       const paletteStats = measure(e.ps, processPixelSet(e.ps, paletteParams));
       const curves = autoCurves(e.ps, paletteParams, {
@@ -776,7 +782,7 @@ const handlers = {
       for (let i = 0; i < e.ps.n; i++) if (sk && sk[i] >= 191 && rendered.L[i] > 25 && rendered.L[i] < 92) { a += rendered.A[i]; b += rendered.B[i]; n++; }
       if (n >= e.ps.n * 0.002) finalSkin = { a: a / n, b: b / n };
       const finish = referenceFinish(postCurve, target, finalSkin);
-      const result = { ...palette, ...curves, exposure: finish.exposure, contrast: lowerContrast, highlights: 0, shadows: 0, whites: 0, blacks: 0 };
+      const result = { ...base, ...palette, ...curves, exposure: finish.exposure, contrast: lowerContrast, highlights: 0, shadows: 0, whites: 0, blacks: 0, saturation: 0, vibrance: 0, curveSaturation: 100 };
       if (finalSkin) {
         result.temp = clamp((params.temp || 0) + finish.temp, -60, 60);
         result.tint = clamp((params.tint || 0) + finish.tint, -50, 50);
@@ -814,7 +820,7 @@ const handlers = {
     const wheelsFree = !look?.kind && !['shadowSat', 'midtoneSat', 'highlightSat'].some((k) => params[k]);
     if (wheelsFree) Object.assign(basic, colorContrast(own.zones));
     const curves = autoCurves(e.ps, { ...base, ...basic }, { midL: target?.p50 != null ? clamp(target.p50, 35, 65) : null, spreadL: target?.p25 != null && target?.p75 != null ? [target.p25, target.p75] : null, zoneShift: target?.zones ? zoneChannelShifts(own.zones, target.zones) : null });
-    return autoAdjustResult(params, { ...basic, ...curves });
+    return autoAdjustResult(params, { ...base, ...basic, ...curves });
   },
 
   // modelUrl + refThumb (the reference's saved thumbnail) turn on model assist: the Deep Preset Space
