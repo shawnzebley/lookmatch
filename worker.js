@@ -1,15 +1,13 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
-import { prepare, measure, regionStats, regionUsable, halationSignature } from './engine/measure.js';
+import { prepare, measure, regionStats, halationSignature } from './engine/measure.js';
 import { solve, solvePreset } from './engine/solver.js';
 import { referenceRegionTargets, solveMaskedReference } from './engine/masked-reference.js';
-import { fitSkinMatch, applySkinMatchRGBA } from './engine/skin-match.js';
-import { fitFinish, FINISH_PROFILES, styleTargets } from './engine/finish.js';
-import { fitRegions, fitReferenceRegions, REGION_MOVE, REF_REGION } from './engine/regions.js';
-import { signature, nearestRegions } from './engine/style.js';
+import { applySkinMatchRGBA } from './engine/skin-match.js';
 import { compile, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, curveLUT, fadeLevels, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
 import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { referenceAcceptance } from './engine/reference-acceptance.js';
+import { refineReference } from './engine/reference-refine.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
 import { exifSegment, xmpSegment, insertSegments, isJpeg, jpegOrientation } from './engine/jpegmeta.js';
 import { isIdentityGeom, geomKey, geomSize, drawTransform, mapPolys, lightroomCrop, autoLevel, toSource } from './engine/geom.js';
@@ -700,18 +698,13 @@ const handlers = {
     const e = await ensurePrepared(id);
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
     // What the chosen look measures, if there is one: tone ends, middle, skin, colour bands, intensity.
-    // A photographer's finish already carries its black/white lift, so Auto Adjust takes that over as fade.
     let target = null;
     if (look?.kind === 'reference' && look.refStats?.tone?.pct) {
       const r = look.refStats;
       target = { p1: r.tone.pct[1], p25: r.tone.pct[25], p50: r.tone.pct[50], p75: r.tone.pct[75], p99: r.tone.pct[99], bands: r.bandsBg || r.bands, skin: r.skin, chroma: r.color?.meanChroma, zones: r.zones };
-    } else if (look?.kind === 'photographer' && FINISH_PROFILES[look.finish]?.p1 != null) {
-      const T = styleTargets(e.ps, FINISH_PROFILES[look.finish], false);
-      target = { p1: T.p1, p99: T.p99 };
     }
     // start from the current edit with the pieces Auto Adjust owns cleared (the curves, fade, its own picked points)
     const base = { ...params, curve: null, curveR: null, curveG: null, curveB: null, fadeBlacks: 0, fadeWhites: 0, points: (params.points || []).filter((q) => !q.auto) };
-    if (look?.kind === 'photographer') { base.finishBlacks = 0; base.finishRolloff = 0; }
     const s = measure(e.ps), t = s.tone, p = t.pct;
     const exposure = clamp(Math.log2(lToY(target?.p50 != null ? clamp(target.p50, 35, 65) : 47) / Math.max(0.0001, lToY(p[50]))) * 0.24, -0.35, 0.35);
     // dark photos can take a bigger lift, because the curve below pulls the highlights down to balance it
@@ -742,7 +735,6 @@ const handlers = {
     // default look only: warm highlights / cool shadows when the photo lacks that separation (a chosen look owns the wheels)
     const wheelsFree = !look?.kind && !['shadowSat', 'midtoneSat', 'highlightSat'].some((k) => params[k]);
     if (wheelsFree) Object.assign(basic, colorContrast(own.zones));
-    if (look?.kind === 'photographer') { basic.finishBlacks = 0; basic.finishRolloff = 0; }
     const curves = autoCurves(e.ps, { ...base, ...basic }, { midL: target?.p50 != null ? clamp(target.p50, 35, 65) : null, spreadL: target?.p25 != null && target?.p75 != null ? [target.p25, target.p75] : null, zoneShift: target?.zones ? zoneChannelShifts(own.zones, target.zones) : null });
     return autoAdjustResult(params, { ...basic, ...curves });
   },
@@ -779,40 +771,20 @@ const handlers = {
     const res = masked || (lrParams
       ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene, pull })
       : solve(e.ps, o, refStats, { strength, scene: e.scene }));
-    // Skin has its own measured color and brightness target inside the subject, before finishes.
-    if (!lrParams && refStats?.skinMatch) {
-      const match = fitSkinMatch(e.ps, processPixelSet(e.ps, res.params), refStats.skinMatch, { move: Math.min(1, strength ?? 1) * 0.65 });
-      if (match) res.params.skinMatch = match;
-    }
     if (!lrParams && refStats && refStats.signature && refStats.signature.halation > 0) {
-      res.params.halation = Math.round(Math.min(60, refStats.signature.halation * Math.min(1, strength)));
+      res.params.halation = Math.round(Math.min(100, refStats.signature.halation * Math.min(1, strength ?? 1)));
     }
-    let style = null;
-    const prof = finish && finish !== 'off' ? FINISH_PROFILES[finish] : null;
-    if (prof) {
-      const f = fitFinish(e.ps, res.params, prof, null, { strength: finishStrength });
-      res.params = f.params; style = f.style;
-    }
-    // subject vs background: the photographer's similar published photos, else the reference's own split
-    let regions = masked?.regions || null;
-    if (!masked && split && e.ps.subject) {
-      let want = null, move = REGION_MOVE, from = null;
-      if (prof && prof.data) {
-        want = nearestRegions(prof.data, signature(e.ps.L, e.ps.A, e.ps.B, e.ps.width, e.ps.height), !(style && style.mono));
-        move *= Math.min(1.5, finishStrength); from = want ? { kind: 'photographer', name: prof.name, k: want.k, n: want.n } : null;
-      }
-      if (!want && refStats && regionUsable(refStats.regions)) {
-        want = refStats.regions; move = REF_REGION.move * Math.min(1, strength); from = { kind: 'reference' };
-      }
-      if (want && move > 0) {
-        const r = from && from.kind === 'reference' && want.subject && want.subject.tone && want.background && want.background.bands
-          ? fitReferenceRegions(e.ps, res.params, want, { ...REF_REGION, move })
-          : fitRegions(e.ps, res.params, want, from && from.kind === 'reference' ? { ...REF_REGION, move } : { move });
-        if (r) { res.params = r.params; regions = { ...r.regions, from }; }
-      }
-    }
+    const style = null, regions = masked?.regions || null;
     // Retained manual edits must be present before the acceptance checks run.
     for (const key of ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points']) if (kept[key] != null) res.params[key] = kept[key];
+    if (!lrParams && refStats && (strength ?? 1) > 0) {
+      const src = e.solveImage;
+      const heals = hasHeals(res.params) ? healsToOut(res.params.heals, e.fullW, e.fullH, e.geom, dispScale(e, src.width, e.geom)) : null;
+      const refined = refineReference(e.ps, res.params, res.targets, (params) => prepare(renderInto(src, params, e.ps.subject, e.ps.skinMask, heals, e.ps.skinPeople)),
+        { skinTarget: refStats.skinMatch, regional: masked ? refStats.regions : null, strength: Math.max(0, Math.min(1, strength ?? 1)) });
+      res.params = refined.params;
+      res.timings.refinement = refined.refinement;
+    }
     const checked = renderedMeasurements(e, res.params, acceptanceReference, strength);
     return { model, params: res.params, targets: res.targets, before: o, ...checked, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
   },
