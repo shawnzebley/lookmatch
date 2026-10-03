@@ -1,9 +1,11 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
 import { prepare, measure, regionStats, halationSignature } from './engine/measure.js';
-import { solve, solvePreset } from './engine/solver.js';
+import { solve, solvePreset, computeTargets } from './engine/solver.js';
+import { referenceTransferStats, fitReferenceTransfer } from './engine/reference-transfer.js';
+import { referenceDetailStats, fitReferenceDetail, applyReferenceDetailRGBA } from './engine/reference-detail.js';
 import { referenceRegionTargets, solveMaskedReference } from './engine/masked-reference.js';
 import { applySkinMatchRGBA } from './engine/skin-match.js';
-import { compile, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, curveLUT, fadeLevels, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
+import { compile, defaultParams, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, curveLUT, fadeLevels, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
 import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { referenceAcceptance } from './engine/reference-acceptance.js';
@@ -21,9 +23,43 @@ import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
 import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
 import { stylizeRemote } from './lib/deeppreset.js';
-import { autoAdjustResult, sCurvePush, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor, lookFade, lookSkinPoint, lookBands, lookPresence, colorContrast, zoneChannelShifts, applyChannelShift } from './engine/auto-adjust.js';
+import { autoAdjustResult, sCurvePush, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor, lookFade, lookSkinPoint, lookBands, lookPresence, colorContrast, zoneChannelShifts, applyChannelShift, referenceCurveContrast, referenceFinish } from './engine/auto-adjust.js';
 
 const SOLVE_SIDE = 512;
+
+function labTargets(ps) {
+  const all = referenceTransferStats(ps);
+  if (all) all.detail = referenceDetailStats(ps);
+  if (!ps.subject) return { version: 1, all };
+  const backgroundMask = Uint8Array.from(ps.subject, (v) => v < 64 ? 255 : 0);
+  const subject = referenceTransferStats(ps, { mask: ps.subject });
+  const background = referenceTransferStats(ps, { mask: backgroundMask });
+  if (subject) subject.detail = referenceDetailStats(ps, { mask: ps.subject });
+  if (background) background.detail = referenceDetailStats(ps, { mask: backgroundMask });
+  return { version: 1, all, subject, background };
+}
+
+function solveLabReference(ps, refStats, strength, split) {
+  if (refStats?.labTransfer?.version !== 1) return null;
+  const started = performance.now();
+  const source = labTargets(ps), target = refStats.labTransfer;
+  const params = defaultParams();
+  const canSplit = split && ['subject', 'background'].every((r) => source[r]?.n >= 200 && target[r]?.n >= 200);
+  if (canSplit) {
+    params.local = Object.fromEntries(['subject', 'background'].map((r) => [r,
+      { referenceTransfer: fitReferenceTransfer(source[r], target[r], { strength }), curveAuto: 'reference' }]));
+    if (Object.values(params.local).some((r) => !r.referenceTransfer)) return null;
+  } else {
+    params.referenceTransfer = fitReferenceTransfer(source.all, target.all, { strength });
+    if (!params.referenceTransfer) return null;
+  }
+  params.referenceMethod = 'lab-distribution'; params.curveAuto = 'reference';
+  const relation = (r) => ({ sep: r.sep, dA: r.dA, dB: r.dB, chroma: Math.exp(r.logC) });
+  return { params, targets: computeTargets(measure(ps), refStats, { strength }), timings: { total: performance.now() - started }, guardScale: 1,
+    regions: canSplit ? { from: { kind: 'reference' }, frac: regionStats(ps).frac, before: relation(regionStats(ps)),
+      after: relation(regionStats(ps, processPixelSet(ps, params))), theirs: relation(refStats.regions || regionStats(ps)),
+      local: params.local, referenceStyle: { regionCurves: false, labTransfer: true, backgroundHslBands: [] } } : null };
+}
 // id -> { file (decodable), orig (what was picked), geom, ps, display, gdisplay, faces, scene, lastUse }
 const cache = new Map();
 // the photo open in the editor on this worker, if any: touch() won't evict its prepared data
@@ -299,10 +335,11 @@ async function ensureDisplay(id, side, plain) {
 // like Lightroom's spot removal, which works on the photo before the develop settings)
 function renderInto(src, params, mask = null, skin = null, heals = null, people = null) {
   const luts = buildLUTs(params, 33);
-  const out = new Uint8ClampedArray(src.width * src.height * 4);
+  let out = new Uint8ClampedArray(src.width * src.height * 4);
   let data = src.data;
   if (heals && heals.length) { data = Uint8ClampedArray.from(src.data); healBuffer(data, src.width, src.height, heals); }
   applyLUTs(luts, mask, data, out, src.width * src.height, 4, 4);
+  if (params.referenceDetail) out = applyReferenceDetailRGBA(out, src.width, src.height, params.referenceDetail, mask);
   if (skin && params.skinMatch) applySkinMatchRGBA(out, params.skinMatch, skin, 4, people, src.data);
   if (skin && hasSkinPass(params)) applySkinPass(out, src.width, src.height, params, skin, Math.max(src.width, src.height));
   if (params.halation) applyHalation(out, src.width, src.height, params.halation);
@@ -326,7 +363,7 @@ function renderedMeasurements(e, params, refStats = null, strength = 1) {
     if (acceptance.status === 'rejected') loss.worst = 'bad';
     else if (acceptance.status === 'unverified' && loss.worst === 'ok') loss.worst = 'warn';
   }
-  return { after: measure(e.ps, cur), loss, acceptance };
+  return { after: measure(e.ps, cur), loss, acceptance, renderedRegions: regionStats(e.ps, cur) };
 }
 
 // output px per photo px for a display of the photo's geometry g that is dw wide
@@ -543,7 +580,8 @@ const handlers = {
     stats.scene = e.scene;
     stats.regions = regionStats(e.ps);
     stats.maskedRegions = referenceRegionTargets(e.ps);
-    stats.matchVersion = 3;
+    stats.labTransfer = labTargets(e.ps);
+    stats.matchVersion = 4;
     stats.signature = { halation: halationSignature(e.ps) };
     const thumb = await toJpegBlob(scaledData(bmp, 480), 0.85);
     bmp.close();
@@ -705,6 +743,46 @@ const handlers = {
     }
     // start from the current edit with the pieces Auto Adjust owns cleared (the curves, fade, its own picked points)
     const base = { ...params, curve: null, curveR: null, curveG: null, curveB: null, fadeBlacks: 0, fadeWhites: 0, points: (params.points || []).filter((q) => !q.auto) };
+    if (target) {
+      // Reference workflow: establish palette first, lower basic contrast, fit light/RGB curves,
+      // then review exposure and skin white balance from the actual post-curve pixels.
+      const paletteBase = { ...base, exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0 };
+      const initial = processPixelSet(e.ps, paletteBase);
+      const source = measure(e.ps, initial), p = source.tone.pct;
+      const lowerContrast = referenceCurveContrast(source, target);
+      const palette = { exposure: 0, contrast: lowerContrast, highlights: 0, shadows: 0, whites: 0, blacks: 0 };
+      const own = source;
+      Object.assign(palette, lookFade({ p1: p[1], p99: p[99], clipLo: source.tone.clipLo, clipHi: source.tone.clipHi }, target) || fadeFor({ clipLo: source.tone.clipLo, clipHi: source.tone.clipHi, p5: p[5], p99: p[99] }));
+      let sn = 0, sa = 0, sb = 0, sl = 0;
+      const sk = e.ps.skinMask;
+      for (let i = 0; i < e.ps.n; i++) if (sk && sk[i] >= 191 && initial.L[i] > 25 && initial.L[i] < 92) { sa += initial.A[i]; sb += initial.B[i]; sl += initial.L[i]; sn++; }
+      const haveSkin = sn >= e.ps.n * 0.002;
+      const lc = lookBands(own.bandsBg, target.bands, { skin: haveSkin });
+      const sp = haveSkin && target.skin ? lookSkinPoint({ L: sl / sn, a: sa / sn, b: sb / sn }, target.skin) : null;
+      const points = [...base.points, ...[sp, lc.point].filter(Boolean)];
+      for (const [k, v] of Object.entries(lc.hsl)) palette[k] = clamp((params[k] || 0) + v, -100, 100);
+      palette.points = points;
+      Object.assign(palette, lookPresence(own.color.meanChroma, target.chroma) || {});
+      const paletteParams = { ...paletteBase, ...palette };
+      const paletteStats = measure(e.ps, processPixelSet(e.ps, paletteParams));
+      const curves = autoCurves(e.ps, paletteParams, {
+        midL: clamp(target.p50, 35, 65),
+        spreadL: [target.p25, target.p75],
+        zoneShift: target.zones ? zoneChannelShifts(paletteStats.zones, target.zones) : null,
+      });
+      const rendered = processPixelSet(e.ps, { ...paletteParams, ...curves });
+      const postCurve = measure(e.ps, rendered);
+      let finalSkin = null, n = 0, a = 0, b = 0;
+      for (let i = 0; i < e.ps.n; i++) if (sk && sk[i] >= 191 && rendered.L[i] > 25 && rendered.L[i] < 92) { a += rendered.A[i]; b += rendered.B[i]; n++; }
+      if (n >= e.ps.n * 0.002) finalSkin = { a: a / n, b: b / n };
+      const finish = referenceFinish(postCurve, target, finalSkin);
+      const result = { ...palette, ...curves, exposure: finish.exposure, contrast: lowerContrast, highlights: 0, shadows: 0, whites: 0, blacks: 0 };
+      if (finalSkin) {
+        result.temp = clamp((params.temp || 0) + finish.temp, -60, 60);
+        result.tint = clamp((params.tint || 0) + finish.tint, -50, 50);
+      }
+      return autoAdjustResult(params, result);
+    }
     const s = measure(e.ps), t = s.tone, p = t.pct;
     const exposure = clamp(Math.log2(lToY(target?.p50 != null ? clamp(target.p50, 35, 65) : 47) / Math.max(0.0001, lToY(p[50]))) * 0.24, -0.35, 0.35);
     // dark photos can take a bigger lift, because the curve below pulls the highlights down to balance it
@@ -761,13 +839,14 @@ const handlers = {
         const ps = prepare(r, { faces: mapPolys(e.faces, e.fullW, e.fullH, e.geom), subject: maskFor(e, r.width, r.height, e.geom), skin: maskFor(e, r.width, r.height, e.geom, 0, null, 'skin') });
         ps.skinPeople = maskFor(e, r.width, r.height, e.geom, 0, null, 'skinPeople') || new Uint8Array(ps.n);
         ps.skinPositions = mapPositions(e.mask?.skinPositions, e.fullW, e.fullH, e.geom);
-        refStats = { ...measure(ps), maskedRegions: referenceRegionTargets(ps), scene: refStats.scene, regions: refStats.regions, signature: refStats.signature };
+        refStats = { ...measure(ps), labTransfer: labTargets(ps), maskedRegions: referenceRegionTargets(ps), scene: refStats.scene, regions: refStats.regions, signature: refStats.signature };
         model = { ok: true };
       } catch (err) { model = { ok: false, error: err.message }; }
     }
     // Masks are ready before fitting. Each region follows its own reference instead of correcting
     // a whole-photo match afterwards; missing masks retain the whole-photo fallback.
-    const masked = !lrParams && split && refStats ? solveMaskedReference(e.ps, refStats, { strength, scene: e.scene }) : null;
+    const lab = !lrParams && refStats ? solveLabReference(e.ps, refStats, strength ?? 1, split) : null;
+    const masked = lab || (!lrParams && split && refStats ? solveMaskedReference(e.ps, refStats, { strength, scene: e.scene }) : null);
     const res = masked || (lrParams
       ? solvePreset(e.ps, o, lrParams, { strength, scene: e.scene, pull })
       : solve(e.ps, o, refStats, { strength, scene: e.scene }));
@@ -780,12 +859,28 @@ const handlers = {
     if (!lrParams && refStats && (strength ?? 1) > 0) {
       const src = e.solveImage;
       const heals = hasHeals(res.params) ? healsToOut(res.params.heals, e.fullW, e.fullH, e.geom, dispScale(e, src.width, e.geom)) : null;
+      if (lab) {
+        // Fit detail on the tone/color result at the same resolution as the reference statistics.
+        const rendered = prepare(renderInto(src, res.params, e.ps.subject));
+        if (res.params.local) {
+          const backgroundMask = Uint8Array.from(e.ps.subject, (v) => v < 64 ? 255 : 0);
+          res.params.referenceDetail = {
+            subject: fitReferenceDetail(referenceDetailStats(rendered, { mask: e.ps.subject }), refStats.labTransfer.subject?.detail, { strength: strength ?? 1 }),
+            background: fitReferenceDetail(referenceDetailStats(rendered, { mask: backgroundMask }), refStats.labTransfer.background?.detail, { strength: strength ?? 1 }),
+          };
+        } else res.params.referenceDetail = fitReferenceDetail(referenceDetailStats(rendered), refStats.labTransfer.all?.detail, { strength: strength ?? 1 });
+      }
       const refined = refineReference(e.ps, res.params, res.targets, (params) => prepare(renderInto(src, params, e.ps.subject, e.ps.skinMask, heals, e.ps.skinPeople)),
         { skinTarget: refStats.skinMatch, regional: masked ? refStats.regions : null, strength: Math.max(0, Math.min(1, strength ?? 1)) });
       res.params = refined.params;
       res.timings.refinement = refined.refinement;
     }
     const checked = renderedMeasurements(e, res.params, acceptanceReference, strength);
+    if (regions) {
+      const r = checked.renderedRegions;
+      regions.after = { sep: r.sep, dA: r.dA, dB: r.dB, chroma: Math.exp(r.logC) };
+      regions.local = res.params.local;
+    }
     return { model, params: res.params, targets: res.targets, before: o, ...checked, scene: e.scene, timings: res.timings, guardScale: res.guardScale, style, regions, mask: maskInfo(e) };
   },
 
@@ -861,9 +956,9 @@ const handlers = {
     const long = Math.max(OW, OH);
     const skinOn = hasSkinPass(params) && e.mask && e.mask.skinFrac >= 0.0005;
     const glowHalo = params.halation ? halationRadius(OW, OH) : 0;
-    const halo = Math.max(skinOn ? skinHalo(long) : 0, glowHalo);
+    const halo = Math.max(skinOn ? skinHalo(long) : 0, glowHalo, params.referenceDetail ? 1 : 0);
     // tiles keep each canvas well under iOS Safari's ~16.7 MP canvas limit
-    const tileH = Math.max(64, Math.min(OH, Math.floor(4_000_000 / OW) - 2 * halo));
+    const tileH = Math.max(64, Math.min(OH, Math.floor((params.referenceDetail ? 1_000_000 : 4_000_000) / OW) - 2 * halo));
     const [c, x] = canvas(OW, Math.min(OH, tileH + 2 * halo));
     x.imageSmoothingQuality = 'high';
     const healed = hasHeals(params) ? healPatches(bmp, g, OW, OH, healsToOut(params.heals, W, H, g, 1, 0)) : null;
@@ -880,8 +975,9 @@ const handlers = {
           maskFor(e, OW, h, g, y, 1, 'skinPeople'), d);
       }
       else {
-        const tmp = new Uint8ClampedArray(OW * hh * 4);
+        let tmp = new Uint8ClampedArray(OW * hh * 4);
         applyLUTs(luts, masked ? maskFor(e, OW, hh, g, ya, 1) : null, d, tmp, OW * hh, 4, 4, 1 + ya);
+        if (params.referenceDetail) tmp = applyReferenceDetailRGBA(tmp, OW, hh, params.referenceDetail, maskFor(e, OW, hh, g, ya, 1));
         if (params.skinMatch) applySkinMatchRGBA(tmp, params.skinMatch, maskFor(e, OW, hh, g, ya, 1, 'skin'), 4,
           maskFor(e, OW, hh, g, ya, 1, 'skinPeople'), d);
         if (skinOn) applySkinPass(tmp, OW, hh, params, maskFor(e, OW, hh, g, ya, 1, 'skin'), long, 4, y - ya, y - ya + h);
@@ -910,7 +1006,9 @@ const handlers = {
         out.acceptance = { ...referenceAcceptance(acceptanceSource, cur, refStats, { strength, skinMatch: params.skinMatch }), scope: 'export-sample' };
       } finally { exported.close(); }
     }
-    if (lightroom) {
+    const labMapping = params.referenceTransfer || Object.values(params.local || {}).some((r) => r.referenceTransfer);
+    if (lightroom && labMapping) out.lightroomWarning = 'The reference color mapping is included in the rendered JPEG. Lightroom slider files cannot reproduce it and were omitted.';
+    if (lightroom && !labMapping) {
       const crop = lightroomCrop(g, W, H, origJpeg ? jpegOrientation(orig) : 1);
       out.xmp = xmpPreset(params, `LookMatch ${name}`, lrMode, crop);
       if (origJpeg) out.lrCopy = new Blob([insertSegments(orig, [xmpSegment(xmpPacket(params, lrMode, crop))], { dropXmp: true })], { type: 'image/jpeg' });

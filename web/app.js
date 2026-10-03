@@ -9,7 +9,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-10-03b';
+const APP_VERSION = '2026-10-03c';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -586,14 +586,15 @@ function solveArgs(p) {
 const upgrading = new Map();
 function ensurePresetRegions(pr) {
   const stats = pr?.stats;
-  const current = stats?.matchVersion === 3 && Number.isFinite(stats.signature?.halation);
+  const current = stats?.matchVersion === 4 && stats.labTransfer?.version === 1 && Number.isFinite(stats.signature?.halation);
   if (!pr || pr.lr || !pr.stats || current || !pr.thumb) return Promise.resolve();
   if (!upgrading.has(pr.id)) {
     upgrading.set(pr.id, (async () => {
       try {
         const r = await pool.call(0, 'measureRef', { file: await dataURLToBlob(pr.thumb) }, { priority: true });
         pr.stats.regions = r.stats.regions || null; pr.stats.signature = r.stats.signature || { halation: 0 };
-        pr.stats.maskedRegions = r.stats.maskedRegions; pr.stats.skinMatch = r.stats.skinMatch; pr.stats.matchVersion = 3;
+        pr.stats.maskedRegions = r.stats.maskedRegions; pr.stats.skinMatch = r.stats.skinMatch;
+        pr.stats.labTransfer = r.stats.labTransfer; pr.stats.matchVersion = 4;
       } catch (e) { pr.stats.regions = null; pr.stats.signature ||= { halation: 0 }; }
       try { await db.putPreset(pr); } catch (e) { /* stays in memory */ }
     })());
@@ -778,7 +779,9 @@ function curveCardMarkup(p) {
   const fittedReferenceCurve = local
     ? localOf(p, D.region).curveAuto === 'reference'
     : p.params.curveAuto === 'reference';
-  const curveMatchNote = !local && regionalReference
+  const curveMatchNote = p.params.referenceMethod === 'lab-distribution'
+    ? '<p class="muted small" style="margin:5px 0 0">The reference supplies a separate luminance and color mapping. These point curves adjust that result.</p>'
+    : !local && regionalReference
     ? '<p class="muted small" style="margin:5px 0 0">Reference light and RGB curves are fitted separately. Choose Subject or Background to view and refine them.</p>'
     : fittedReferenceCurve
     ? `<p class="muted small" style="margin:5px 0 0">Fitted from this photo and the selected reference. ${isIdentityCurve(points) ? 'No visible point-curve adjustment was needed.' : 'Adjust the points to refine the match.'}</p>` : '';
@@ -975,7 +978,7 @@ function regionNote(p) {
   if (Math.abs(warm) >= 1) li.push(`Subject ${warm > 0 ? 'warmer' : 'cooler'} than the background`);
   if (Math.abs(a.chroma - b.chroma) >= 0.05) li.push(`Subject color ${a.chroma > b.chroma ? 'stronger' : 'weaker'} than the background: ${b.chroma.toFixed(2)}× → ${a.chroma.toFixed(2)}×`);
   if (g.referenceStyle) {
-    li.push(g.referenceStyle.regionCurves ? 'Reference fit: separate subject and background light and RGB curves' : 'Reference fit: subject white balance and tonal curve');
+    li.push(g.referenceStyle.labTransfer ? 'Reference fit: separate subject and background luminance curves and color distributions' : g.referenceStyle.regionCurves ? 'Reference fit: separate subject and background light and RGB curves' : 'Reference fit: subject white balance and tonal curve');
     if (g.referenceStyle.backgroundHslBands.length) li.push(`Background HSL matched in ${g.referenceStyle.backgroundHslBands.join(', ')}`);
     if (p.params.halation > 0) li.push(`Warm halation from the reference’s light sources: ${p.params.halation}%`);
   }
@@ -1266,10 +1269,27 @@ function renderSyncCard() {
     const qs = syncTargets(p);
     $('#syGo', box).disabled = true;
     for (const q of qs) {
+      // Sync copies manual controls, while every destination gets its own reference fit.
+      let baseline = q.params;
+      if (p.params?.referenceMethod === 'lab-distribution') {
+        try { baseline = (await pool.call(q.worker, 'solve', { id: q.id, ...solveArgs(p), kept: keptEdits(q.params) })).params; }
+        catch (error) { toast(`${q.name}: ${error.message}`, 4500); continue; }
+      }
       const next = structuredClone(p.params);
       // Automatic skin targets belong to this photo's person IDs.
-      if (q.params?.skinMatch) next.skinMatch = structuredClone(q.params.skinMatch);
+      if (baseline?.skinMatch) next.skinMatch = structuredClone(baseline.skinMatch);
       else delete next.skinMatch;
+      // Preserve each destination's fitted reference baseline and person-specific detail.
+      for (const key of ['referenceTransfer', 'referenceDetail', 'referenceMethod']) {
+        if (baseline?.[key]) next[key] = structuredClone(baseline[key]);
+        else delete next[key];
+      }
+      for (const region of ['subject', 'background']) {
+        if (baseline?.local?.[region]?.referenceTransfer) {
+          next.local ||= {}; next.local[region] ||= {};
+          next.local[region].referenceTransfer = structuredClone(baseline.local[region].referenceTransfer);
+        } else if (next.local?.[region]) delete next.local[region].referenceTransfer;
+      }
       if (!o.light) for (const k of SYNC_OWN) next[k] = q.params ? q.params[k] ?? 0 : 0;
       if (!o.heals) next.heals = q.params && q.params.heals ? q.params.heals : [];
       invalidateAcceptance(q);
@@ -1391,7 +1411,7 @@ function styleCard(p) {
     body = '<p class="muted small" style="margin:8px 0 0">Use the photo as it was captured. Manual edits remain available below.</p>';
   } else {
     body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
-      <p class="muted small" style="margin:8px 0 0">Match this photo to the selected reference. It fits each person’s skin brightness and color to the reference; check measurements and preview.</p>
+      <p class="muted small" style="margin:8px 0 0">Match this photo to the selected reference. Tone and color are fitted separately, then skin is corrected. Manual controls adjust the result; check measurements and preview.</p>
       ${pr ? `${strengthRow('str', 'Match', p.strength, 100)}<button id="workflowNeedham" class="ghost small" style="margin-top:8px">Needham workflow</button>`
     : '<p class="muted small" style="margin:8px 0 0">Pick a reference to copy its look onto this photo.</p>'}`;
   }
@@ -1433,8 +1453,8 @@ function renderStyleCard() {
     resolve();
   };
   if ($('#workflowNeedham', box)) $('#workflowNeedham', box).onclick = () => openSheet(`<h2>Needham workflow</h2>
-    <p class="muted small">A manual finishing checklist based on Gerard Needham’s published preset and curve guidance. It does not recreate a specific video look.</p>
-    <ol><li>Use the selected reference to set the palette.</li><li>Refine the tone curve and RGB color separation.</li><li>Review exposure, white balance and contrast, then adjust match strength.</li></ol>
+    <p class="muted small">Auto Adjust applies this order to the selected reference: set the palette, lower basic tonal contrast, fit tone and RGB curves for contrast and color separation, then review exposure and skin white balance from the processed photo.</p>
+    <p class="muted small">This follows Gerard Needham’s published written curve guidance. It does not claim to recreate a specific video look or preset.</p>
     <p class="muted small">Sources: <a href="https://gerardneedham.com/products/analog-curve-collection" target="_blank" rel="noopener">Analog Curve Collection</a> · <a href="https://www.youtube.com/watch?v=BEJgKPJI9uY" target="_blank" rel="noopener">Gerard Needham skin tones video</a></p>
     <div class="acts"><button class="primary" data-close>Done</button></div>`);
   for (const [id, key] of [['str', 'strength']]) {
@@ -1491,7 +1511,7 @@ function openDetail(p) {
     </div></main>
     <aside class="dpanel" id="dbody">
       <div class="panel-head"><div class="panel-topline"><strong class="panel-title">Controls</strong><button class="panel-toggle" id="panelToggle" type="button" aria-label="Collapse controls" aria-expanded="true">‹</button></div>
-        <div class="edit-actions"><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Correct exposure, set fade, fit the curves, then pick and adjust colors toward the chosen look (or a clean portrait look)">Auto Adjust</button><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
+        <div class="edit-actions"><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Reference: set palette, lower basic contrast, fit tone and RGB curves, then review exposure and skin white balance. Without a reference, apply a clean portrait correction.">Auto Adjust</button><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
         <nav class="ptabs" id="ptabs" aria-label="Editing sections">${PAGES.map(([k, l]) => `<button data-p="${k}" title="${l}" aria-label="${l}"><span class="tab-icon" aria-hidden="true">${({ look: '◉', subject: '◌', light: '☼', color: '◐', retouch: '✦', more: '⋯' })[k]}</span><span class="tab-label">${l}</span></button>`).join('')}</nav>
       </div>
       <div class="pager" id="pager">
@@ -1543,7 +1563,7 @@ function openDetail(p) {
       $('#sliders').querySelectorAll('details.group').forEach((group) => {
         if (visible.has($('summary', group)?.textContent.trim())) group.open = true;
       });
-      toast('Auto Adjust applied: fade, curves, point colors and HSL are set toward the look. Undo puts it back.');
+      toast(look ? 'Reference workflow applied: palette, reduced basic contrast, tone/RGB curves, then exposure and skin white balance. Undo puts it back.' : 'Auto Adjust applied: curves, point colors and HSL set a clean portrait baseline. Undo puts it back.');
     } catch (e) { toast(e.message, 4500); logError('auto adjust', e, p.file); }
     finally { if ($('#autoAdjust')) { $('#autoAdjust').disabled = false; $('#autoAdjust').textContent = 'Auto Adjust'; } }
   };
@@ -2138,6 +2158,7 @@ async function exportPhotos(list) {
         p.status = 'exporting'; rerenderMatchSoon();
         try {
           const r = await pool.call(p.worker, 'export', exportArgs(p));
+          if (r.lightroomWarning) reviewNotes.push(`${p.name}: ${r.lightroomWarning}`);
           p.acceptance = r.acceptance || null;
           if (p.acceptance && !p.acceptance.accepted) reviewNotes.push(`${p.name}: ${p.acceptance.status === 'rejected' ? 'needs review' : 'unverified'}`);
           status(`${p.name}: uploading…`);
@@ -2161,6 +2182,7 @@ async function exportPhotos(list) {
           p.status = 'exporting'; rerenderMatchSoon();
           try {
             const r = await pool.call(p.worker, 'export', exportArgs(p));
+            if (r.lightroomWarning) reviewNotes.push(`${p.name}: ${r.lightroomWarning}`);
             p.acceptance = r.acceptance || null;
             if (p.acceptance && !p.acceptance.accepted) reviewNotes.push(`${p.name}: ${p.acceptance.status === 'rejected' ? 'needs review' : 'unverified'}`);
             const b = baseName(p.name);
@@ -2226,7 +2248,7 @@ function renderSettings() {
         <select id="sDest"><option value="drive">Google Drive</option><option value="device">This iPhone (Photos / Files)</option></select></div>
       <div class="field"><label class="t">JPEG quality</label><input type="number" id="sQ" min="60" max="100" value="${s.quality}"></div>
       <label class="check"><input type="checkbox" id="sLR" ${s.lightroom ? 'checked' : ''}> Also export Lightroom files</label>
-      <p class="muted small">For each photo: <code>_lightroom.jpg</code> (your untouched original with the computed settings embedded, so Lightroom opens it already edited) and <code>_lookmatch.xmp</code> (the same settings as a Lightroom preset you can import).</p>
+      <p class="muted small">For slider edits, also export the untouched original with Lightroom settings and an XMP preset. Reference color mappings are included in the rendered JPEG; Lightroom slider files cannot reproduce them.</p>
       <div class="field"><label class="t">Lightroom settings style</label>
         <select id="sLRM"><option value="sliders">Basic sliders (easy to tweak, approximate)</option><option value="curve">Tone curve (closer match)</option></select></div>
     </div>

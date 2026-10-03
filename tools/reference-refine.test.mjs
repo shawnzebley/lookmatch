@@ -48,3 +48,15 @@ test('entering the curve domain preserves bright saturated colors instead of cli
   assert.ok(Math.hypot(...curved.slice(3).map((v, i) => v - base[i + 3])) < 0.05);
   assert.ok(curved.slice(0, 3).every(v => v >= 0 && v <= 1));
 });
+
+test('already-matching skin retains explicit correspondence without adding a correction', () => {
+  const { ps } = fixture();
+  ps.skinPeople = new Uint8Array(ps.n).fill(1);
+  const target = skinStats(ps), stats = measure(ps);
+  const result = refineReference(ps, defaultParams(), computeTargets(stats, stats), () => ps,
+    { skinTarget: target, passes: 0 });
+  assert.equal(result.params.skinMatch.version, 2);
+  assert.equal(result.params.skinMatch.people[0].referenceId, 1);
+  for (const zone of result.params.skinMatch.people[0].zones)
+    for (const key of ['deltaL', 'deltaA', 'deltaB']) assert.equal(zone[key], 0);
+});

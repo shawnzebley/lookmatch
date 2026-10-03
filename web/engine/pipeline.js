@@ -1,3 +1,4 @@
+import { applyReferenceDetailRGBA } from './reference-detail.js';
 // Edit pipeline. Every slider is a deterministic, global per-pixel operation, so the whole edit
 // compiles into one function RGB -> RGB and then into a 3D LUT for full-resolution rendering.
 //
@@ -8,6 +9,7 @@
 import { SRGB8_TO_LIN, linearToSrgb, srgbToLinear, linToLab, labToLin, yToL, lToY, rgbHue, wheelHueToAB } from './color.js';
 import { BANDS, bandWeights, gradeWeights } from './measure.js';
 import { applySkinMatchLinear } from './skin-match.js';
+import { applyReferenceTransferLinear } from './reference-transfer.js';
 
 // ---- slider definitions ---------------------------------------------------------------
 // cap = the guardrail range the solver may use; ui = the range the user may drag to.
@@ -99,6 +101,7 @@ function wheelAB(hue, sat) {
 /** Does this region carry any change? */
 export function localActive(loc) {
   if (!loc) return false;
+  if (loc.referenceTransfer) return true;
   for (const s of LOCAL_SLIDERS) if (loc[s.key]) return true;
   return ZONES3.some((z) => loc[`${z}Sat`]) || CURVE_KEYS.some((k) => !isIdentityCurve(loc[k]));
 }
@@ -110,6 +113,7 @@ export function withLocal(p, loc) {
   if (!localActive(loc)) return p;
   const q = { ...p };
   delete q.local;
+  if (loc.referenceTransfer) q.referenceTransfer = loc.referenceTransfer;
   for (const s of LOCAL_SLIDERS) {
     const d = loc[s.key];
     if (!d) continue;
@@ -346,6 +350,10 @@ export function compile(p) {
 
   // process linear RGB -> writes linear RGB (in gamut) into res[0..2] and Lab into res[3..5]
   return function process(r, g, b, res) {
+    if (p.referenceTransfer) {
+      const mapped = applyReferenceTransferLinear(r, g, b, p.referenceTransfer, res);
+      if (mapped) { r = res[0]; g = res[1]; b = res[2]; }
+    }
     if (cal) {
       const r2 = cal[0][0] * r + cal[0][1] * g + cal[0][2] * b;
       const g2 = cal[1][0] * r + cal[1][1] * g + cal[1][2] * b;
@@ -716,8 +724,9 @@ export function applyFinish(buf, width, rows, p, y0 = 0, fullW = width, fullH = 
 export function renderImage(img, p, N = 33, mask = null) {
   const luts = buildLUTs(p, N);
   const ch = img.channels || 4;
-  const out = new Uint8Array(img.width * img.height * ch);
+  let out = new Uint8Array(img.width * img.height * ch);
   applyLUTs(luts, mask, img.data, out, img.width * img.height, ch, ch);
+  if (p.referenceDetail) out = applyReferenceDetailRGBA(out, img.width, img.height, p.referenceDetail, mask, ch);
   if (p.halation) applyHalation(out, img.width, img.height, p.halation, 0, img.width, img.height, undefined, ch);
   if (hasSpatialFinish(p)) applyFinish(out, img.width, img.height, p, 0, img.width, img.height, 7, ch);
   return { width: img.width, height: img.height, channels: ch, data: out };

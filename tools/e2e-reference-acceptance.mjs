@@ -50,6 +50,7 @@ try {
     return { original: original.acceptance, bad: bad.acceptance, finish: finish.acceptance, missing: missing.acceptance,
       exported: exported.acceptance, safeExport: safeExport.acceptance, bytes, dimensions: [safeExport.width, safeExport.height] };
   });
+  await fs.writeFile(path.join(output, 'diagnostics.json'), JSON.stringify({ ...results, bytes: undefined }, null, 2));
   assert.equal(results.original.status, 'accepted', 'Self-reference must pass with usable skin/region evidence');
   assert.equal(results.bad.status, 'rejected', 'Overexposed skin must fail actual rendered checks');
   assert.equal(results.exported.status, 'rejected', 'Encoded overexposed JPEG must fail');

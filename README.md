@@ -12,8 +12,10 @@ shadows and highlights. After fitting, two passes refine tone, white balance and
 the actual rendered pixels; skin is then fitted and re-rendered up to three times after finishing.
 Reference matching uses full editable slider ranges, with no source-skin preservation penalties
 or automatic clipping backoff. Numerical validity and output gamut mapping remain necessary.
-Auto Adjust preserves reference-matched settings; use Re-match
-to calculate them again. Without usable region masks, matching falls back to whole-photo targets.
+Reference Auto Adjust follows a fixed sequence: set the palette from the reference, reduce basic tonal
+contrast, fit tone and RGB curves for contrast and color separation, then measure the processed photo
+to make a bounded exposure and skin white-balance correction. Without a reference, Auto Adjust keeps
+its clean-portrait correction. Without usable region masks, matching falls back to whole-photo targets.
 
 ## Layout
 - `engine/` — shared by the browser and Node
@@ -69,4 +71,17 @@ Reference acceptance checks are independent of the solver's aggregate score. A r
 
 Checks measure the actual 8-bit preview after skin correction, retouching, and finishing, rather than the solver's float prediction. Export rechecks a 512-pixel-long-side sample decoded from the encoded JPEG; this does not certify every full-resolution pixel. A failed dimension yields “needs review”; missing masks, face correspondence, target statistics, or measurement support yields “unverified.” These checks report problems without limiting the edit or blocking export. Imported Lightroom presets do not receive reference-match certification. Visual review is still required.
 
-The **Needham workflow** button opens a manual checklist with Gerard Needham's own curve guidance and skin-tone video links. It uses the selected reference as the palette target and explains tone curves, RGB color separation, and final exposure/white-balance/contrast review. It is based on published written guidance; no video transcript or creator-specific preset has been verified or encoded.
+The **Needham workflow** button describes the reference Auto Adjust sequence based on Gerard Needham's published written curve guidance. No video transcript or creator-specific preset has been verified or encoded.
+
+## LAB reference matching and TIFF CLI
+
+Newly measured references use a per-photo LAB distribution mapping: one smooth luminance quantile curve, separate a/b mean and variance transfer, and supported circular hue-sector residuals. Subject and background get separate mappings when both masks have enough support. Local luminance detail is fitted at the analysis resolution; skin is corrected after rendering. Manual sliders adjust this baseline. Auto Adjust runs the Needham workflow over the result; Re-match restores the calculated reference fit.
+
+The browser still renders 8-bit JPEGs. LAB mappings cannot be represented by Lightroom slider sidecars, so those exports are omitted with a visible explanation. Python offers a separate high-precision path:
+
+```powershell
+python -m pip install -r tools/requirements-reference-match.txt
+python tools/reference_match.py --reference reference.tif --user_photo original.tif --output matched.tif
+```
+
+Optional paired `--reference-mask` and `--user-mask` grayscale masks separate foreground/background. `--strength`, `--chroma-strength`, and `--local-contrast-strength` control the fit. TIFF output is 16-bit with an sRGB profile and preserved alpha; JPEG output is 8-bit. Untagged inputs are treated as sRGB. Non-sRGB 16-bit ICC input requires prior color-managed conversion and produces an actionable error rather than being silently downconverted. The CLI does not detect faces or reproduce the browser's person-specific skin correction. Neither implementation can infer the original photographer's camera profile or guarantee an exact look across different scenes.

@@ -1,11 +1,22 @@
 import assert from 'node:assert/strict';
-import { autoAdjustResult } from '../engine/auto-adjust.js';
+import { autoAdjustResult, referenceCurveContrast, referenceFinish } from '../engine/auto-adjust.js';
 
 // a reference match is recalculated toward the look, not preserved
 const calculated = { exposure: 0.1, highlights: -1, curve: [[0, 0], [255, 255]] };
 assert.deepEqual(autoAdjustResult({ curveAuto: 'reference', curve: [[0, 0], [128, 141], [255, 255]] }, calculated), { ...calculated, preservedReference: false });
 assert.deepEqual(autoAdjustResult({}, calculated), { ...calculated, preservedReference: false });
 console.log('auto-adjust checks passed');
+
+// The reference contrast step is always negative before curve fitting, and responds to the
+// flat percentile shape passed by worker.autoAdjust.
+assert.equal(referenceCurveContrast({ tone: { pct: { 25: 20, 75: 70 } } }, { p25: 30, p75: 60 }), -13);
+assert.equal(referenceCurveContrast({}, {}), -8);
+// Final exposure follows post-curve median values; white balance uses the post-curve skin sample.
+const finish = referenceFinish({ tone: { pct: { 25: 25, 50: 38, 75: 68 } } }, { p25: 30, p50: 55, p75: 70 }, { a: 8, b: 22 });
+assert.ok(finish.exposure > 0 && finish.exposure <= 0.25);
+assert.ok(finish.tint > 0 && finish.temp < 0);
+assert.ok(Math.abs(referenceFinish({ tone: { pct: { 50: 5 } } }, { p50: 90 }).exposure) <= 0.25);
+console.log('reference workflow stage checks passed');
 
 import { skinWhiteBalance, presenceFor, highlightRollOff } from '../engine/auto-adjust.js';
 // natural skin (hue ~53 deg) is left alone; green/yellow skin gets magenta + a little blue; red skin gets a little green

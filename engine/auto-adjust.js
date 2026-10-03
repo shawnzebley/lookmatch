@@ -6,7 +6,7 @@ export function autoAdjustResult(params = {}, calculated = {}) {
 
 // Portrait rules for Auto Adjust, taken from a working portrait editor's Lightroom routine. Each is
 // small on purpose: Auto Adjust is a starting correction, not a look.
-import { labToLin, linearToSrgb } from './color.js';
+import { labToLin, linearToSrgb, lToY } from './color.js';
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const SKIN_HUE = [44, 64]; // Lab hue angle (deg) where skin reads as natural
 
@@ -25,6 +25,28 @@ export function skinWhiteBalance(meanA, meanB) {
     return { temp: 0, tint: -Math.round(clamp(e * 0.3, 0, 3)) };
   }
   return { temp: 0, tint: 0 };
+}
+
+// The reference tonal stage lowers basic contrast before fitting curves. Final review then
+// adjusts exposure from the post-curve midpoint and white balance from post-curve skin.
+export function referenceCurveContrast(own = {}, target = {}) {
+  const pct = own.tone?.pct || own.pct || {};
+  const targetPct = target.tone?.pct || target.pct || { 25: target.p25, 50: target.p50, 75: target.p75 };
+  const ownSpread = Number.isFinite(pct[25]) && Number.isFinite(pct[75]) ? pct[75] - pct[25] : null;
+  const targetSpread = Number.isFinite(targetPct[25]) && Number.isFinite(targetPct[75]) ? targetPct[75] - targetPct[25] : null;
+  if (ownSpread == null || targetSpread == null) return -8;
+  return -clamp(8 + Math.max(0, ownSpread - targetSpread) * 0.25, 8, 18);
+}
+
+export function referenceFinish(own = {}, target = {}, skin = null) {
+  const pct = own.tone?.pct || own.pct || {};
+  const targetPct = target.tone?.pct || target.pct || { 25: target.p25, 50: target.p50, 75: target.p75 };
+  const ownMid = pct[50], targetMid = targetPct[50];
+  const exposure = Number.isFinite(ownMid) && Number.isFinite(targetMid)
+    ? clamp(Math.log2(lToY(clamp(targetMid, 35, 65)) / Math.max(0.0001, lToY(ownMid))) * 0.18, -0.25, 0.25)
+    : 0;
+  const wb = skin ? skinWhiteBalance(skin.a, skin.b) : { temp: 0, tint: 0 };
+  return { exposure, temp: wb.temp, tint: wb.tint };
 }
 
 // Saturation slightly down, vibrance up: keeps skin natural while muted colours get some pop. Photos
