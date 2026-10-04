@@ -295,3 +295,8 @@ label.chk input { width: 18px; height: 18px; margin: 0; flex: none; }
 .strip .scene { flex: none; align-self: center; font-size: 11px; color: var(--muted); padding: 2px 5px; border-left: 1px solid var(--line); }
 .cullbar { margin-top: 8px; }
 #dPick.on { color: #ffd24a; border-color: #ffd24a; }
+.rcard em, #dPick em { margin-left: auto; padding: 2px 6px; border-radius: 999px; background: #263d38; color: #a9e0c8; font-size: 10px; font-style: normal; font-weight: 650; white-space: nowrap; }
+.adaptive-status { margin: 8px 0; line-height: 1.5; }
+.recipe-actions { margin-top: 12px; flex-wrap: wrap; }
+.recipe-actions button { font-size: 12px; }
+.adaptive-credit { margin: 4px 0 10px; line-height: 1.45; }
