@@ -1,6 +1,7 @@
 // Engine worker: decode, measure, solve, render previews, export full resolution.
 import { prepare, measure, regionStats, halationSignature } from './engine/measure.js';
 import { solve, solvePreset, computeTargets } from './engine/solver.js';
+import { solveAdaptiveLook } from './engine/adaptive-look.js';
 import { referenceTransferStats, fitReferenceTransfer } from './engine/reference-transfer.js';
 import { referenceDetailStats, fitReferenceDetail, applyReferenceDetailRGBA } from './engine/reference-detail.js';
 import { referenceRegionTargets, solveMaskedReference } from './engine/masked-reference.js';
@@ -232,6 +233,27 @@ const maskInfo = (e) => {
     peopleMethod: M.peopleMethod || 'none', peopleGroups: M.skinPositions?.length || 0, peopleFaceFallbacks: M.skinPositions?.filter((p) => p.scope === 'face').length || 0,
     peopleAmbiguous: M.peopleAmbiguous || 0, peopleLabeled: M.peopleLabeled || 0 };
 };
+
+function maskRuns(data) {
+  const runs = [];
+  for (let i = 0; i < data.length;) {
+    const value = data[i]; let end = i + 1;
+    while (end < data.length && data[end] === value) end++;
+    runs.push([value, end - i]); i = end;
+  }
+  return runs;
+}
+function restoreMaskRuns(runs, size) {
+  if (!Array.isArray(runs) || runs.length > size) throw new Error('Invalid mask recipe');
+  const data = new Uint8Array(size); let offset = 0;
+  for (const run of runs) {
+    if (!Array.isArray(run) || run.length !== 2 || !Number.isInteger(run[0]) || run[0] < 0 || run[0] > 255 ||
+        !Number.isInteger(run[1]) || run[1] < 1 || offset + run[1] > size) throw new Error('Invalid mask recipe');
+    data.fill(run[0], offset, offset + run[1]); offset += run[1];
+  }
+  if (offset !== size) throw new Error('Incomplete mask recipe');
+  return data;
+}
 
 // key: 'sub' (the subject) or 'skin'
 function maskCanvas(M, key = 'sub') {
@@ -607,6 +629,37 @@ const handlers = {
 
   // subject mask edits. op: 'add' / 'remove' (the object under x, y: 0..1 of the photo as shown, after
   // crop and level), 'auto' (people on or off: on), 'undo' (last tap), 'clear' (all taps).
+  async maskRecipe({ id, recipe = null }) {
+    const e = await ensurePrepared(id), M = e.mask;
+    if (!M) return { recipe: null, mask: null };
+    if (!recipe) return { recipe: { version: 1, w: M.w, h: M.h,
+      sourceWidth: e.fullW, sourceHeight: e.fullH, useAuto: M.useAuto,
+      person: maskRuns(M.person), skin: maskRuns(M.skin), skinPeople: maskRuns(M.skinPeople),
+      skinPositions: M.skinPositions, picks: M.picks.map(p => ({ add: p.add, x: p.x, y: p.y, data: maskRuns(p.data) })) } };
+    if (recipe.version !== 1 || recipe.w !== M.w || recipe.h !== M.h || recipe.sourceWidth !== e.fullW ||
+        recipe.sourceHeight !== e.fullH || typeof recipe.useAuto !== 'boolean' || !Array.isArray(recipe.picks) || recipe.picks.length > 100 ||
+        !Array.isArray(recipe.skinPositions) || recipe.skinPositions.length > 100) throw new Error('Mask recipe does not match this photo');
+    const size = M.w * M.h;
+    const person = restoreMaskRuns(recipe.person, size), skin = restoreMaskRuns(recipe.skin, size), skinPeople = restoreMaskRuns(recipe.skinPeople, size);
+    const positions = recipe.skinPositions.map(p => {
+      if (!Number.isInteger(p.id) || p.id < 1 || p.id > 255 || !Number.isFinite(p.x) || !Number.isFinite(p.y) ||
+          p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) throw new Error('Invalid skin position');
+      return { id: p.id, x: p.x, y: p.y };
+    });
+    const picks = recipe.picks.map(p => {
+      if (typeof p.add !== 'boolean' || !Number.isFinite(p.x) || !Number.isFinite(p.y) ||
+          p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) throw new Error('Invalid mask tap');
+      return { add: p.add, x: p.x, y: p.y, data: restoreMaskRuns(p.data, size) };
+    });
+    Object.assign(M, { person, skin, skinPeople, skinPositions: positions, picks, useAuto: recipe.useAuto });
+    M.personFrac = person.reduce((a, b) => a + b, 0) / 255 / size;
+    M.skinFrac = skin.reduce((a, b) => a + b, 0) / 255 / size;
+    M.peopleLabeled = skinPeople.reduce((a, b) => a + (b > 0 ? 1 : 0), 0);
+    combineMask(e); e.ps = null; e.display = null; e.gdisplay = null; e.sample = null;
+    await ensurePrepared(id);
+    return { mask: maskInfo(e), before: measure(e.ps) };
+  },
+
   async mask({ id, op, x, y, on }) {
     const e = cache.get(id);
     if (!e) throw new Error('photo not loaded');
@@ -803,32 +856,30 @@ const handlers = {
     const sk = e.ps.skinMask;
     for (let i = 0; i < e.ps.n; i++) if (sk && sk[i] >= 191 && cur0.L[i] > 25 && cur0.L[i] < 92) { sa += cur0.A[i]; sb += cur0.B[i]; sl += cur0.L[i]; sn++; }
     const haveSkin = sn >= e.ps.n * 0.002;
-    // fade: the look's black and white ends, else a light matte floor sized from the measured clipping
-    const clip = { clipLo: own.tone.clipLo, clipHi: own.tone.clipHi };
-    Object.assign(basic, lookFade({ p1: own.tone.pct[1], p99: own.tone.pct[99], ...clip }, target) || fadeFor({ ...clip, p5: own.tone.pct[5], p99: own.tone.pct[99] }));
-    // colour picker + HSL: toward the look's skin and colour bands, else the default clean-portrait look
-    const lc = target?.bands ? lookBands(own.bandsBg, target.bands, { skin: haveSkin }) : lookColor(own.bands);
-    const sp = !haveSkin ? null : target?.skin ? lookSkinPoint({ L: sl / sn, a: sa / sn, b: sb / sn }, target.skin) : skinPoint(sl / sn, sa / sn, sb / sn);
-    const points = [...base.points, ...[sp, lc.point].filter(Boolean)];
-    const hsl = {};
-    for (const [k, v] of Object.entries(lc.hsl)) hsl[k] = clamp(target?.bands ? (params[k] || 0) + v : v, -100, 100);
-    // white balance on skin only when there is no look skin to chase; presence from the look's intensity
-    const wb = haveSkin && !target?.skin ? skinWhiteBalance(sa / sn, sb / sn) : { temp: 0, tint: 0 };
-    const pres = (target?.chroma && look?.kind === 'reference' ? lookPresence(own.color.meanChroma, target.chroma) : null) || presenceFor(own.color.meanChroma);
-    Object.assign(basic, hsl, points.length ? { points } : {}, pres, wb.temp || wb.tint ? { temp: clamp((params.temp || 0) + wb.temp, -60, 60), tint: clamp((params.tint || 0) + wb.tint, -50, 50) } : {});
-    // default look only: warm highlights / cool shadows when the photo lacks that separation (a chosen look owns the wheels)
-    const wheelsFree = !look?.kind && !['shadowSat', 'midtoneSat', 'highlightSat'].some((k) => params[k]);
-    if (wheelsFree) Object.assign(basic, colorContrast(own.zones));
-    const curves = autoCurves(e.ps, { ...base, ...basic }, { midL: target?.p50 != null ? clamp(target.p50, 35, 65) : null, spreadL: target?.p25 != null && target?.p75 != null ? [target.p25, target.p75] : null, zoneShift: target?.zones ? zoneChannelShifts(own.zones, target.zones) : null });
-    return autoAdjustResult(params, { ...base, ...basic, ...curves });
+    // With no reference, correct measured light and skin white balance only. Do not
+    // inject the old portrait curves, saturation, vibrance, fade or palette treatment.
+    const wb = haveSkin ? skinWhiteBalance(sa / sn, sb / sn) : { temp: 0, tint: 0 };
+    const result = { ...base, ...basic };
+    if (wb.temp || wb.tint) {
+      result.temp = clamp((base.temp || 0) + wb.temp, -60, 60);
+      result.tint = clamp((base.tint || 0) + wb.tint, -50, 50);
+    }
+    return autoAdjustResult(params, result);
   },
 
   // modelUrl + refThumb (the reference's saved thumbnail) turn on model assist: the Deep Preset Space
   // restyles this photo toward the reference, and the solver then chases that result's measured
   // targets instead of the reference's own. Any failure falls back to the plain reference targets.
-  async solve({ id, refStats, strength, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true, modelUrl = null, refThumb = null, kept = {} }) {
+  async solve({ id, refStats, strength, adaptiveLook = null, skinProtection = 1, lrParams = null, finish = 'off', finishStrength = 1, pull = 0.5, split = true, modelUrl = null, refThumb = null, kept = {} }) {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
+    if (adaptiveLook) {
+      const result = solveAdaptiveLook(e.ps, adaptiveLook, { strength, skinProtection, scene: e.scene });
+      for (const key of ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points']) if (kept[key] != null) result.params[key] = kept[key];
+      const checked = renderedMeasurements(e, result.params, null, strength);
+      return { ...result, before: o, ...checked, scene: e.scene, model: null, style: null,
+        regions: null, mask: maskInfo(e) };
+    }
     const acceptanceReference = !lrParams ? refStats : null;
     let model = null;
     if (modelUrl && refThumb && refStats && !lrParams) {

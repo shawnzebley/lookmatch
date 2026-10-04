@@ -32,7 +32,7 @@ try {
   await page.waitForFunction(() => window.__lm.S.photos[0]?.status === 'done' && window.__lm.D()?.edit, null, { timeout: 90000 });
   await page.locator('#ptabs [data-p=look]').click();
   await page.click('#workflowNeedham');
-  await page.waitForSelector('h2:text-is("Needham workflow")');
+  await page.waitForSelector('h2:text-is("How matching works")');
   assert.equal(await page.locator('a[href="https://gerardneedham.com/products/analog-curve-collection"]').count(), 1);
   await page.locator('[data-close]').click();
   const results = await page.evaluate(async () => {

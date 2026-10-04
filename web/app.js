@@ -9,7 +9,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-10-03c';
+const APP_VERSION = '2026-10-03d';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -66,7 +66,7 @@ function showProblem(title, rec, extraActs = '') {
 // ---------------------------------------------------------------- settings
 const SETTINGS_KEY = 'lm_settings';
 const S = {
-  presets: [],
+  presets: [], userPresets: [],
   settings: { clientId: '243038152226-jfgss8uq68lb72bi9j5jqgkdlg475kj8.apps.googleusercontent.com', quality: 92, lightroom: true, lrMode: 'sliders', dest: 'drive', ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') },
   presetId: localStorage.getItem('lm_preset') || null,
   look: (() => { try { return JSON.parse(localStorage.getItem('lm_look') || 'null'); } catch (e) { return null; } })(),
@@ -84,7 +84,7 @@ class Pool {
     this.rr = 0;
   }
   spawn(i) {
-    const w = new Worker('./worker.js', { type: 'module' });
+    const w = new Worker(`./worker.js?v=${APP_VERSION}`, { type: 'module' });
     w.idx = i; w.pending = new Map(); w.queue = []; w.running = 0; w.rid = 0;
     w.onmessage = (e) => {
       const m = e.data;
@@ -155,7 +155,17 @@ function presetChips(st, pr = null) {
 }
 
 async function loadPresets() {
-  S.presets = await db.listPresets();
+  S.userPresets = await db.listPresets();
+  let adaptive = [];
+  try {
+    const response = await fetch('./looks/cvatik.json');
+    if (response.ok) {
+      const profiles = await response.json();
+      if (Array.isArray(profiles)) adaptive = profiles.filter((x) => x && x.version === 1 && typeof x.id === 'string' && typeof x.name === 'string' && x.params && typeof x.params === 'object')
+        .map((profile) => ({ id: `adaptive:${profile.id}`, name: profile.name, thumb: profile.thumb, strength: 100, adaptiveLook: profile, builtin: true, created: 0 }));
+    }
+  } catch (e) { console.warn('built-in adaptive looks unavailable', e); }
+  S.presets = [...S.userPresets, ...adaptive.filter((x) => !S.userPresets.some((q) => q.id === x.id))];
   // older installs picked a preset before looks existed: keep using it
   if (!S.look && S.presetId && S.presets.find((p) => p.id === S.presetId)) S.look = { kind: 'preset', id: S.presetId };
 }
@@ -163,14 +173,14 @@ async function loadPresets() {
 function renderPresets() {
   const v = $('#view-presets');
   v.innerHTML = '';
-  if (!S.presets.length) {
+  if (!S.userPresets.length) {
     v.append(h(`<div class="empty"><b>No references yet</b>Pick a photo with the look you want, or import a Lightroom preset (.xmp or .lrtemplate) to apply its exact values.<br><br><button class="primary" id="newPresetEmpty">New reference photo</button><br><br><button id="importLREmpty">Import Lightroom preset</button></div>`));
     $('#newPresetEmpty').onclick = () => $('#pickRef').click();
     $('#importLREmpty').onclick = () => $('#pickLR').click();
     return;
   }
   const list = h('<div class="preset-list"></div>');
-  for (const p of S.presets) {
+  for (const p of S.userPresets) {
     const el = h(`<div class="preset ${S.look && S.look.kind === 'preset' && S.look.id === p.id ? 'sel' : ''}">
       <div class="ph"><img src="${p.thumb}" alt=""><div style="min-width:0"><div class="nm">${esc(p.name)}</div>
       <div class="muted small">Default match strength ${p.strength}%</div>${presetChips(p.stats, p)}</div></div>
@@ -294,7 +304,7 @@ async function restorePresets() {
       const p = JSON.parse(await drive.download(f.id));
       if ((!p.stats && !p.lr) || !p.id) continue;
       p.driveId = f.id;
-      if (!S.presets.find((q) => q.id === p.id)) { await db.putPreset(p); n++; }
+      if (!S.userPresets.find((q) => q.id === p.id)) { await db.putPreset(p); n++; }
     } catch (e) { /* skip */ }
   }
   await loadPresets();
@@ -331,7 +341,7 @@ function resetPhotoLook(p) {
   cancelPhotoSolve(p);
   const retained = keptEdits(p.params);
   p.params = { ...defaultParams(), ...retained };
-  p.solved = null; p.solvedLook = NONE_LOOK; p.finish = undefined; p.finishStrength = undefined; p.strength = 100;
+  p.solved = null; p.solvedLook = NONE_LOOK; p.finish = undefined; p.finishStrength = undefined; p.strength = 100; p.skinProtection = 100;
   p.style = null; p.regions = null; p.targets = null; p.after = null; p.loss = null; p.model = null; p.acceptance = null;
   delete p.error; delete p.errRec;
   if (p.before) p.status = 'done';
@@ -372,7 +382,7 @@ function setLook(l) {
     // Invalidate an in-flight solve before changing its inputs; its result must
     // never be committed after the global style has moved on.
     cancelPhotoSolve(ph);
-    ph.look = null; ph.finish = undefined; ph.finishStrength = undefined; ph.strength = pr ? pr.strength : 100;
+    ph.look = null; ph.finish = undefined; ph.finishStrength = undefined; ph.strength = pr ? pr.strength : 100; ph.skinProtection = 100;
     if (ph.before && ['done', 'exported', 'ready', 'solving', 'error'].includes(ph.status)) ph.status = 'ready';
   }
   if (S.photos.length === 1) S.autoOpen = true;
@@ -461,15 +471,16 @@ function referenceCards(current, onPick) {
     const list = h('<div class="rcards"></div>');
     for (const pr of S.presets) {
       const on = current && current.kind === 'preset' && current.id === pr.id;
-      const b = h(`<button class="rcard ${on ? 'on' : ''}"><img src="${pr.thumb}" alt=""><span>${esc(pr.name)}</span>${pr.lr ? '<em>Lightroom</em>' : ''}</button>`);
+      const b = h(`<button class="rcard ${on ? 'on' : ''}"><img src="${pr.thumb}" alt=""><span>${esc(pr.name)}</span>${pr.adaptiveLook ? '<em>Adaptive</em>' : pr.lr ? '<em>Lightroom</em>' : ''}</button>`);
       b.onclick = () => onPick({ kind: 'preset', id: pr.id });
       list.append(b);
     }
     wrap.append(list);
+    if (S.presets.some((pr) => pr.adaptiveLook)) wrap.append(h('<p class="muted small adaptive-credit">Adaptive looks are measured from example photos on the <a href="https://www.cvatik.com/demo" target="_blank" rel="noopener">Cvatik demo</a>; they do not include its paid original preset files.</p>'));
   } else {
     wrap.append(h('<p class="muted small" style="margin:4px 0 10px">Pick a photo whose look you want. Each of your photos gets its own edit toward it.</p>'));
   }
-  const acts = h(`<div class="row wrap"><button class="primary" data-a="ref">+ Reference photo</button><button data-a="lr">Import Lightroom preset</button>${S.presets.length ? '<button class="ghost" data-a="manage">Manage</button>' : ''}</div>`);
+  const acts = h(`<div class="row wrap"><button class="primary" data-a="ref">+ Reference photo</button><button data-a="lr">Import Lightroom preset</button>${S.userPresets.length ? '<button class="ghost" data-a="manage">Manage</button>' : ''}</div>`);
   acts.onclick = (e) => {
     const a = e.target.dataset.a;
     if (a === 'ref') $('#pickRef').click();
@@ -559,7 +570,7 @@ async function addPhotos(files) {
   const pr = look && look.kind === 'preset' ? presetById(look.id) : null;
   if (!S.photos.length && files.length === 1) S.autoOpen = true;
   for (const file of files) {
-    const p = { id: uid(), file, name: file.name || 'photo.jpg', status: 'loading', strength: pr ? pr.strength : 100, worker: pool.assign() };
+    const p = { id: uid(), file, name: file.name || 'photo.jpg', status: 'loading', strength: pr ? pr.strength : 100, skinProtection: 100, worker: pool.assign() };
     S.photos.push(p);
     pool.call(p.worker, 'load', { id: p.id, file }).then((r) => {
       p.thumbURL = blobURL(r.thumb); p.before = r.stats; p.w = r.width; p.h = r.height; p.converted = r.converted; p.mask = r.mask; p.faceErr = r.faceErr; p.cull = r.cull; S.scenesKey = null; noteVision(r, file);
@@ -578,6 +589,7 @@ function solveArgs(p) {
   if (!look || isNoneLook(look)) return null;
   const split = p.split !== false;
   const pr = presetById(look.id);
+  if (pr?.adaptiveLook) return { adaptiveLook: pr.adaptiveLook, strength: p.strength / 100, skinProtection: (p.skinProtection ?? 100) / 100, split };
   const assist = S.settings.modelUrl && !pr.lr && pr.thumb;
   return { refStats: pr.stats, lrParams: pr.lr ? pr.lrParams : null, strength: p.strength / 100, finish: 'off', split, ...(assist ? { modelUrl: S.settings.modelUrl, refThumb: pr.thumb } : {}) };
 }
@@ -585,6 +597,7 @@ function solveArgs(p) {
 // References saved before subject/background existed: measure the split once from the saved thumbnail.
 const upgrading = new Map();
 function ensurePresetRegions(pr) {
+  if (pr?.builtin) return Promise.resolve();
   const stats = pr?.stats;
   const current = stats?.matchVersion === 4 && stats.labTransfer?.version === 1 && Number.isFinite(stats.signature?.halation);
   if (!pr || pr.lr || !pr.stats || current || !pr.thumb) return Promise.resolve();
@@ -604,10 +617,12 @@ function ensurePresetRegions(pr) {
 
 // hand edits the style doesn't solve: they survive Redo and a style change
 const KEEP_KEYS = ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points'];
-const keptEdits = (params) => Object.fromEntries(KEEP_KEYS.filter((k) => params && params[k] != null).map((k) => [k, structuredClone(params[k])]));
+const keptEdits = (params) => Object.fromEntries(KEEP_KEYS.filter((k) => params && params[k] != null)
+  .map((k) => [k, structuredClone(k === 'points' ? params[k].filter(point => !point.auto) : params[k])]));
 
 function referenceCheckArgs(p) {
   const args = solveArgs(p);
+  if (args?.adaptiveLook) return { refStats: null, strength: args.strength };
   return { refStats: args?.lrParams ? null : args?.refStats || null, strength: args?.strength ?? 1 };
 }
 
@@ -659,7 +674,7 @@ function solvePhoto(p, { priority = false } = {}) {
       if (solveRuns.get(p) !== run || JSON.stringify(p.geom || null) !== geometry || p.mask?.ver !== maskVersion) return null;
     }
     if (r.model && !r.model.ok) toast(`Model assist failed, matched without it: ${r.model.error}`);
-    Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, acceptance: r.acceptance || null, scene: r.scene, timings: r.timings, guardScale: r.guardScale, model: r.model, style: r.style, regions: r.regions, mask: r.mask || p.mask, status: 'done' });
+    Object.assign(p, { params: r.params, solved: structuredClone(r.params), targets: r.targets, before: r.before, after: r.after, loss: r.loss, acceptance: r.acceptance || null, scene: r.scene, timings: r.timings, guardScale: r.guardScale, model: r.model, style: r.style, regions: r.regions, adaptive: r.adaptive ? { ...r.adaptive, normalise: r.normalise } : null, mask: r.mask || p.mask, status: 'done' });
     rerenderMatchSoon();
     // one photo in, style picked: go straight to the editor
     if (S.autoOpen && S.photos.length === 1 && !D && S.tab === 'match') { S.autoOpen = false; openDetail(p); }
@@ -702,7 +717,7 @@ function numbersTable(p) {
   const pr = presetOf(p);
   const b = p.before, a = p.after, T = p.targets, r = pr?.stats;
   if (!b || !a) return '';
-  if (!T) {
+  if (!T?.tone?.pct || !T?.zones) {
     // No saved reference is available for this match.
     const st = p.style, row2 = (label, bv, av, tv = '') => `<tr><td>${label}</td><td>${bv}</td><td>${av}</td><td>${tv}</td></tr>`;
     const newClip2 = (Math.max(0, a.tone.clipHi - b.tone.clipHi) * 100).toFixed(2) + ' / ' + (Math.max(0, a.tone.clipLo - b.tone.clipLo) * 100).toFixed(2);
@@ -1401,6 +1416,90 @@ function bindWheels() {
 
 const strengthRow = (id, label, v, max) => `<div class="strength"><span class="muted small slbl">${label}</span><input type="range" id="${id}" min="0" max="${max}" step="5" value="${v}"><output id="${id}Out">${v}%</output></div>`;
 
+async function photoFingerprint(p) {
+  const bytes = await crypto.subtle.digest('SHA-256', await p.file.arrayBuffer());
+  return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+async function recipeDownload(p) {
+  const pr = presetOf(p);
+  const mask = p.worker == null ? null : (await pool.call(p.worker, 'maskRecipe', { id: p.id }, { priority: true })).recipe;
+  const recipe = {
+    version: 1,
+    sourceFingerprint: await photoFingerprint(p), source: { name: p.name, width: p.w, height: p.h },
+    look: pr?.adaptiveLook ? { id: pr.adaptiveLook.id, version: pr.adaptiveLook.version, name: pr.adaptiveLook.name } : { id: pr?.id || null, name: pr?.name || null },
+    params: p.params || defaultParams(), strength: p.strength ?? 100,
+    skinProtection: p.skinProtection ?? 100, geom: p.geom || null, mask,
+  };
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(recipe, null, 2)], { type: 'application/json' }));
+  a.download = `${baseName(p.name)}.lookmatch.json`; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function validRecipeValue(value, depth = 0) {
+  if (depth > 12) return false;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (value == null || typeof value === 'string' || typeof value === 'boolean') return typeof value !== 'string' || value.length <= 200;
+  if (Array.isArray(value)) return value.length <= 2048 && value.every((v) => validRecipeValue(v, depth + 1));
+  if (typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const entries = Object.entries(value);
+  return entries.length <= 256 && entries.every(([k, v]) => k.length <= 80 && validRecipeValue(v, depth + 1));
+}
+function validRecipeParams(params, local = false) {
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return false;
+  const sliders = local ? LOCAL_SLIDERS : SLIDERS;
+  for (const slider of sliders) if (Object.hasOwn(params, slider.key) &&
+      (typeof params[slider.key] !== 'number' || !Number.isFinite(params[slider.key]) ||
+       params[slider.key] < slider.ui[0] || params[slider.key] > slider.ui[1])) return false;
+  for (const key of CURVE_KEYS) if (params[key] != null) {
+    const curve = params[key];
+    if (!Array.isArray(curve) || curve.length < 2 || !curve.every((point, i) => Array.isArray(point) && point.length === 2 &&
+        point.every(v => Number.isFinite(v) && v >= 0 && v <= 255) && (!i || point[0] > curve[i - 1][0]))) return false;
+  }
+  for (const key of ['points', 'heals']) if (params[key] != null && !Array.isArray(params[key])) return false;
+  if (params.local != null && (local || typeof params.local !== 'object' || Array.isArray(params.local) ||
+      !Object.entries(params.local).every(([key, value]) => REGIONS.includes(key) && validRecipeParams(value, true)))) return false;
+  if (params.skinMatch != null && (typeof params.skinMatch !== 'object' || Array.isArray(params.skinMatch) ||
+      (params.skinMatch.version === 2 && (!Array.isArray(params.skinMatch.people) ||
+       !params.skinMatch.people.every(person => Number.isInteger(person.id) && Array.isArray(person.zones)))))) return false;
+  return true;
+}
+async function recipeLoad(file, p) {
+  if (!file || file.size > 25_000_000) throw new Error('Recipe file is too large');
+  const recipe = JSON.parse(await file.text());
+  const allowed = new Set([...Object.keys(defaultParams()), ...CURVE_KEYS, 'points', 'heals', 'skinTexture', 'skinClarity', 'skinTone', 'skinMatch', 'curveAuto', 'referenceMethod', 'referenceTransfer', 'referenceDetail', 'local']);
+  if (recipe?.version !== 1 || !recipe.params || typeof recipe.params !== 'object' || Array.isArray(recipe.params) ||
+      !Object.keys(recipe.params).every((k) => allowed.has(k)) || !validRecipeValue(recipe.params) || !validRecipeParams(recipe.params) ||
+      !Number.isFinite(recipe.strength) || recipe.strength < 0 || recipe.strength > 100 ||
+      !Number.isFinite(recipe.skinProtection) || recipe.skinProtection < 0 || recipe.skinProtection > 100 ||
+      (recipe.geom != null && (!validRecipeValue(recipe.geom) || !validRect(recipe.geom, p.w, p.h, recipe.geom.angle || 0)))) throw new Error('This adjustment recipe is invalid or unsupported');
+  if (recipe.sourceFingerprint !== await photoFingerprint(p)) throw new Error('This recipe belongs to a different source photo');
+  const selected = recipe.look?.id ? presetById(recipe.look.id.startsWith('adaptive:') ? recipe.look.id : `adaptive:${recipe.look.id}`) : null;
+  const pr = selected?.adaptiveLook ? selected : null;
+  if (recipe.look?.id && recipe.look?.version && (!pr || pr.adaptiveLook.version !== recipe.look.version)) throw new Error('The recipe uses a built-in look that is not available in this version');
+  if (recipe.look?.id && !pr && !presetById(recipe.look.id)) throw new Error('The reference used by this recipe is no longer saved');
+  commitEdit();
+  const before = editSnap(p), oldGeom = p.geom || null;
+  if (p.worker != null) {
+    try {
+      const g = await pool.call(p.worker, 'setGeom', { id: p.id, geom: recipe.geom || null }, { priority: true });
+      p.before = g.before;
+      if (recipe.mask) {
+        const m = await pool.call(p.worker, 'maskRecipe', { id: p.id, recipe: recipe.mask }, { priority: true });
+        p.mask = m.mask; p.before = m.before;
+      }
+    } catch (e) {
+      await pool.call(p.worker, 'setGeom', { id: p.id, geom: oldGeom }, { priority: true }).catch(() => {});
+      throw e;
+    }
+  }
+  if (pr) { p.look = { kind: 'preset', id: pr.id }; D.styleKind = 'preset'; }
+  else if (recipe.look?.id && presetById(recipe.look.id)) { p.look = { kind: 'preset', id: recipe.look.id }; D.styleKind = 'preset'; }
+  p.params = structuredClone(recipe.params); p.solved = structuredClone(recipe.params);
+  p.strength = recipe.strength; p.skinProtection = recipe.skinProtection; p.geom = recipe.geom || null;
+  p.status = 'done'; p.adaptive = null; D.userEdited = true;
+  recordLookResetUndo(before); refreshDetail();
+}
+
 // The editor's style selection applies to this photo only.
 function styleCard(p) {
   const look = lookOf(p), requestedKind = (D && D.styleKind) || look?.kind || 'preset';
@@ -1410,10 +1509,12 @@ function styleCard(p) {
   if (kind === 'none') {
     body = '<p class="muted small" style="margin:8px 0 0">Use the photo as it was captured. Manual edits remain available below.</p>';
   } else {
-    body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
-      <p class="muted small" style="margin:8px 0 0">Match this photo to the selected reference. Tone and color are fitted separately, then skin is corrected. Manual controls adjust the result; check measurements and preview.</p>
-      ${pr ? `${strengthRow('str', 'Match', p.strength, 100)}<button id="workflowNeedham" class="ghost small" style="margin-top:8px">Needham workflow</button>`
+    body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}${q.adaptiveLook ? '<em>Adaptive</em>' : ''}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
+      <p class="muted small" style="margin:8px 0 0">${pr?.adaptiveLook ? 'This look adapts tone and color to each photo. Manual controls adjust the result; preview the effect.' : 'Match this photo to the selected reference. Tone and color are fitted separately, then skin is corrected. Manual controls adjust the result; check measurements and preview.'}</p>
+      ${S.presets.some((q) => q.adaptiveLook) ? '<p class="muted small adaptive-credit">Adaptive looks are measured from example photos on the <a href="https://www.cvatik.com/demo" target="_blank" rel="noopener">Cvatik demo</a>; they do not include its paid original preset files.</p>' : ''}
+      ${pr ? `${strengthRow('str', pr.adaptiveLook ? 'Amount' : 'Match', p.strength, 100)}${pr.adaptiveLook ? `${strengthRow('skinProtection', 'Skin protection', p.skinProtection ?? 100, 100)}<div class="adaptive-status muted small">${p.adaptive ? `Per-photo fit: ${f1(p.adaptive.normalise?.exposure)} EV · WB ${f1(p.adaptive.normalise?.temp)} / ${f1(p.adaptive.normalise?.tint)} · skin protection ${p.adaptive.skinProtected ? 'active' : 'unavailable'} · mask ${p.adaptive.maskAvailable ? 'available' : 'unavailable'}${p.adaptive.warning ? ` · ${esc(p.adaptive.warning)}` : ''}` : 'This look adapts exposure, white balance, and skin for each photo.'}</div>` : ''}${pr.adaptiveLook ? '' : '<button id="workflowNeedham" class="ghost small" style="margin-top:8px">How matching works</button>'}`
     : '<p class="muted small" style="margin:8px 0 0">Pick a reference to copy its look onto this photo.</p>'}`;
+    body += `<div class="row recipe-actions"><button type="button" id="saveRecipe">Save adjustment recipe</button><button type="button" id="loadRecipe">Load adjustment recipe</button><input id="recipeFile" type="file" accept="application/json,.json" hidden></div>`;
   }
   const status = p.status === 'solving'
     ? '<p class="muted small" role="status" style="margin:8px 0 0">Applying style…</p>'
@@ -1446,16 +1547,17 @@ function renderStyleCard() {
     const b = e.target.closest('button');
     if (!b) return;
     if (b.dataset.a === 'ref') return $('#pickRef').click();
-    const [kind, id] = b.dataset.l.split(':');
+    if (!b.dataset.l) return;
+    const [kind, ...idParts] = b.dataset.l.split(':');
+    const id = idParts.join(':');
     const l = { kind, id };
     p.look = l; p.finish = undefined; p.finishStrength = undefined;
     if (kind === 'preset') p.strength = presetById(id)?.strength ?? 100;
     resolve();
   };
-  if ($('#workflowNeedham', box)) $('#workflowNeedham', box).onclick = () => openSheet(`<h2>Needham workflow</h2>
-    <p class="muted small">Auto Adjust applies this order to the selected reference: set the palette, lower basic tonal contrast, fit tone and RGB curves for contrast and color separation, then review exposure and skin white balance from the processed photo.</p>
-    <p class="muted small">This follows Gerard Needham’s published written curve guidance. It does not claim to recreate a specific video look or preset.</p>
-    <p class="muted small">Sources: <a href="https://gerardneedham.com/products/analog-curve-collection" target="_blank" rel="noopener">Analog Curve Collection</a> · <a href="https://www.youtube.com/watch?v=BEJgKPJI9uY" target="_blank" rel="noopener">Gerard Needham skin tones video</a></p>
+  if ($('#workflowNeedham', box)) $('#workflowNeedham', box).onclick = () => openSheet(`<h2>How matching works</h2>
+    <p class="muted small">The photo is measured and its masks are detected before fitting the selected reference. Tone and color are fitted separately, then skin is corrected. Auto Adjust recalculates the selected look using the current Amount and masks.</p>
+    <p class="muted small">With no look selected, Auto Adjust makes a measured light and white balance correction. It does not add a default portrait curve or saturation treatment.</p>
     <div class="acts"><button class="primary" data-close>Done</button></div>`);
   for (const [id, key] of [['str', 'strength']]) {
     const r = $(`#${id}`, box);
@@ -1463,6 +1565,24 @@ function renderStyleCard() {
     r.oninput = () => ($(`#${id}Out`, box).textContent = `${r.value}%`);
     r.onchange = () => { p[key] = +r.value; resolve(); };
   }
+  const protection = $('#skinProtection', box);
+  if (protection) {
+    protection.oninput = () => ($('#skinProtectionOut', box).textContent = `${protection.value}%`);
+    protection.onchange = () => { p.skinProtection = +protection.value; resolve(); };
+  }
+  $('#saveRecipe', box)?.addEventListener('click', async (e) => {
+    e.currentTarget.disabled = true;
+    try { await recipeDownload(p); toast('Adjustment recipe saved'); }
+    catch (error) { toast(error.message || 'Could not save recipe', 4500); }
+    finally { if ($('#saveRecipe', box)) $('#saveRecipe', box).disabled = false; }
+  });
+  const recipeFile = $('#recipeFile', box);
+  $('#loadRecipe', box)?.addEventListener('click', () => recipeFile?.click());
+  if (recipeFile) recipeFile.onchange = async () => {
+    try { await recipeLoad(recipeFile.files?.[0], p); toast('Adjustment recipe loaded'); }
+    catch (e) { toast(e.message || 'Could not load recipe', 4500); }
+    finally { recipeFile.value = ''; }
+  };
   if ($('#lookAll', box)) $('#lookAll', box).onclick = () => {
     const l = lookOf(p);
     if (isNoneLook(l)) { setLook(NONE_LOOK); toast(`Plain photo on all ${S.photos.length} photos`); return; }
@@ -1511,7 +1631,7 @@ function openDetail(p) {
     </div></main>
     <aside class="dpanel" id="dbody">
       <div class="panel-head"><div class="panel-topline"><strong class="panel-title">Controls</strong><button class="panel-toggle" id="panelToggle" type="button" aria-label="Collapse controls" aria-expanded="true">‹</button></div>
-        <div class="edit-actions"><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="Reference: set palette, lower basic contrast, fit tone and RGB curves, then review exposure and skin white balance. Without a reference, apply a clean portrait correction.">Auto Adjust</button><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
+        <div class="edit-actions"><button id="cropBtn" class="${p.geom ? 'on' : ''}">Crop</button><button id="autoAdjust" class="primary" title="${presetOf(p)?.adaptiveLook ? 'Apply the selected adaptive look to this photo.' : 'Reapply the selected reference. Without a reference, adjust exposure and white balance from this photo.'}">Auto Adjust</button><button id="undo" disabled title="Undo the last edit (Ctrl+Z)">Undo</button><button id="reMatch" title="Match this photo to its reference again">Re-match</button></div>
         <nav class="ptabs" id="ptabs" aria-label="Editing sections">${PAGES.map(([k, l]) => `<button data-p="${k}" title="${l}" aria-label="${l}"><span class="tab-icon" aria-hidden="true">${({ look: '◉', subject: '◌', light: '☼', color: '◐', retouch: '✦', more: '⋯' })[k]}</span><span class="tab-label">${l}</span></button>`).join('')}</nav>
       </div>
       <div class="pager" id="pager">
@@ -1544,26 +1664,32 @@ function openDetail(p) {
   $('#autoAdjust').onclick = async () => {
     const btn = $('#autoAdjust'); btn.disabled = true; btn.textContent = 'Adjusting…';
     try {
-      const sa = solveArgs(p), rs = sa?.refStats;
-      // the reference's measured tone, skin and colour bands guide Auto Adjust
-      const look = rs ? { kind: 'reference', refStats: { tone: { pct: rs.tone?.pct }, bands: rs.bands, bandsBg: rs.bandsBg, zones: rs.zones, skin: rs.skin, color: { meanChroma: rs.color?.meanChroma } } } : null;
-      const r = await pool.call(p.worker, 'autoAdjust', { id: p.id, params: structuredClone(p.params || defaultParams()), look }, { priority: true });
       if (!D || D.p !== p) return;
-      const preservedReference = r.preservedReference === true;
-      delete r.preservedReference;
-      if (preservedReference) {
-        toast('Reference match preserved. Use Re-match to recalculate it.');
+      const before = editSnap(p);
+      const hasReference = !!solveArgs(p);
+      if (hasReference) {
+        // Re-solve from the selected reference so the full stats and current look options
+        // reach the same pipeline used by Re-match. solvePhoto replaces all owned params.
+        const r = await solvePhoto(p, { priority: true });
+        if (!D || D.p !== p || !r || p.status !== 'done') return;
+        D.userEdited = true;
+        recordLookResetUndo(before);
+        refreshDetail(); D.goPage('light');
+        toast('Selected reference applied. Undo restores the previous settings.');
         return;
       }
+      const r = await pool.call(p.worker, 'autoAdjust', { id: p.id, params: structuredClone(p.params || defaultParams()), look: null }, { priority: true });
+      if (!D || D.p !== p) return;
       delete (p.params ||= defaultParams()).curveAuto;
       Object.assign(p.params ||= defaultParams(), r);
       p.solved = structuredClone(p.params); p.status = 'done'; D.userEdited = true;
+      recordLookResetUndo(before);
       refreshDetail(); D.goPage('light');
       const visible = new Set(['Tone', 'Tone curve', 'Presence', 'HSL hue', 'HSL saturation', 'HSL luminance']);
       $('#sliders').querySelectorAll('details.group').forEach((group) => {
         if (visible.has($('summary', group)?.textContent.trim())) group.open = true;
       });
-      toast(look ? 'Reference workflow applied: palette, reduced basic contrast, tone/RGB curves, then exposure and skin white balance. Undo puts it back.' : 'Auto Adjust applied: curves, point colors and HSL set a clean portrait baseline. Undo puts it back.');
+      toast('Auto Adjust applied: exposure and white balance corrected from this photo. Undo puts it back.');
     } catch (e) { toast(e.message, 4500); logError('auto adjust', e, p.file); }
     finally { if ($('#autoAdjust')) { $('#autoAdjust').disabled = false; $('#autoAdjust').textContent = 'Auto Adjust'; } }
   };
@@ -1696,7 +1822,7 @@ function jumpToSlider(k) {
 // Undo: every edit ends in scheduleMeasure, so its debounce is where an edit counts as finished
 // (a whole slider drag is one step). Snapshots are the photo's params, as JSON, per open photo.
 const UNDO_MAX = 50;
-const editSnap = (p) => JSON.stringify({ params: p.params || null, solved: p.solved || null, look: p.look ?? null, finish: p.finish ?? null, finishStrength: p.finishStrength ?? null, strength: p.strength ?? null, split: p.split ?? null });
+const editSnap = (p) => JSON.stringify({ params: p.params || null, solved: p.solved || null, look: p.look ?? null, finish: p.finish ?? null, finishStrength: p.finishStrength ?? null, strength: p.strength ?? null, skinProtection: p.skinProtection ?? 100, split: p.split ?? null, geom: p.geom ?? null });
 function commitEdit() {
   if (!D || !D.hist) return;
   const s = editSnap(D.p);
@@ -1717,20 +1843,28 @@ function recordLookResetUndo(before) {
   syncUndo();
 }
 function syncUndo() { if (D && $('#undo')) $('#undo').disabled = !D.hist.stack.length; }
-function undo() {
+async function undo() {
   if (!D || D.crop) return;
+  const photo = D.p;
   commitEdit();
   const prev = D.hist.stack.pop();
   if (!prev) return;
   D.hist.cur = prev;
   const o = JSON.parse(prev);
-  D.p.params = o.params || defaultParams(); D.p.solved = o.solved || null;
-  if (Object.hasOwn(o, 'look')) D.p.look = o.look;
-  if (Object.hasOwn(o, 'finish')) D.p.finish = o.finish;
-  if (Object.hasOwn(o, 'finishStrength')) D.p.finishStrength = o.finishStrength;
-  if (Object.hasOwn(o, 'strength')) D.p.strength = o.strength;
-  if (Object.hasOwn(o, 'split')) D.p.split = o.split;
-  D.p.solvedLook = lookOf(D.p);
+  photo.params = o.params || defaultParams(); photo.solved = o.solved || null;
+  if (Object.hasOwn(o, 'look')) photo.look = o.look;
+  if (Object.hasOwn(o, 'finish')) photo.finish = o.finish;
+  if (Object.hasOwn(o, 'finishStrength')) photo.finishStrength = o.finishStrength;
+  if (Object.hasOwn(o, 'strength')) photo.strength = o.strength;
+  if (Object.hasOwn(o, 'skinProtection')) photo.skinProtection = o.skinProtection;
+  if (Object.hasOwn(o, 'split')) photo.split = o.split;
+  if (Object.hasOwn(o, 'geom')) {
+    photo.geom = o.geom;
+    try { const g = await pool.call(photo.worker, 'setGeom', { id: photo.id, geom: photo.geom }, { priority: true }); photo.before = g.before; }
+    catch (e) { toast(`Could not restore crop: ${e.message}`, 4500); }
+    if (D?.p !== photo) return;
+  }
+  D.p.solvedLook = lookOf(photo);
   D.userEdited = true;
   syncUndo();
   refreshDetail();
@@ -2302,7 +2436,7 @@ function renderSettings() {
   if ($('#sErrCopy')) $('#sErrCopy').onclick = () => copyText(errs.map(errorText).join('\n\n'));
   if ($('#sErrClear')) $('#sErrClear').onclick = () => { localStorage.removeItem(ERR_KEY); renderSettings(); };
   if ($('#sDisc')) $('#sDisc').onclick = () => { drive.disconnect(); renderSettings(); };
-  if ($('#sBackup')) $('#sBackup').onclick = async () => { for (const p of S.presets) await backupPreset(p); toast(`Backed up ${S.presets.length} preset(s) to Drive › LookMatch › presets`); };
+  if ($('#sBackup')) $('#sBackup').onclick = async () => { for (const p of S.userPresets) await backupPreset(p); toast(`Backed up ${S.userPresets.length} preset(s) to Drive › LookMatch › presets`); };
   if ($('#sRestore')) $('#sRestore').onclick = async () => { try { const n = await restorePresets(); toast(`Restored ${n} preset(s)`); } catch (e) { toast(e.message); } };
 }
 
@@ -2367,7 +2501,7 @@ $('#pickPhotos').onchange = (e) => { const fs = [...e.target.files]; e.target.va
   const r = drive.captureRedirect();
   await db.persist();
   await loadPresets();
-  if (r?.ok) { toast('Google Drive connected'); setTab('match'); for (const p of S.presets) if (!p.driveId) backupPreset(p); }
+  if (r?.ok) { toast('Google Drive connected'); setTab('match'); for (const p of S.userPresets) if (!p.driveId) backupPreset(p); }
   else if (r?.error) { toast(`Drive sign-in failed: ${r.error}`); setTab('settings'); }
   else setTab('match');
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});

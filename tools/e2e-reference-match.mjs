@@ -28,52 +28,34 @@ try {
   await fs.writeFile(path.join(output, 'match.jpg'), Uint8Array.from(result.bytes));
   delete result.bytes;
   await page.screenshot({ path: path.join(output, 'match.png') });
-  // Auto Adjust must execute the complete Needham workflow even over a LAB reference baseline.
+  // Auto Adjust must rerun the selected-reference solve instead of layering defaults over old params.
   await page.waitForFunction(() => window.__lm.D()?.edit);
-  const isolation = await page.evaluate(async () => {
-    const { S, pool } = window.__lm, photo = S.photos[0];
-    const look = { kind: 'reference', refStats: S.presets.find(p => p.name === 'Reference pair').stats };
-    const clean = structuredClone(photo.params), dirty = structuredClone(clean);
+  await page.evaluate(() => {
+    const photo = window.__lm.S.photos[0];
     const oldCurve = [[0, 30], [128, 180], [255, 240]];
-    Object.assign(dirty, { curve: oldCurve, curveR: oldCurve, curveG: oldCurve, curveB: oldCurve,
+    Object.assign(photo.params, { curve: oldCurve, curveR: oldCurve, curveG: oldCurve, curveB: oldCurve,
       saturation: -40, vibrance: 60, curveSaturation: 180 });
     for (const region of ['subject', 'background']) {
-      (dirty.local ||= {})[region] = { ...dirty.local?.[region], curve: oldCurve, curveR: oldCurve,
+      (photo.params.local ||= {})[region] = { ...photo.params.local?.[region], curve: oldCurve, curveR: oldCurve,
         saturation: -25, vibrance: 35 };
-      (clean.local ||= {})[region] ||= {};
     }
-    const a = await pool.call(photo.worker, 'autoAdjust', { id: photo.id, params: clean, look });
-    const b = await pool.call(photo.worker, 'autoAdjust', { id: photo.id, params: dirty, look });
-    const renderHash = async params => {
-      const { edited } = await pool.call(photo.worker, 'preview', { id: photo.id, params, side: 512 });
-      const canvas = document.createElement('canvas');
-      canvas.width = edited.width; canvas.height = edited.height;
-      const context = canvas.getContext('2d'); context.drawImage(edited, 0, 0); edited.close();
-      let hash = 2166136261;
-      for (const byte of context.getImageData(0, 0, canvas.width, canvas.height).data) hash = Math.imul(hash ^ byte, 16777619);
-      return hash;
-    };
-    return { a, b, cleanPixels: await renderHash({ ...clean, ...a }), dirtyPixels: await renderHash({ ...dirty, ...b }) };
   });
-  assert.deepEqual(isolation.b, isolation.a, 'Old curves and presence must not affect the new fit');
-  assert.equal(isolation.dirtyPixels, isolation.cleanPixels, 'Old adjustments must not change rendered pixels');
   const beforeAuto = await page.evaluate(() => JSON.stringify(window.__lm.S.photos[0].params));
   if (await page.locator('#panelToggle').getAttribute('aria-expanded') === 'false') await page.click('#panelToggle');
   await page.click('#autoAdjust');
   await page.waitForFunction(() => !document.querySelector('#autoAdjust').disabled, null, { timeout: 120000 });
   const auto = await page.evaluate(() => structuredClone(window.__lm.S.photos[0].params));
-  assert.ok(auto.contrast < 0, 'Needham reduces basic contrast');
-  for (const channel of ['curve', 'curveR', 'curveG', 'curveB']) assert.ok(auto[channel]?.length >= 2, `Needham fits ${channel}`);
+  for (const channel of ['curve', 'curveR', 'curveG', 'curveB']) assert.deepEqual(auto[channel], result.params[channel], `${channel} comes from the selected-reference solve`);
   assert.equal(auto.referenceMethod, 'lab-distribution');
   assert.deepEqual(auto.referenceTransfer, result.params.referenceTransfer);
-  assert.equal(auto.saturation, 0);
-  assert.equal(auto.vibrance, 0);
-  assert.equal(auto.curveSaturation, 100);
+  assert.notEqual(auto.saturation, -40, 'Old global saturation is cleared');
+  assert.notEqual(auto.vibrance, 60, 'Old global vibrance is cleared');
+  assert.notEqual(auto.curveSaturation, 180, 'Old master curve saturation is cleared');
   for (const region of ['subject', 'background']) {
     assert.deepEqual(auto.local[region].referenceTransfer, result.params.local?.[region]?.referenceTransfer,
       'Auto Adjust retains per-region LAB baseline');
-    assert.equal(auto.local[region].saturation, 0);
-    assert.equal(auto.local[region].vibrance, 0);
+    assert.notEqual(auto.local[region].saturation, -25, 'Old local saturation is cleared');
+    assert.notEqual(auto.local[region].vibrance, 35, 'Old local vibrance is cleared');
     assert.ok(!auto.local[region].curve && !auto.local[region].curveR);
   }
   assert.notEqual(JSON.stringify(auto), beforeAuto, 'Button applies workflow settings');
@@ -85,8 +67,8 @@ try {
   await fs.writeFile(path.join(output, 'auto-adjust.jpg'), Uint8Array.from(autoJpeg));
   await page.click('#undo');
   assert.equal(await page.evaluate(() => JSON.stringify(window.__lm.S.photos[0].params)), beforeAuto, 'Undo restores all settings');
-  result.needham = { applied: true, undo: true, oldAdjustmentsIsolated: true,
-    pixelHash: isolation.cleanPixels, saturation: auto.saturation, vibrance: auto.vibrance,
+  result.needham = { applied: true, undo: true, selectedReferenceSolve: true,
+    saturation: auto.saturation, vibrance: auto.vibrance,
     contrast: auto.contrast, exposure: auto.exposure };
   assert.deepEqual(errors, []);
   assert.ok(result.params.skinMatch?.people?.length, 'Real pair must produce person-specific skin correction');
