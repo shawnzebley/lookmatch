@@ -80,11 +80,12 @@ export function referenceRegionTargets(ps) {
   return { version: 1, subject: measure(subject), background: measure(background) };
 }
 
-function regionalParams(params) {
+function regionalParams(params, adaptive = false) {
   const out = {};
   for (const { key } of LOCAL_SLIDERS) out[key] = params[key] || 0;
   for (const key of LOCAL_WHEEL_KEYS) out[key] = params[key] || 0;
   for (const key of ['curve', 'curveR', 'curveG', 'curveB']) if (params[key]) out[key] = params[key];
+  if (adaptive) out.curveSaturation = 0;
   out.curveAmount = 100;
   out.curveAuto = 'reference';
   return out;
@@ -110,11 +111,12 @@ export function solveMaskedReference(ps, refStats, opts = {}) {
   const params = {
     ...defaultParams(),
     curveAuto: 'reference',
+    curveSaturation: opts.adaptive ? 0 : 100,
     saturation: 0,
     temp: 0,
     local: {
-      subject: regionalParams(fitted.subject.params),
-      background: regionalParams(fitted.background.params),
+      subject: regionalParams(fitted.subject.params, opts.adaptive),
+      background: regionalParams(fitted.background.params, opts.adaptive),
     },
   };
   const before = regionStats(ps), after = regionStats(ps, processPixelSet(ps, params));

@@ -76,24 +76,27 @@ export function lm(fn, x0, lo, hi, { iters = 25, h = null, lambda0 = 1e-2 } = {}
 }
 
 // ---------------- targets ----------------------------------------------------------------------
-export function computeTargets(o, ref, { strength = 1 } = {}) {
+export function computeTargets(o, ref, { strength = 1, adaptive = false } = {}) {
   const s = Math.min(1, Math.max(0, strength));
   const anchor = o.tone.pct[50] + s * (ref.tone.pct[50] - o.tone.pct[50]);
   const pct = Object.fromEntries(PCTS.map((p) => [p, o.tone.pct[p] + s * (ref.tone.pct[p] - o.tone.pct[p])]));
-  const wbConf = Math.min(1, o.wb.confidence / 0.4) * Math.min(1, ref.wb.confidence / 0.4);
+  const hasNeutralReference = (o.wb.pixels || 0) >= 0.02 && (ref.wb.pixels || 0) >= 0.02;
+  const wbConf = adaptive && !hasNeutralReference ? 0 : Math.min(1, o.wb.confidence / 0.4) * Math.min(1, ref.wb.confidence / 0.4);
   const sw = s * wbConf;
   const wb = { a: o.wb.a + sw * (ref.wb.a - o.wb.a), b: o.wb.b + sw * (ref.wb.b - o.wb.b), weight: 0.3 + 0.7 * wbConf };
   const zones = {};
-  for (const z of ['shadows', 'midtones', 'highlights']) {
+  for (const z of adaptive ? [] : ['shadows', 'midtones', 'highlights']) {
     const mass = Math.min(o.zones[z].mass, ref.zones[z].mass);
     if (mass < 0.02) continue;
     const zs = s;
     zones[z] = { a: o.zones[z].a + zs * (ref.zones[z].a - o.zones[z].a), b: o.zones[z].b + zs * (ref.zones[z].b - o.zones[z].b), weight: Math.sqrt(Math.min(1, mass / 0.1)) };
   }
   const bands = {};
+  const sourceBands = adaptive ? (o.bandsAdaptive || o.bandsBg || o.bands) : o.bands;
+  const referenceBands = adaptive ? (ref.bandsAdaptive || ref.bandsBg || ref.bands) : ref.bands;
   for (const b of BANDS) {
-    const ob = o.bands[b], rb = ref.bands[b];
-    if (ob.weight < 0.008 || rb.weight < 0.008) continue;
+    const ob = sourceBands[b], rb = referenceBands[b];
+    if (ob.weight < (adaptive ? 0.015 : 0.008) || rb.weight < (adaptive ? 0.015 : 0.008)) continue;
     const dh = wrapDeg(rb.hue - ob.hue);
     bands[b] = {
       hue: wrapDeg(ob.hue + s * dh),
@@ -102,7 +105,7 @@ export function computeTargets(o, ref, { strength = 1 } = {}) {
       weight: Math.sqrt(Math.min(1, Math.min(ob.weight, rb.weight) / 0.05)),
     };
   }
-  const color = {
+  const color = adaptive ? null : {
     meanChroma: o.color.meanChroma + s * (ref.color.meanChroma - o.color.meanChroma),
     lowChroma: o.color.lowChroma + s * (ref.color.lowChroma - o.color.lowChroma),
   };
@@ -110,7 +113,7 @@ export function computeTargets(o, ref, { strength = 1 } = {}) {
     hi: Math.max(o.tone.clipHi, ref.tone.clipHi) + 0.001,
     lo: Math.max(o.tone.clipLo, ref.tone.clipLo) + 0.001,
   };
-  return { tone: { pct }, wb, zones, bands, color, clip, strength: s, anchor };
+  return { tone: { pct }, wb, zones, bands, color, clip, strength: s, anchor, adaptive };
 }
 
 // ---------------- stage residuals ------------------------------------------------------------------
@@ -135,7 +138,7 @@ function sampleIdx(n, count, pred, seed = 7) {
 // are the grayscale sRGB values after Exposure; its y values are the same grayscale values after the
 // fitted tonal shaping. This keeps Exposure available for brightness while curves carry the reference's
 // contrast, highlight, shadow, black-point, and white-point character.
-function toneTransferCurve(p) {
+function toneTransferCurve(p, adaptive = false) {
   const fl = fadeLevels(p), points = [];
   for (let i = 0; i <= 32; i++) {
     const inputL = i * 100 / 32;
@@ -148,6 +151,25 @@ function toneTransferCurve(p) {
   }
   if (points[0]?.[0] !== 0) points.unshift([0, points[0]?.[1] ?? 0]);
   if (points[points.length - 1]?.[0] !== 255) points.push([255, points[points.length - 1]?.[1] ?? 255]);
+  if (adaptive) {
+    // The fitted tone controls can reverse locally. A reversing RGB curve turns
+    // nearby input values into false contours, so project its samples onto the
+    // nearest gently increasing curve before spline interpolation.
+    const slope = Math.min(0.05, Math.max(0, (points.at(-1)[1] - points[0][1]) / 510));
+    const blocks = [];
+    for (let i = 0; i < points.length; i++) {
+      const weight = i === 0 || i === points.length - 1 ? 1000 : 1;
+      blocks.push({ first: i, last: i, sum: (points[i][1] - slope * points[i][0]) * weight, weight });
+      while (blocks.length > 1) {
+        const b = blocks.at(-1), a = blocks.at(-2);
+        if (a.sum / a.weight <= b.sum / b.weight) break;
+        a.last = b.last; a.sum += b.sum; a.weight += b.weight; blocks.pop();
+      }
+    }
+    for (const block of blocks) for (let i = block.first; i <= block.last; i++) {
+      points[i][1] = Math.max(0, Math.min(255, block.sum / block.weight + slope * points[i][0]));
+    }
+  }
 
   // Keep the automatically-created curve easy to inspect and edit without losing its shape.
   const keep = new Uint8Array(points.length); keep[0] = 1; keep[points.length - 1] = 1;
@@ -220,6 +242,7 @@ export function solve(ps, o, ref, opts = {}) {
   const t0 = performance.now();
   const T = computeTargets(o, ref, opts);
   const params = defaultParams();
+  if (opts.adaptive) params.curveSaturation = 0;
 
   // ---- stage A: tone (quantile mapping is exact for a monotonic luminance curve)
   let toneBias = Object.fromEntries(PCTS.map((p) => [p, 0]));
@@ -258,6 +281,7 @@ export function solve(ps, o, ref, opts = {}) {
 
   // ---- stage C: color (grading as Cartesian offsets, HSL, saturation, vibrance)
   const colorIdx = sampleIdx(ps.n, opts.colorSamples ?? 3000, null, 19);
+  const colorSourceTone = opts.adaptive ? measure(ps, ps, colorIdx).tone.pct : null;
   const ZN = ['shadow', 'midtone', 'highlight'];
   const CKEYS = ['saturation', 'vibrance', 'su', 'sv', 'mu', 'mv', 'hu', 'hv', ...HSL_KEYS];
   const toParams = (x, base) => {
@@ -280,7 +304,8 @@ export function solve(ps, o, ref, opts = {}) {
   const colorStage = (iters) => {
     const lo = [], hi = [];
     CKEYS.forEach((k) => {
-      if (/^[smh][uv]$/.test(k)) { lo.push(-100); hi.push(100); }
+      if (opts.adaptive && !HSL_KEYS.includes(k)) { lo.push(0); hi.push(0); }
+      else if (/^[smh][uv]$/.test(k)) { lo.push(-100); hi.push(100); }
       else if (HSL_KEYS.includes(k) && !T.bands[BANDS[HSL_KEYS.indexOf(k) % BANDS.length]]) { lo.push(0); hi.push(0); }
       else { const c = capRange(k); lo.push(c[0]); hi.push(c[1]); }
     });
@@ -296,6 +321,12 @@ export function solve(ps, o, ref, opts = {}) {
       processPixelSet(ps, p, colorIdx, cur);
       const st = measure(ps, cur, colorIdx);
       const r = [];
+      if (opts.adaptive) for (const q of [5, 25, 50, 75, 95]) {
+        // HSL luminance can undo the tone fit, especially after the master curve is
+        // serialized. Preserve the reference's percentile shift on this same sample.
+        const target = colorSourceTone[q] + T.tone.pct[q] - o.tone.pct[q];
+        r.push((st.tone.pct[q] - target) / 2 * Math.min(1, T.strength * 20));
+      }
       for (const z of ['shadows', 'midtones', 'highlights']) {
         const tz = T.zones[z];
         if (!tz) { r.push(0, 0); continue; }
@@ -304,10 +335,11 @@ export function solve(ps, o, ref, opts = {}) {
       for (const b of BANDS) {
         const tb = T.bands[b];
         if (!tb) { r.push(0, 0, 0); continue; }
-        const sb = st.bands[b];
+        const sb = opts.adaptive ? (st.bandsAdaptive || st.bandsBg || st.bands)[b] : st.bands[b];
         r.push(wrapDeg(sb.hue - tb.hue) / 12 * tb.weight, (sb.chroma - tb.chroma) / 2.5 * tb.weight, (sb.lumRel - tb.lumRel) / 4 * tb.weight);
       }
-      r.push((st.color.meanChroma - T.color.meanChroma) / 0.8, (st.color.lowChroma - T.color.lowChroma) / 0.8);
+      if (T.color) r.push((st.color.meanChroma - T.color.meanChroma) / 0.8, (st.color.lowChroma - T.color.lowChroma) / 0.8);
+      else r.push(0, 0);
       r.push((st.wb.a - T.wb.a) / 0.8 * T.wb.weight, (st.wb.b - T.wb.b) / 0.8 * T.wb.weight);
       // Small normalized ridge term stabilizes weakly identified color dimensions without narrowing UI ranges.
       x.forEach((v, i) => {
@@ -315,6 +347,16 @@ export function solve(ps, o, ref, opts = {}) {
         const range = /^[smh][uv]$/.test(key) ? 100 : Math.max(...SLIDER_BY_KEY[key].ui.map(Math.abs));
         r.push(0.03 * v / range);
       });
+      if (opts.adaptive) {
+        // Adjacent mixer bands overlap on real pixels. Penalize abrupt control jumps that
+        // make color boundaries visible when the reference contains different objects.
+        for (let offset = 8; offset < CKEYS.length; offset += BANDS.length) {
+          for (let i = 0; i < BANDS.length; i++) {
+            const next = (i + 1) % BANDS.length;
+            r.push(0.18 * (x[offset + i] - x[offset + next]) / 100);
+          }
+        }
+      }
       return r;
     };
     const res = lm(fn, x0, lo, hi, { iters });
@@ -350,7 +392,7 @@ export function solve(ps, o, ref, opts = {}) {
   const tCurve0 = performance.now();
   let rCurveColor = null;
   let rgbCurveEvals = 0;
-  const matchedCurve = toneTransferCurve(params);
+  const matchedCurve = toneTransferCurve(params, opts.adaptive);
   params.curveAuto = 'reference';
   if (!isIdentityCurve(matchedCurve)) {
     params.curve = matchedCurve;
@@ -358,7 +400,7 @@ export function solve(ps, o, ref, opts = {}) {
     rCurveColor = colorStage(Math.min(6, opts.colorIters ?? 10));
   }
 
-  const rgbFit = fitReferenceRgbCurves(ps, T, params, sampleIdx(ps.n, 7000, null, 47), cur);
+  const rgbFit = opts.adaptive ? null : fitReferenceRgbCurves(ps, T, params, sampleIdx(ps.n, 7000, null, 47), cur);
   if (rgbFit) { Object.assign(params, rgbFit.curves); rgbCurveEvals = rgbFit.evals; }
 
   // Keep fitted curves at their full strength; clipping remains a diagnostic.

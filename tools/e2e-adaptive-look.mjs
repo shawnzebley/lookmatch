@@ -19,7 +19,8 @@ try {
   await page.screenshot({ path: 'scratch/adaptive-e2e/gallery.png', fullPage: true });
   await page.setInputFiles('#pickPhotos', [sourceA, sourceB]);
   await page.waitForFunction(() => window.__lm?.S?.photos?.length === 2, null, { timeout: 30000 });
-  await page.waitForFunction(() => window.__lm.S.photos.every((p) => ['ready', 'done'].includes(p.status)), null, { timeout: 90000 });
+  try { await page.waitForFunction(() => window.__lm.S.photos.every((p) => ['ready', 'done'].includes(p.status)), null, { timeout: 90000 }); }
+  catch (error) { console.log(await page.evaluate(() => window.__lm.S.photos.map(p => ({ name: p.name, status: p.status, error: p.error })))); throw error; }
   const first = page.locator('.tile:not(.add)').first();
   await first.click();
   await page.locator('#ptabs [data-p=look]').click();
@@ -40,14 +41,16 @@ try {
   });
   const outputs = [];
   const identity = await snapshot();
-  for (let i = 0; i < await lookButtons.count(); i++) {
+  const count = process.argv.includes('--quick') ? 2 : await lookButtons.count();
+  for (let i = 0; i < count; i++) {
     const button = lookButtons.nth(i);
     await button.click(); await waitSolved();
     const rendered = await snapshot();
+    assert.equal(rendered.adaptive?.fitVersion, 3, 'Built-in look must use smooth per-photo fitting.');
     console.log(`Look ${i + 1}: ${rendered.adaptive?.id}, pixel hash ${rendered.hash}`);
     outputs.push(rendered.hash);
   }
-  assert.equal(new Set(outputs).size, 12, 'All twelve looks must produce distinct rendered pixels.');
+  assert.equal(new Set(outputs).size, count, 'Selected looks must produce distinct rendered pixels.');
 
   const selected = lookButtons.first();
   await selected.click(); await waitSolved();
@@ -58,10 +61,11 @@ try {
   assert.equal(zero.hash, identity.hash, 'Amount zero should restore the untouched photo.');
   assert.notEqual(zero.params, full.params, 'Amount zero should remove the adaptive correction.');
   await amount.fill('100'); await amount.dispatchEvent('change'); await waitSolved();
+  const protectedResult = await snapshot();
   const protect = page.locator('#skinProtection');
   assert.equal(await protect.count(), 1, 'Adaptive look should expose skin protection.');
   await protect.fill('0'); await protect.dispatchEvent('change'); await waitSolved();
-  assert.notEqual((await snapshot()).params, zero.params, 'Skin protection should affect the solved edit.');
+  assert.notEqual((await snapshot()).params, protectedResult.params, 'Skin match amount should affect the solved edit.');
   await protect.fill('100'); await protect.dispatchEvent('change'); await waitSolved();
 
   await page.locator('#ptabs [data-p=subject]').click();
@@ -87,6 +91,7 @@ try {
   await page.locator('#ptabs [data-p=subject]').click();
   await page.click('#mUndo');
   await page.waitForFunction((n) => window.__lm.D().p.mask.picks === n - 1, savedMaskPicks, { timeout: 15000 });
+  await waitSolved();
   await page.locator('#ptabs [data-p=look]').click();
   await page.click('#loadRecipe');
   await page.locator('#recipeFile').setInputFiles(recipePath);

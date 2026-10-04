@@ -130,6 +130,20 @@ test('a single supported hue sector fades continuously at its membership edge', 
     `jump at sector boundary: ${beforeEdge} vs ${afterEdge}`);
 });
 
+test('optional adaptive band correction fades through near-neutral chroma without a hard edge', () => {
+  const neutral = stats(Array(257).fill(50));
+  const transfer = fitReferenceTransfer(neutral, neutral);
+  transfer.chromaFade = [4, 12];
+  transfer.bandCorrections = [{ center: 0, width: 32, weight: 1, deltaA: 40, deltaB: 10 }];
+  const at = (chroma) => applyReferenceTransferLinear(...labToLin(50, chroma, 0, [0, 0, 0]), transfer);
+  const below = at(4.99), above = at(5.01);
+  assert.ok(Math.hypot(above[3] - below[3], above[4] - below[4], above[5] - below[5]) < 0.3,
+    `near-neutral boundary jumped: ${below.slice(3)} vs ${above.slice(3)}`);
+  close(at(4)[4], 4, 0.05);
+  assert.ok(at(12)[4] > 20, 'supported color still receives a substantial correction');
+  close(at(12)[3], 50, 0.1);
+});
+
 test('reused six-value output buffers gamut-map only RGB and report actual Lab', () => {
   const source = stats(Array(257).fill(60), [0, 0], [1, 1]);
   const target = stats(Array(257).fill(60), [140, 100], [1, 1]);

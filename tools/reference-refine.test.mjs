@@ -41,6 +41,16 @@ test('skin target is fitted after tone changes and follows selected strength fro
   assert.ok(Math.abs(actual.a - (original.a + 1.5)) < 1);
 });
 
+test('skin correction amount can differ from the lighting match amount', () => {
+  const { ps, render } = fixture(), stats = measure(ps), original = skinStats(ps);
+  const target = { ...original, L: original.L - 20, a: original.a + 4, b: original.b + 4 };
+  const result = refineReference(ps, { ...defaultParams(), exposure: 0.3 }, computeTargets(stats, stats), render,
+    { skinTarget: target, strength: 1, skinStrength: 0.25, passes: 0 });
+  const actual = skinStats(ps, render(result.params));
+  assert.ok(Math.abs(actual.L - (original.L - 5)) < 1);
+  assert.ok(Math.abs(actual.a - (original.a + 1)) < 1);
+});
+
 test('entering the curve domain preserves bright saturated colors instead of clipping each channel', () => {
   const params = { ...defaultParams(), exposure: 1 };
   const base = compile(params)(0.8, 0.3, 0.12, new Array(6).fill(0));

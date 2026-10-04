@@ -350,6 +350,7 @@ export function measure(ps, cur, idx) {
   let na = 0, nb = 0, nn = 0;
   const band = Array.from({ length: 8 }, () => ({ w: 0, a: 0, b: 0, c: 0, l: 0 }));
   const bandBg = Array.from({ length: 8 }, () => ({ w: 0, a: 0, b: 0, c: 0, l: 0 })); // same bands without skin, light sources (L* >= 90) or near-black
+  const bandAdaptive = Array.from({ length: 8 }, () => ({ w: 0, a: 0, b: 0, c: 0, l: 0 })); // fixed source eligibility while fitting
   let sl = 0;
   let sa = 0, sb = 0, sc = 0, sn = 0; const skinH = []; let ha = 0, hb = 0, hc = 0, hn = 0;
 
@@ -367,11 +368,13 @@ export function measure(ps, cur, idx) {
     if (m.zoneTint[i]) { for (let q = 0; q < 3; q++) { const w = m.zw[i * 3 + q]; if (w) { const zz = z[q]; zz[0] += w * a; zz[1] += w * b; zz[2] += w; } } }
     if (m.neutral[i]) { na += a; nb += b; nn++; }
     const o = i * 8;
+    const adaptiveSkin = ps.skinMask ? ps.skinMask[i] >= 64 : Boolean(m.skin[i]);
     for (let q = 0; q < 8; q++) {
       const w = m.bw[o + q];
       if (w > 0) {
         const bd = band[q]; bd.w += w; bd.a += w * a; bd.b += w * b; bd.c += w * c; bd.l += w * l;
         if (!m.skin[i] && l > 8 && l < 90) { const bg = bandBg[q]; bg.w += w; bg.a += w * a; bg.b += w * b; bg.c += w * c; bg.l += w * l; }
+        if (!adaptiveSkin && ps.L[i] > 8 && ps.L[i] < 90) { const fixed = bandAdaptive[q]; fixed.w += w; fixed.a += w * a; fixed.b += w * b; fixed.c += w * c; fixed.l += w * l; }
       }
     }
     if (m.skin[i]) { sa += a; sb += b; sc += c; sl += l; sn++; skinH.push(Math.atan2(b, a) * 180 / Math.PI); if (m.skin[i] === 2) { ha += a; hb += b; hc += c; hn++; } }
@@ -423,7 +426,7 @@ export function measure(ps, cur, idx) {
     });
     return out;
   };
-  const bands = bandStats(band), bandsBg = bandStats(bandBg);
+  const bands = bandStats(band), bandsBg = bandStats(bandBg), bandsAdaptive = bandStats(bandAdaptive);
 
   const color = { meanChroma: sumC / N, lowChroma: lowN ? lowC / lowN : 0 };
   const sh = sn ? Math.atan2(sb / sn, sa / sn) * 180 / Math.PI : 0;
@@ -431,7 +434,7 @@ export function measure(ps, cur, idx) {
   const skin = { source: ps.skinSource, faces: ps.faceCount, frac: sn / N, hue: sh, chroma: sn ? sc / sn : 0, lum: sn ? sl / sn : 0, hueSpread: sn ? Math.sqrt(sv / sn) : 0,
     litHue: hn ? Math.atan2(hb / hn, ha / hn) * 180 / Math.PI : 0, litChroma: hn ? hc / hn : 0 };
 
-  return { tone, curve, wb, zones, bands, bandsBg, color, skin, skinMatch: idx ? null : skinStats(ps, cur) };
+  return { tone, curve, wb, zones, bands, bandsBg, bandsAdaptive, color, skin, skinMatch: idx ? null : skinStats(ps, cur) };
 }
 
 // Round everything for printing / storage.

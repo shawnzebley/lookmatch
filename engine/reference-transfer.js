@@ -13,9 +13,13 @@ const finite = Number.isFinite;
 
 function hueDistance(a, b) { return ((a - b + 540) % 360) - 180; }
 
-function hueMembership(hue, center) {
-  const x = Math.abs(hueDistance(hue, center)) / HUE_RADIUS;
+function hueMembership(hue, center, radius = HUE_RADIUS) {
+  const x = Math.abs(hueDistance(hue, center)) / radius;
   return x >= 1 ? 0 : 0.5 + 0.5 * Math.cos(Math.PI * x);
+}
+function smoothstep(lo, hi, value) {
+  const t = Math.max(0, Math.min(1, (value - lo) / (hi - lo)));
+  return t * t * (3 - 2 * t);
 }
 
 function quantiles(values) {
@@ -167,7 +171,10 @@ export function applyReferenceTransferLinear(r, g, b, transform, out = new Float
   let a = transform.targetMean[0] + (lab[1] - transform.sourceMean[0]) * transform.abScale[0];
   let bb = transform.targetMean[1] + (lab[2] - transform.sourceMean[1]) * transform.abScale[1];
   const originalChroma = Math.hypot(lab[1], lab[2]);
-  if (originalChroma >= HUE_MIN_CHROMA && transform.hueSectors?.length) {
+  const chromaFade = transform.chromaFade
+    ? smoothstep(transform.chromaFade[0], transform.chromaFade[1], originalChroma)
+    : originalChroma >= HUE_MIN_CHROMA ? 1 : 0;
+  if (chromaFade > 0 && transform.hueSectors?.length) {
     const hue = (Math.atan2(lab[2], lab[1]) * 180 / Math.PI + 360) % 360;
     let da = 0, db = 0, total = 0;
     for (const sector of transform.hueSectors) {
@@ -176,7 +183,20 @@ export function applyReferenceTransferLinear(r, g, b, transform, out = new Float
       da += sector.deltaA * w; db += sector.deltaB * w; total += w;
     }
     // Missing adjacent sectors must fade to zero rather than jump at the sector boundary.
-    if (total > 0) { a += da / Math.max(1, total); bb += db / Math.max(1, total); }
+    if (total > 0) { a += chromaFade * da / Math.max(1, total); bb += chromaFade * db / Math.max(1, total); }
+  }
+  if (chromaFade > 0 && transform.bandCorrections?.length) {
+    const hue = (Math.atan2(lab[2], lab[1]) * 180 / Math.PI + 360) % 360;
+    let da = 0, db = 0, total = 0;
+    for (const sector of transform.bandCorrections) {
+      const w = hueMembership(hue, sector.center, sector.width) * sector.weight;
+      if (!w) continue;
+      da += sector.deltaA * w; db += sector.deltaB * w; total += w;
+    }
+    if (total > 0) {
+      const scale = 1 / Math.max(1, total);
+      a += da * scale * chromaFade; bb += db * scale * chromaFade;
+    }
   }
   gamutMap(L, a, bb, out);
   const actualLab = linToLab(out[0], out[1], out[2], [0, 0, 0]);

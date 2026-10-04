@@ -1,6 +1,7 @@
 import { measure, regionStats } from './measure.js';
 import { SLIDER_BY_KEY } from './pipeline.js';
 import { fitSkinMatch, skinStats } from './skin-match.js';
+import { adaptiveAppearanceChecks } from './adaptive-check.js';
 
 function skinError(ps, cur, reference, match, strength) {
   const original = skinStats(ps), actual = skinStats(ps, cur);
@@ -23,12 +24,20 @@ function skinError(ps, cur, reference, match, strength) {
 
 // Refine against pixels from the renderer, including quantization and finishing.
 // The pass count limits runtime; it never scales an edit back to preserve source appearance.
-export function renderedTargetError(ps, cur, targets, { regional = null, strength = 1 } = {}) {
+export function renderedTargetError(ps, cur, targets, { regional = null, strength = 1, appearanceReference = null } = {}) {
   const got = measure(ps, cur);
   let sum = 0, count = 0;
   const add = (a, b, weight = 1) => {
     if (Number.isFinite(a) && Number.isFinite(b)) { sum += weight * (a - b) ** 2; count += weight; }
   };
+  // Adaptive refinement must consider supported individual colors as well as tone.
+  if (appearanceReference) {
+    const checks = adaptiveAppearanceChecks(ps, cur, appearanceReference, { strength });
+    for (const check of checks) if (Number.isFinite(check.value)) {
+      const limit = check.tolerance;
+      if (limit > 0) { sum += 16 * (check.value / limit) ** 2; count++; }
+    }
+  }
   if (regional?.subject?.tone && regional?.background?.tone && ps.subject) {
     const before = regionStats(ps), after = regionStats(ps, cur);
     for (const name of ['subject', 'background']) {
@@ -37,14 +46,14 @@ export function renderedTargetError(ps, cur, targets, { regional = null, strengt
       for (const p of [1, 5, 25, 50, 75, 95, 99]) {
         add(actual.tone.pct[p], original.tone.pct[p] + strength * (reference.tone.pct[p] - original.tone.pct[p]));
       }
-      for (const key of ['a', 'b', 'C']) add(actual[key], original[key] + strength * (reference[key] - original[key]));
+      if (!targets.adaptive) for (const key of ['a', 'b', 'C']) add(actual[key], original[key] + strength * (reference[key] - original[key]));
     }
     if (count) return sum / count;
   }
   for (const p of [1, 5, 25, 50, 75, 95, 99]) add(got.tone.pct[p], targets.tone.pct[p]);
   add(got.wb.a, targets.wb.a, targets.wb.weight);
   add(got.wb.b, targets.wb.b, targets.wb.weight);
-  add(got.color.meanChroma, targets.color.meanChroma);
+  if (!targets.adaptive) add(got.color.meanChroma, targets.color.meanChroma);
   for (const [name, target] of Object.entries(targets.zones || {})) {
     add(got.zones[name]?.a, target.a, target.weight);
     add(got.zones[name]?.b, target.b, target.weight);
@@ -52,9 +61,9 @@ export function renderedTargetError(ps, cur, targets, { regional = null, strengt
   return count ? sum / count : Infinity;
 }
 
-export function refineReference(ps, params, targets, render, { skinTarget = null, regional = null, strength = 1, passes = 2 } = {}) {
+export function refineReference(ps, params, targets, render, { skinTarget = null, regional = null, strength = 1, skinStrength = strength, appearanceReference = null, passes = 2 } = {}) {
   let best = structuredClone(params), evaluations = 0;
-  const evaluate = (p) => { evaluations++; return renderedTargetError(ps, render(p), targets, { regional, strength }); };
+  const evaluate = (p) => { evaluations++; return renderedTargetError(ps, render(p), targets, { regional, strength, appearanceReference }); };
   const initial = evaluate(best);
   let error = initial;
   // Tone first, white balance next, color intensity last. All candidates stay editable.
@@ -82,7 +91,7 @@ export function refineReference(ps, params, targets, render, { skinTarget = null
     delete best.skinMatch;
     for (let pass = 0; pass < 3; pass++) {
       const current = render(best);
-      const fit = fitSkinMatch(ps, current, skinTarget, { move: strength });
+      const fit = fitSkinMatch(ps, current, skinTarget, { move: skinStrength });
       if (!fit) break;
       const previous = best.skinMatch;
       if (previous?.version === 2 && fit.version === 2) {
@@ -94,7 +103,7 @@ export function refineReference(ps, params, targets, render, { skinTarget = null
         for (const key of ['deltaL', 'deltaA', 'deltaB']) fit[key] += previous[key] || 0;
       }
       const candidate = { ...best, skinMatch: fit };
-      if (skinError(ps, render(candidate), skinTarget, fit, strength) >= skinError(ps, current, skinTarget, fit, strength)) {
+      if (skinError(ps, render(candidate), skinTarget, fit, skinStrength) >= skinError(ps, current, skinTarget, fit, skinStrength)) {
         // A self-reference may need no correction, but acceptance still needs the fitted correspondence.
         if (!previous) {
           const identity = structuredClone(fit);
