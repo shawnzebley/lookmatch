@@ -1,45 +1,21 @@
-// A reference pair defines an editable look; every application solves a small exposure/WB
-// normalisation for the new photo before applying that look.
+// A reference pair defines measured appearance targets; every application refits controls to its own pixels.
 import { measure } from './measure.js';
-import { solve, solvePreset, lm } from './solver.js';
-import { processPixelSet, SLIDERS, curveLUT } from './pipeline.js';
+import { solve } from './solver.js';
+import { processPixelSet, SLIDERS } from './pipeline.js';
 import { fitSkinMatch, skinStats } from './skin-match.js';
+import { fitReferenceRegions } from './regions.js';
+import { regionStats as splitRegionStats, regionUsable } from './measure.js';
+import { referenceRegionTargets, solveMaskedReference } from './masked-reference.js';
+import { adaptiveReferenceTargets, solveAdaptiveTransfer } from './adaptive-transfer.js';
 
 const clone = (x) => JSON.parse(JSON.stringify(x));
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+function signedHueParams(params) {
+  for (const key of Object.keys(params)) if (key.startsWith('hue_') && Number.isFinite(params[key])) params[key] = ((params[key] + 180) % 360 + 360) % 360 - 180;
+  for (const region of ['subject', 'background']) if (params.local?.[region]) signedHueParams(params.local[region]);
+  return params;
+}
 function pixelBuffers(n) { return { L: new Float32Array(n), A: new Float32Array(n), B: new Float32Array(n), lr: new Float32Array(n), lg: new Float32Array(n), lb: new Float32Array(n) }; }
-function smoothLookCurve(points, channel = false) {
-  if (!points) return [[0, 0], [255, 255]];
-  const lut = curveLUT(points), xs = [0, 32, 64, 96, 128, 160, 192, 224, 255];
-  const values = xs.map(x => {
-    const measured = 255 * lut[Math.round(x / 255 * (lut.length - 1))];
-    return channel ? x + clamp(measured - x, -18, 18) : x + (measured - x) * 0.85;
-  });
-  if (channel) { values[0] = 0; values[8] = 255; }
-  else { values[0] = clamp(values[0], 0, 40); values[8] = clamp(values[8], 185, 255); }
-  for (let i = 0; i < xs.length; i++) values[i] = clamp(values[i], 0.3 * xs[i], 255 - 0.3 * (255 - xs[i]));
-  // Keep the fitted treatment smooth between all anchors instead of reproducing histogram
-  // plateaus and steep scene-specific steps from one demonstration image.
-  for (let pass = 0; pass < 3; pass++) {
-    for (let i = 1; i < xs.length; i++) values[i] = clamp(values[i], values[i - 1] + (xs[i] - xs[i - 1]) * 0.3, Math.min(255 - 0.3 * (255 - xs[i]), values[i - 1] + (xs[i] - xs[i - 1]) * 1.8));
-    for (let i = xs.length - 2; i >= 0; i--) values[i] = clamp(values[i], Math.max(0, values[i + 1] - (xs[i + 1] - xs[i]) * 1.8), values[i + 1] - (xs[i + 1] - xs[i]) * 0.3);
-  }
-  return xs.map((x, i) => [x, values[i]]);
-}
-function scaleLookParams(params, amount) {
-  const out = {};
-  for (const [key, value] of Object.entries(params || {})) {
-    if (Array.isArray(value)) out[key] = value.map(([x, y]) => [x, x + (y - x) * amount]);
-    else if (typeof value === 'number') {
-      if (key === 'curveSaturation') out[key] = 100 + (value - 100) * amount;
-      else if (key.startsWith('hue_')) { const d = ((value + 180) % 360 + 360) % 360 - 180; out[key] = d * amount; }
-      else if (SLIDERS.find(s => s.key === key)?.hue) out[key] = value;
-      else out[key] = value * amount;
-    } else out[key] = value;
-  }
-  return out;
-}
-
 function regionStats(ps, cur, wantSubject) {
   const mask = ps.subject;
   const skin = ps.masks?.skin;
@@ -62,112 +38,28 @@ function deltaStats(a, b) {
   }
   return out;
 }
-function applyDelta(base, delta) {
-  if (!base || !delta) return null;
-  const out = clone(base);
-  for (const [k, v] of Object.entries(delta)) if (typeof v === 'number' && Number.isFinite(out[k])) out[k] += v;
-  return out;
-}
-function skinDelta(before, after) {
-  if (!before || !after) return null;
-  const sub = (a, b) => {
-    if (!a || !b) return null;
-    const d = {};
-    for (const k of ['L', 'a', 'b']) if (Number.isFinite(a[k]) && Number.isFinite(b[k])) d[k] = a[k] - b[k];
-    return d;
-  };
-  const out = { ...sub(after, before) };
-  if (before.version === 2 && after.version === 2) {
-    out.version = 2;
-    // Store one reusable profile delta. Runtime people IDs belong to the current image and
-    // cannot be paired with identities from the catalogue source photo.
-    const zones = {};
-    for (const name of ['shadow', 'midtone', 'lit']) {
-      const deltas = [];
-      for (const person of after.people) {
-        const old = before.people.find((q) => q.id === person.id), d = sub(person.zones?.[name], old?.zones?.[name]);
-        if (d) deltas.push(d);
-      }
-      if (deltas.length) zones[name] = Object.fromEntries(['L', 'a', 'b'].map((k) => [k, deltas.reduce((sum, d) => sum + (d[k] || 0), 0) / deltas.length]));
-    }
-    out.people = [{ id: 'adaptive-profile', zones }];
-  }
-  return out;
-}
-function skinTarget(base, delta) {
-  if (!base || !delta) return null;
-  if (!Array.isArray(base.people)) return applyDelta(base, delta);
-  const out = clone(base);
-  for (const k of ['L', 'a', 'b']) if (Number.isFinite(out[k]) && Number.isFinite(delta[k])) out[k] += delta[k];
-  const profileZones = delta.version === 2 ? delta.people?.[0]?.zones : null;
-  for (const p of out.people || []) {
-    const dZones = profileZones || delta.people?.find((x) => x.id === p.id)?.zones;
-    for (const [name, z] of Object.entries(p.zones || {})) {
-      const dz = dZones?.[name] || (delta.version !== 2 ? delta : null);
-      if (dz) for (const k of ['L', 'a', 'b']) if (Number.isFinite(z[k]) && Number.isFinite(dz[k])) z[k] += dz[k];
-    }
-  }
-  return out;
+function fitPerPerson(ps, cur, targetStats, move) {
+  // Let fitSkinMatch perform its position-based pairing and retain catalogue reference IDs.
+  return fitSkinMatch(ps, cur, targetStats, { move });
 }
 
-function fitPerPerson(ps, cur, sourceStats, targetStats, move) {
-  if (sourceStats?.version !== 2 || targetStats?.version !== 2 || !sourceStats.people?.length || sourceStats.people.length !== targetStats.people?.length) {
-    return fitSkinMatch(ps, cur, targetStats, { move });
+function fitAdaptiveRegions(ps, params, look, amount, enabled) {
+  if (enabled === false) return { params, regions: null, warning: null };
+  if (!ps.subject) return { params, regions: null, warning: 'Subject mask unavailable; reference regional fit was skipped.' };
+  const ownRegions = splitRegionStats(ps, ps, null), referenceRegions = look.reference?.after?.regions || look.reference?.regions;
+  if (!regionUsable(ownRegions) || !regionUsable(referenceRegions)) {
+    return { params, regions: null, warning: 'Reference subject/background measurements are unavailable or too small.' };
   }
-  const people = [];
-  for (const source of sourceStats.people) {
-    const target = targetStats.people.find((p) => p.id === source.id);
-    if (!target) continue;
-    // Without positions, the skin matcher cannot pair a multi-person reference. Fit each
-    // person against their own current stats plus the generic profile delta instead.
-    const labels = new Uint8Array(ps.n);
-    for (let i = 0; i < ps.n; i++) if (ps.skinPeople?.[i] === source.id) labels[i] = source.id;
-    const personPs = { ...ps, skinPeople: labels };
-    const match = fitSkinMatch(personPs, cur, { version: 2, people: [{ ...target, id: 'adaptive-profile' }] }, { move });
-    if (match?.people?.length) people.push(...match.people);
-  }
-  return { version: 2, people, targets: people.map((p) => ({ id: p.id, referenceId: p.referenceId, zones: p.zones.map((z) => z.name) })) };
-}
-
-function fitAdaptiveBackground(ps, params, look, amount, limits) {
-  if (!ps.subject) return { params, regions: null, warning: 'Background mask unavailable; adaptive background fitting was skipped.' };
-  const sampled = [], step = Math.max(1, Math.floor(ps.n / 6000));
-  for (let i = 0; i < ps.n; i += step) if (ps.subject[i] < 64) sampled.push(i);
-  const idx = Int32Array.from(sampled);
-  if (idx.length < 20) return { params, regions: null, warning: 'Background mask has too few pixels for adaptive fitting.' };
-  const delta = look.targets?.background, own = measure(ps, ps, idx);
-  if (!delta || !own?.tone?.pct) return { params, regions: null, warning: 'Reference background measurements are unavailable.' };
-  const target = {
-    mid: clamp(own.tone.pct[50] + amount * (delta.tone?.pct?.[50] || 0), 0, 100),
-    a: own.wb.a + amount * (delta.wb?.a || 0), b: own.wb.b + amount * (delta.wb?.b || 0),
-    chroma: own.color.meanChroma + amount * (delta.color?.meanChroma || 0),
-    wbSupported: (own.wb.pixels || 0) >= 0.02,
-  };
-  const max = [limits.backgroundExposure ?? 0.25, limits.backgroundTemp ?? 10, limits.backgroundTint ?? 10, limits.backgroundSaturation ?? 20].map(v => v * amount);
-  const base = { ...params }; delete base.local;
-  const cur = pixelBuffers(ps.n);
-  const evaluate = (x) => {
-    const local = { background: { exposure: x[0], temp: x[1], tint: x[2], saturation: x[3] } };
-    processPixelSet(ps, { ...base, local }, idx, cur);
-    const stats = measure(ps, cur, idx), residual = [(stats.tone.pct[50] - target.mid) / 2];
-    if (target.wbSupported) residual.push((stats.wb.a - target.a) / 2, (stats.wb.b - target.b) / 2);
-    residual.push((stats.color.meanChroma - target.chroma) / 2, x[0] / 0.18, x[1] / 7, x[2] / 7, x[3] / 14);
-    return { residual, stats, local };
-  };
-  const fitted = lm((x) => evaluate(x).residual, [0, 0, 0, 0], max.map((v) => -v), max, { iters: 12 });
-  const result = evaluate(fitted.x), background = Object.fromEntries(Object.entries(result.local.background).map(([k, v]) => [k, k === 'exposure' ? Math.round(v * 100) / 100 : Math.round(v)]));
-  return { params: { ...base, local: { background } }, regions: { background: { target, after: result.stats, local: background } }, warning: null };
+  const fitted = fitReferenceRegions(ps, params, referenceRegions, { move: 0.7 * amount });
+  return fitted ? { params: fitted.params, regions: fitted.regions, warning: null }
+    : { params, regions: null, warning: 'Subject/background masks do not support a regional reference fit.' };
 }
 
 /** Build a versioned profile from paired images from the same scene. */
 export function buildAdaptiveLook(beforePs, afterPs, { id, name, thumb = null, beforeThumb = null, source = null } = {}) {
   const before = measure(beforePs), after = measure(afterPs);
   const fitted = solve(beforePs, before, after, { strength: 1 });
-  const params = clone(fitted.params);
-  // The core solver wraps hue sliders into 0..360 when clamping, while the render pipeline
-  // interprets these controls as signed offsets in -100..100. Restore the equivalent short offset.
-  for (const key of Object.keys(params)) if (key.startsWith('hue_') && Number.isFinite(params[key])) params[key] = ((params[key] + 180) % 360 + 360) % 360 - 180;
-  for (const key of ['curve', 'curveR', 'curveG', 'curveB']) params[key] = smoothLookCurve(params[key], key !== 'curve');
+  const params = signedHueParams(clone(fitted.params));
   const transformLimits = { exposure: [-1, 1], temp: [-22, 22], tint: [-20, 20], saturation: [-75, 35], vibrance: [-40, 35] };
   for (const [key, bounds] of Object.entries(transformLimits)) params[key] = clamp(params[key] || 0, ...bounds);
   for (const key of Object.keys(params)) {
@@ -182,10 +74,11 @@ export function buildAdaptiveLook(beforePs, afterPs, { id, name, thumb = null, b
   return {
     version: 1, id, name, thumb, beforeThumb, source,
     params, toneCurve: params.curve,
-    reference: { before, after, skinBefore: beforeSkin, skinAfter: afterSkin,
+    reference: { before, after: { ...after, regions: splitRegionStats(afterPs, afterPs, null), maskedRegions: referenceRegionTargets(afterPs), adaptiveTransfer: adaptiveReferenceTargets(afterPs) }, skinBefore: beforeSkin, skinAfter: afterSkin,
+      regions: splitRegionStats(afterPs, afterPs, null),
       backgroundBefore: regionStats(beforePs, beforePs, false), backgroundAfter: regionStats(afterPs, afterPs, false) },
     targets: {
-      skin: skinMaskAvailable ? skinDelta(beforeSkin, afterSkin) : null,
+      skin: skinMaskAvailable ? afterSkin : null,
       background: deltaStats(bgAfter, bgBefore),
       subject: deltaStats(subAfter, subBefore),
     },
@@ -194,51 +87,60 @@ export function buildAdaptiveLook(beforePs, afterPs, { id, name, thumb = null, b
   };
 }
 
-/** Solve this profile for a particular PixelSet. Amount zero is a strict identity operation. */
-export function solveAdaptiveLook(ps, look, { strength = 1, skinProtection = 1, scene = null } = {}) {
+/** Fit this reference appearance to one PixelSet. Amount zero is a strict identity operation. */
+export function solveAdaptiveLook(ps, look, { strength = 1, skinProtection = 1, scene = null, split = true } = {}) {
   const amount = clamp(Number.isFinite(strength) ? strength : 1, 0, 1);
   const protection = clamp(Number.isFinite(skinProtection) ? skinProtection : 1, 0, 1);
   if (amount === 0) return {
     params: {}, targets: null, normalise: { exposure: 0, temp: 0, tint: 0 }, timings: { total: 0, evals: 0 }, guardScale: 1,
-    adaptive: { id: look.id, skinProtected: false, maskAvailable: Boolean(ps.skinMask), limits: clone(look.limits), warning: null },
+    adaptive: { id: look.id, fitVersion: look.reference?.after?.adaptiveTransfer?.version === 1 ? 3 : 2, skinProtected: false, maskAvailable: Boolean(ps.skinMask), limits: clone(look.limits || {}), warning: null },
   };
-  const own = measure(ps);
-  const limits = look.limits || { normaliseExposure: 0.75, normaliseTemp: 30, normaliseTint: 25, maxGuardScale: 1, skinDeltaL: 8, skinDeltaAB: 12 };
-  const scaledLook = scaleLookParams(look.params, amount);
-  const normalized = solvePreset(ps, own, scaledLook, { strength: 1, scene, pull: 0.35 });
-  const normalise = {
-    exposure: clamp(normalized.normalise.exposure * amount, -limits.normaliseExposure, limits.normaliseExposure),
-    temp: clamp(normalized.normalise.temp * amount, -limits.normaliseTemp, limits.normaliseTemp),
-    tint: clamp(normalized.normalise.tint * amount, -limits.normaliseTint, limits.normaliseTint),
-  };
-  let params = { ...normalized.params,
-    exposure: (scaledLook.exposure || 0) + normalise.exposure,
-    temp: (scaledLook.temp || 0) + normalise.temp,
-    tint: (scaledLook.tint || 0) + normalise.tint,
-    curveSaturation: scaledLook.curveSaturation ?? 100,
-  };
+  const own = measure(ps), reference = look.reference?.after;
+  const limits = look.limits || { maxGuardScale: 1, skinDeltaL: 8, skinDeltaAB: 12 };
+  let normalized, params, warning = null;
+  const measuredReference = !!(reference?.tone?.pct && reference.wb && reference.zones && reference.bands && reference.color);
+  if (measuredReference) {
+    normalized = solveAdaptiveTransfer(ps, reference, amount, split !== false);
+    normalized ||= reference.maskedRegions && split !== false
+      ? solveMaskedReference(ps, reference, { strength: amount, scene, adaptive: true })
+      : null;
+    normalized ||= solve(ps, own, reference, { strength: amount, scene, adaptive: true });
+    params = signedHueParams({ ...normalized.params });
+    warning = normalized.warning || null;
+  } else {
+    warning = 'Reference measurements are incomplete; using saved look controls as a legacy fallback.';
+    params = {};
+    for (const [key, value] of Object.entries(look.params || {})) {
+      if (Array.isArray(value)) params[key] = value.map(([x, y]) => [x, x + (y - x) * amount]);
+      else if (typeof value === 'number' && Number.isFinite(value)) params[key] = key === 'curveSaturation' ? 100 + (value - 100) * amount : SLIDERS.find(s => s.key === key)?.hue ? value : value * amount;
+    }
+    normalized = { timings: { total: 0, evals: 0 } };
+  }
   for (const slider of SLIDERS) if (Number.isFinite(params[slider.key])) params[slider.key] = clamp(params[slider.key], ...slider.ui);
-  const background = fitAdaptiveBackground(ps, params, look, amount, limits);
-  params = background.params;
+  const regional = params.local
+    ? { params, regions: normalized.regions || null, warning: null }
+    : fitAdaptiveRegions(ps, params, look, amount, split);
+  params = regional.params;
   const cur = pixelBuffers(ps.n);
   processPixelSet(ps, params, null, cur);
   const currentSkin = skinStats(ps);
+  const hasReferenceSkinStats = reference && Object.hasOwn(reference, 'skinMatch');
+  const referenceSkin = hasReferenceSkinStats ? reference.skinMatch : look.reference?.skinAfter || look.targets?.skin || null;
   let skinMatch = null;
-  if (protection > 0 && currentSkin && look.targets?.skin) {
-    const d = clone(look.targets.skin);
-    for (const p of d.people || []) for (const z of Object.values(p.zones || {})) {
-      if (Number.isFinite(z.L)) z.L = clamp(z.L * amount, -limits.skinDeltaL, limits.skinDeltaL);
-      for (const k of ['a', 'b']) if (Number.isFinite(z[k])) z[k] = clamp(z[k] * amount, -limits.skinDeltaAB, limits.skinDeltaAB);
-    }
-    for (const k of ['L', 'a', 'b']) if (Number.isFinite(d[k])) d[k] = clamp(d[k] * amount, k === 'L' ? -limits.skinDeltaL : -limits.skinDeltaAB, k === 'L' ? limits.skinDeltaL : limits.skinDeltaAB);
-    const target = skinTarget(currentSkin, d);
-    skinMatch = fitPerPerson(ps, cur, currentSkin, target, protection);
+  if (protection > 0 && currentSkin && referenceSkin) {
+    skinMatch = fitPerPerson(ps, cur, referenceSkin, protection * amount);
     if (skinMatch) params.skinMatch = skinMatch;
   }
   return {
-    params, targets: { skin: look.targets?.skin || null, background: look.targets?.background || null }, normalise, regions: background.regions,
-    timings: normalized.timings, guardScale: 1,
-    adaptive: { id: look.id, skinProtected: Boolean(skinMatch?.people?.length || skinMatch?.deltaA || skinMatch?.deltaB || skinMatch?.deltaL), maskAvailable: Boolean(ps.skinMask && currentSkin), backgroundFitted: !!background.regions,
-      limits: clone(limits), warning: [background.warning, ps.skinMask ? (currentSkin ? null : 'Skin mask has too few confident pixels for correction.') : 'Skin mask unavailable; skin protection was skipped.'].filter(Boolean).join(' ') || null },
+    params, targets: normalized.targets || null,
+    referenceStats: { ...reference, skinMatch: referenceSkin || null },
+    normalise: { exposure: params.exposure || 0, temp: params.temp || 0, tint: params.tint || 0 }, regions: regional.regions,
+    timings: normalized.timings, guardScale: 1, fitVersion: measuredReference ? (params.referenceMethod === 'lab-distribution' ? 3 : 2) : 1,
+    adaptive: { id: look.id, fitVersion: measuredReference ? (params.referenceMethod === 'lab-distribution' ? 3 : 2) : 1, skinProtected: Boolean(skinMatch?.people?.length || skinMatch?.deltaA || skinMatch?.deltaB || skinMatch?.deltaL), maskAvailable: Boolean(ps.skinMask && currentSkin), backgroundFitted: !!regional.regions,
+      limits: clone(limits), warning: [warning, regional.warning,
+        ps.skinMask ? (currentSkin ? null : 'Skin mask has too few confident pixels for correction.') : 'Skin mask unavailable; skin protection was skipped.',
+        protection > 0 && currentSkin && !referenceSkin ? 'Reference skin measurements unavailable; skin matching was skipped.' : null,
+        protection > 0 && referenceSkin?.version === 2 && !referenceSkin.people?.length ? 'Reference has no supported per-person skin measurements.' : null,
+      ].filter(Boolean).join(' ') || null },
   };
 }

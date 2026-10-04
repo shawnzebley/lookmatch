@@ -9,7 +9,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-10-03d';
+const APP_VERSION = '2026-10-04a';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -622,7 +622,7 @@ const keptEdits = (params) => Object.fromEntries(KEEP_KEYS.filter((k) => params 
 
 function referenceCheckArgs(p) {
   const args = solveArgs(p);
-  if (args?.adaptiveLook) return { refStats: null, strength: args.strength };
+  if (args?.adaptiveLook) return { refStats: args.adaptiveLook.reference?.after ? { ...args.adaptiveLook.reference.after, adaptiveFit: true, adaptiveSplit: args.split } : null, strength: args.strength };
   return { refStats: args?.lrParams ? null : args?.refStats || null, strength: args?.strength ?? 1 };
 }
 
@@ -744,7 +744,7 @@ function numbersTable(p) {
     ${row('Tone curve error (L*)', f1(toneErr(b)), f1(toneErr(a)), '0')}
     ${row('Neutral cast error (Lab)', f1(wbErr(b)), f1(wbErr(a)), '0')}
     ${row('Zone color error (Lab)', f1(zoneErr(b)), f1(zoneErr(a)), '0')}
-    ${row('Mean chroma', f1(b.color.meanChroma), f1(a.color.meanChroma), `${f1(r?.color.meanChroma)} / ${f1(T.color.meanChroma)}`, false)}
+    ${row('Mean chroma', f1(b.color.meanChroma), f1(a.color.meanChroma), T.color ? `${f1(r?.color.meanChroma)} / ${f1(T.color.meanChroma)}` : 'Fit by color band', false)}
     ${a.skinMatch && r?.skinMatch ? row('Skin brightness L*', f1(b.skinMatch?.L), f1(a.skinMatch.L), f1(r.skinMatch.L), false) : ''}
     ${a.skinMatch && r?.skinMatch ? row('Skin color a* / b*', `${f1(b.skinMatch?.a)} / ${f1(b.skinMatch?.b)}`, `${f1(a.skinMatch.a)} / ${f1(a.skinMatch.b)}`, `${f1(r.skinMatch.a)} / ${f1(r.skinMatch.b)}`, false) : ''}
     ${skinTargetRows(p)}
@@ -1502,6 +1502,9 @@ async function recipeLoad(file, p) {
 
 // The editor's style selection applies to this photo only.
 function styleCard(p) {
+  const fittedAppearance = p.params?.referenceMethod === 'lab-distribution'
+    ? `Per-photo lighting and palette fit · ${p.params.local ? 'subject/background fitted separately' : 'whole photo fitted'}`
+    : `Per-photo fit: ${f1(p.adaptive?.normalise?.exposure)} EV · WB ${f1(p.adaptive?.normalise?.temp)} / ${f1(p.adaptive?.normalise?.tint)}`;
   const look = lookOf(p), requestedKind = (D && D.styleKind) || look?.kind || 'preset';
   const kind = requestedKind === 'none' ? 'none' : 'preset';
   const pr = presetOf(p);
@@ -1510,9 +1513,9 @@ function styleCard(p) {
     body = '<p class="muted small" style="margin:8px 0 0">Use the photo as it was captured. Manual edits remain available below.</p>';
   } else {
     body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}${q.adaptiveLook ? '<em>Adaptive</em>' : ''}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
-      <p class="muted small" style="margin:8px 0 0">${pr?.adaptiveLook ? 'This look adapts tone and color to each photo. Manual controls adjust the result; preview the effect.' : 'Match this photo to the selected reference. Tone and color are fitted separately, then skin is corrected. Manual controls adjust the result; check measurements and preview.'}</p>
+      <p class="muted small" style="margin:8px 0 0">${pr?.adaptiveLook ? 'Fits lighting, supported colors, and detected skin to the selected reference. Check the measured result and preview; manual controls adjust the fit.' : 'Match this photo to the selected reference. Tone and color are fitted separately, then skin is corrected. Manual controls adjust the result; check measurements and preview.'}</p>
       ${S.presets.some((q) => q.adaptiveLook) ? '<p class="muted small adaptive-credit">Adaptive looks are measured from example photos on the <a href="https://www.cvatik.com/demo" target="_blank" rel="noopener">Cvatik demo</a>; they do not include its paid original preset files.</p>' : ''}
-      ${pr ? `${strengthRow('str', pr.adaptiveLook ? 'Amount' : 'Match', p.strength, 100)}${pr.adaptiveLook ? `${strengthRow('skinProtection', 'Skin protection', p.skinProtection ?? 100, 100)}<div class="adaptive-status muted small">${p.adaptive ? `Per-photo fit: ${f1(p.adaptive.normalise?.exposure)} EV · WB ${f1(p.adaptive.normalise?.temp)} / ${f1(p.adaptive.normalise?.tint)} · skin protection ${p.adaptive.skinProtected ? 'active' : 'unavailable'} · mask ${p.adaptive.maskAvailable ? 'available' : 'unavailable'}${p.adaptive.warning ? ` · ${esc(p.adaptive.warning)}` : ''}` : 'This look adapts exposure, white balance, and skin for each photo.'}</div>` : ''}${pr.adaptiveLook ? '' : '<button id="workflowNeedham" class="ghost small" style="margin-top:8px">How matching works</button>'}`
+      ${pr ? `${strengthRow('str', pr.adaptiveLook ? 'Amount' : 'Match', p.strength, 100)}${pr.adaptiveLook ? `${strengthRow('skinProtection', 'Skin match', p.skinProtection ?? 100, 100)}<div class="adaptive-status muted small">${p.adaptive ? `${fittedAppearance} · skin match ${p.adaptive.skinProtected ? 'active' : 'unavailable'} · mask ${p.adaptive.maskAvailable ? 'available' : 'unavailable'}${p.adaptive.warning ? ` · ${esc(p.adaptive.warning)}` : ''}` : 'Lighting, supported colors, and skin are fitted to the reference for this photo.'}</div>` : ''}${pr.adaptiveLook ? '' : '<button id="workflowNeedham" class="ghost small" style="margin-top:8px">How matching works</button>'}`
     : '<p class="muted small" style="margin:8px 0 0">Pick a reference to copy its look onto this photo.</p>'}`;
     body += `<div class="row recipe-actions"><button type="button" id="saveRecipe">Save adjustment recipe</button><button type="button" id="loadRecipe">Load adjustment recipe</button><input id="recipeFile" type="file" accept="application/json,.json" hidden></div>`;
   }
@@ -1713,6 +1716,7 @@ function openDetail(p) {
 function bindPager() {
   const pager = $('#pager'), tabs = $('#ptabs');
   const mark = (k) => {
+    if (!D || !pager.isConnected) return;
     D.page = k;
     tabs.querySelectorAll('button[data-p]').forEach((b) => {
       const selected = b.dataset.p === k;

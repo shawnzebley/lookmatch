@@ -1,5 +1,5 @@
 // Network-first cache so the app opens offline but always picks up new versions.
-const C = 'lookmatch-v14';
+const C = 'lookmatch-v15';
 self.addEventListener('install', (e) => self.skipWaiting());
 self.addEventListener('activate', (e) => e.waitUntil((async () => {
   for (const key of await caches.keys()) if (key.startsWith('lookmatch-') && key !== C) await caches.delete(key);

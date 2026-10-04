@@ -2,6 +2,7 @@
 import { prepare, measure, regionStats, halationSignature } from './engine/measure.js';
 import { solve, solvePreset, computeTargets } from './engine/solver.js';
 import { solveAdaptiveLook } from './engine/adaptive-look.js';
+import { adaptiveReferenceTargets } from './engine/adaptive-transfer.js';
 import { referenceTransferStats, fitReferenceTransfer } from './engine/reference-transfer.js';
 import { referenceDetailStats, fitReferenceDetail, applyReferenceDetailRGBA } from './engine/reference-detail.js';
 import { referenceRegionTargets, solveMaskedReference } from './engine/masked-reference.js';
@@ -10,6 +11,7 @@ import { compile, defaultParams, buildLUTs, applyLUTs, applyFinish, applyHalatio
 import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
 import { referenceAcceptance } from './engine/reference-acceptance.js';
+import { adaptiveAppearanceChecks, addAdaptiveAppearanceChecks } from './engine/adaptive-check.js';
 import { refineReference } from './engine/reference-refine.js';
 import { xmpPacket, xmpPreset } from './engine/xmp.js';
 import { exifSegment, xmpSegment, insertSegments, isJpeg, jpegOrientation } from './engine/jpegmeta.js';
@@ -376,7 +378,8 @@ function renderedMeasurements(e, params, refStats = null, strength = 1) {
   const heals = hasHeals(params) ? healsToOut(params.heals, e.fullW, e.fullH, e.geom, dispScale(e, src.width, e.geom)) : null;
   const out = renderInto(src, params, e.ps.subject, e.ps.skinMask, heals, e.ps.skinPeople);
   const cur = prepare(out);
-  const acceptance = refStats ? referenceAcceptance(e.ps, cur, refStats, { strength, skinMatch: params.skinMatch }) : null;
+  let acceptance = refStats ? referenceAcceptance(e.ps, cur, refStats, { strength, skinMatch: params.skinMatch }) : null;
+  if (acceptance && refStats.adaptiveFit) acceptance = addAdaptiveAppearanceChecks(acceptance, adaptiveAppearanceChecks(e.ps, cur, refStats, { strength }));
   const loss = lossReport(e.ps, cur, params);
   if (acceptance) {
     if (!acceptance.accepted) {
@@ -607,6 +610,7 @@ const handlers = {
     stats.regions = regionStats(e.ps);
     stats.maskedRegions = referenceRegionTargets(e.ps);
     stats.labTransfer = labTargets(e.ps);
+    stats.adaptiveTransfer = adaptiveReferenceTargets(e.ps);
     stats.matchVersion = 4;
     stats.signature = { halation: halationSignature(e.ps) };
     const thumb = await toJpegBlob(scaledData(bmp, 480), 0.85);
@@ -874,11 +878,21 @@ const handlers = {
     const e = await ensurePrepared(id);
     const o = measure(e.ps);
     if (adaptiveLook) {
-      const result = solveAdaptiveLook(e.ps, adaptiveLook, { strength, skinProtection, scene: e.scene });
+      const result = solveAdaptiveLook(e.ps, adaptiveLook, { strength, skinProtection, scene: e.scene, split });
       for (const key of ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points']) if (kept[key] != null) result.params[key] = kept[key];
-      const checked = renderedMeasurements(e, result.params, null, strength);
+      const reference = adaptiveLook.reference?.after ? { ...adaptiveLook.reference.after, adaptiveFit: true, adaptiveSplit: split } : null;
+      if (reference && result.targets?.tone && (strength ?? 1) > 0) {
+        const src = e.solveImage;
+        const heals = hasHeals(result.params) ? healsToOut(result.params.heals, e.fullW, e.fullH, e.geom, dispScale(e, src.width, e.geom)) : null;
+        const refined = refineReference(e.ps, result.params, result.targets,
+          params => prepare(renderInto(src, params, e.ps.subject, e.ps.skinMask, heals, e.ps.skinPeople)),
+          { skinTarget: skinProtection > 0 ? reference.skinMatch : null, regional: split && result.regions ? reference.regions : null, strength: strength ?? 1, skinStrength: (strength ?? 1) * skinProtection, appearanceReference: reference, passes: 1 });
+        result.params = refined.params;
+        result.timings.refinement = refined.refinement;
+      }
+      const checked = renderedMeasurements(e, result.params, reference, strength);
       return { ...result, before: o, ...checked, scene: e.scene, model: null, style: null,
-        regions: null, mask: maskInfo(e) };
+        mask: maskInfo(e) };
     }
     const acceptanceReference = !lrParams ? refStats : null;
     let model = null;
@@ -1060,7 +1074,9 @@ const handlers = {
       const exported = await createImageBitmap(out.jpeg);
       try {
         const cur = prepare(scaledData(exported, SOLVE_SIDE));
-        out.acceptance = { ...referenceAcceptance(acceptanceSource, cur, refStats, { strength, skinMatch: params.skinMatch }), scope: 'export-sample' };
+        let acceptance = referenceAcceptance(acceptanceSource, cur, refStats, { strength, skinMatch: params.skinMatch });
+        if (refStats.adaptiveFit) acceptance = addAdaptiveAppearanceChecks(acceptance, adaptiveAppearanceChecks(acceptanceSource, cur, refStats, { strength }));
+        out.acceptance = { ...acceptance, scope: 'export-sample' };
       } finally { exported.close(); }
     }
     const labMapping = params.referenceTransfer || Object.values(params.local || {}).some((r) => r.referenceTransfer);
