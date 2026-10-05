@@ -24,7 +24,7 @@ import { personMask, tapMask, maskCanvasSize, segmenter } from './segment.js';
 import { visionErrors, LOADER, WASM, MP_BUILD } from './mp.js';
 import { sceneFromExif } from './engine/scene.js';
 import { edgeSharpness, focusScore, FOCUS_SIDE, eyesClosed, sceneSig } from './engine/cull.js';
-import { srgbToLinear, linearToSrgb, lToY } from './engine/color.js';
+import { srgbToLinear, linearToSrgb, linToLab, lToY } from './engine/color.js';
 import { stylizeRemote } from './lib/deeppreset.js';
 import { autoAdjustResult, autoAdjustBase, sCurvePush, skinWhiteBalance, presenceFor, highlightRollOff, fadeFor, skinPoint, lookColor, lookFade, lookSkinPoint, lookBands, lookPresence, colorContrast, zoneChannelShifts, applyChannelShift, referenceCurveContrast, referenceFinish } from './engine/auto-adjust.js';
 
@@ -721,23 +721,26 @@ const handlers = {
     return { heal: { x: px / W, y: py / H, r: size, sx: sx / W, sy: sy / H, op: opacity } };
   },
 
-  // Point colour: the colour under (x, y) (0..1 of the photo as shown), as it comes out of the current
-  // edit without point colours, in Lab.
-  async samplePoint({ id, x, y, params, side = 1200 }) {
+  // Pick original color for an HSL range; legacy callers can sample the edited Lab color.
+  async samplePoint({ id, x, y, params, side = 1200, source = false }) {
     const d = await ensureDisplay(id, side, false);
     const X = Math.round(x * (d.width - 1)), Y = Math.round(y * (d.height - 1)), rad = Math.max(2, Math.round(d.width / 250));
     const proc = compile({ ...params, points: [] });
-    const res = new Float64Array(6), acc = [0, 0, 0];
+    const res = new Float64Array(6), acc = [0, 0, 0], rgb = [0, 0, 0];
     let n = 0;
     for (let j = -rad; j <= rad; j++) for (let i = -rad; i <= rad; i++) {
       const u = X + i, v = Y + j;
       if (u < 0 || v < 0 || u >= d.width || v >= d.height) continue;
       const o = (v * d.width + u) * 4;
-      proc(srgbToLinear(d.data[o] / 255), srgbToLinear(d.data[o + 1] / 255), srgbToLinear(d.data[o + 2] / 255), res);
+      const r = srgbToLinear(d.data[o] / 255), g = srgbToLinear(d.data[o + 1] / 255), b = srgbToLinear(d.data[o + 2] / 255);
+      if (source) {
+        linToLab(r, g, b, res.subarray(3));
+      } else proc(r, g, b, res);
+      for (let c = 0; c < 3; c++) rgb[c] += d.data[o + c] / 255;
       acc[0] += res[3]; acc[1] += res[4]; acc[2] += res[5]; n++;
     }
     if (!n) throw new Error('That spot is outside the photo');
-    return { L: acc[0] / n, a: acc[1] / n, b: acc[2] / n };
+    return { L: acc[0] / n, a: acc[1] / n, b: acc[2] / n, rgb: rgb.map(v => v / n) };
   },
 
   // Tone-curve picker: sample the displayed point after the other settings, but before the selected curve.
