@@ -35,25 +35,10 @@ function fitPalette(source, target, strength) {
     : { ...target, mean: source.mean, std: source.std, hueSectors: [] };
   const colorSource = source.paletteSupported && target.paletteSupported ? source
     : { ...source, hueSectors: [] };
-  const transfer = fitReferenceTransfer(colorSource, colorTarget, { strength });
+  const transfer = fitReferenceTransfer(colorSource, colorTarget, { strength, preserveColors: true });
   if (!transfer || transfer.identity) return transfer;
   transfer.chromaFade = [4, 12];
-  // Match supported colored sectors without shifting a neutral fabric sample
-  // by the overall color difference between unrelated source and reference scenes.
-  const neutralMean = transfer.sourceMean.map((v, i) => v * transfer.abScale[i]);
-  const removedBias = transfer.targetMean.map((v, i) => v - neutralMean[i]);
-  transfer.targetMean = neutralMean;
-  transfer.hueSectors = transfer.hueSectors.map((sector) => ({ ...sector,
-    deltaA: sector.deltaA + removedBias[0] / sector.weight,
-    deltaB: sector.deltaB + removedBias[1] / sector.weight,
-  }));
   return transfer;
-}
-
-function regionIndices(ps, region) {
-  if (!region) return null;
-  return Int32Array.from(Array.from({ length: ps.n }, (_, i) => i)
-    .filter((i) => region === 'subject' ? ps.subject[i] >= REGION_IN : ps.subject[i] < REGION_OUT));
 }
 
 function bandCorrections(ps, rendered, targetStats, strength, region) {
@@ -63,17 +48,30 @@ function bandCorrections(ps, rendered, targetStats, strength, region) {
   const aims = computeTargets(before, targetStats, { strength, adaptive: true }).bands;
   const corrections = [];
   for (const name of BANDS) {
-    const aim = aims[name], source = before.bandsAdaptive[name], have = predicted.bandsAdaptive[name];
-    if (!aim || !source || !have || have.weight < 0.015) continue;
-    const targetRadians = aim.hue * Math.PI / 180;
+    const aim = aims[name], source = before.bandsAdaptive[name];
+    const reference = targetStats.bandsAdaptive[name], have = predicted.bandsAdaptive[name];
+    // Only correspond a measured RGB hue band when both images have meaningful,
+    // chromatic support. This avoids treating a missing hue as neutral evidence.
+    if (!aim || !source || !reference || !have || source.weight < 0.015 || reference.weight < 0.015 ||
+        source.chroma < 5 || reference.chroma < 5 || have.weight < 0.015) continue;
+    const hueDelta = Math.max(-25, Math.min(25, ((aim.hue - source.hue + 540) % 360) - 180));
+    const ratio = aim.chroma / Math.max(1e-6, source.chroma);
+    const chroma = source.chroma * Math.max(0.7, Math.min(1.3, ratio));
+    const targetRadians = (source.hue + hueDelta) * Math.PI / 180;
     const haveRadians = have.hue * Math.PI / 180;
-    const desiredAB = [Math.cos(targetRadians) * aim.chroma, Math.sin(targetRadians) * aim.chroma];
+    const desiredAB = [Math.cos(targetRadians) * chroma, Math.sin(targetRadians) * chroma];
     const predictedAB = [Math.cos(haveRadians) * have.chroma, Math.sin(haveRadians) * have.chroma];
     if (![...desiredAB, ...predictedAB].every(Number.isFinite)) continue;
     corrections.push({ center: (source.hue + 360) % 360, width: 32, weight: 1,
       deltaA: desiredAB[0] - predictedAB[0], deltaB: desiredAB[1] - predictedAB[1] });
   }
   return corrections;
+}
+
+function regionIndices(ps, region) {
+  if (!region) return null;
+  return Int32Array.from(Array.from({ length: ps.n }, (_, i) => i)
+    .filter((i) => region === 'subject' ? ps.subject[i] >= REGION_IN : ps.subject[i] < REGION_OUT));
 }
 
 export function adaptiveReferenceTargets(ps) {

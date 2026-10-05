@@ -63,6 +63,8 @@ export function renderedTargetError(ps, cur, targets, { regional = null, strengt
 
 export function refineReference(ps, params, targets, render, { skinTarget = null, regional = null, strength = 1, skinStrength = strength, appearanceReference = null, passes = 2 } = {}) {
   let best = structuredClone(params), evaluations = 0;
+  const preservesColors = params.referenceTransfer?.preserveColors
+    || ['subject', 'background'].some(name => params.local?.[name]?.referenceTransfer?.preserveColors);
   const evaluate = (p) => { evaluations++; return renderedTargetError(ps, render(p), targets, { regional, strength, appearanceReference }); };
   const initial = evaluate(best);
   let error = initial;
@@ -70,6 +72,10 @@ export function refineReference(ps, params, targets, render, { skinTarget = null
   for (let pass = 0; pass < passes; pass++) {
     for (const scope of best.local && regional ? ['subject', 'background'] : [null]) {
     for (const [key, initialStep] of [['exposure', 0.12], ['contrast', 12], ['highlights', 20], ['shadows', 20], ['temp', 4], ['tint', 4], ['saturation', 5]]) {
+      // Guarded transfer already fits tone within each color's gamut. Any
+      // later scene-wide adjustment can bleach it again, including exposure.
+      // Keep those automatic fits intact; manual controls remain unrestricted.
+      if (preservesColors) continue;
       const step = initialStep / (pass + 1), range = SLIDER_BY_KEY[key].ui;
       let winner = best, winnerError = error;
       for (const direction of [-1, 1]) {

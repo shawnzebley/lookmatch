@@ -50,10 +50,10 @@ function solveLabReference(ps, refStats, strength, split) {
   const canSplit = split && ['subject', 'background'].every((r) => source[r]?.n >= 200 && target[r]?.n >= 200);
   if (canSplit) {
     params.local = Object.fromEntries(['subject', 'background'].map((r) => [r,
-      { referenceTransfer: fitReferenceTransfer(source[r], target[r], { strength }), curveAuto: 'reference' }]));
+      { referenceTransfer: fitReferenceTransfer(source[r], target[r], { strength, preserveColors: true }), curveAuto: 'reference' }]));
     if (Object.values(params.local).some((r) => !r.referenceTransfer)) return null;
   } else {
-    params.referenceTransfer = fitReferenceTransfer(source.all, target.all, { strength });
+    params.referenceTransfer = fitReferenceTransfer(source.all, target.all, { strength, preserveColors: true });
     if (!params.referenceTransfer) return null;
   }
   params.referenceMethod = 'lab-distribution'; params.curveAuto = 'reference';
