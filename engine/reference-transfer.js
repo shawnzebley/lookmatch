@@ -77,7 +77,7 @@ function valid(s) {
 }
 
 /** Fit a smooth monotone L quantile curve and diagonal Lab chroma normalization. */
-export function fitReferenceTransfer(sourceStats, refStats, { strength = 1 } = {}) {
+export function fitReferenceTransfer(sourceStats, refStats, { strength = 1, preserveColors = false } = {}) {
   if (!valid(sourceStats) || !valid(refStats) || !finite(strength)) return null;
   const amount = Math.max(0, Math.min(1, strength));
   const Lmap = sourceStats.Lquantiles.map((v, i) => v + (refStats.Lquantiles[i] - v) * amount);
@@ -111,9 +111,27 @@ export function fitReferenceTransfer(sourceStats, refStats, { strength = 1 } = {
     hueSectors.push({ center, width: HUE_RADIUS, deltaA: desired[0] - predicted[0],
       deltaB: desired[1] - predicted[1], weight });
   }
+  if (preserveColors) {
+    // Automatic look matching should only move a color where both images contain
+    // that hue. Keep unsupported colors exactly at their source a/b values.
+    for (const sector of hueSectors) {
+      const src = srcSectors.get(sector.center), ref = refSectors.get(sector.center);
+      const sourceHue = Math.atan2(src.mean[1], src.mean[0]);
+      const targetHue = Math.atan2(ref.mean[1], ref.mean[0]);
+      let hueDelta = ((targetHue - sourceHue + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+      hueDelta = Math.max(-25 * Math.PI / 180, Math.min(25 * Math.PI / 180, hueDelta * amount));
+      const sourceChroma = Math.hypot(...src.mean), targetChroma = Math.hypot(...ref.mean);
+      const ratio = sourceChroma > 1e-6 ? targetChroma / sourceChroma : 1;
+      const chromaScale = 1 + (Math.max(0.7, Math.min(1.3, ratio)) - 1) * amount;
+      const mappedHue = sourceHue + hueDelta, mappedChroma = sourceChroma * chromaScale;
+      sector.deltaA = Math.cos(mappedHue) * mappedChroma - src.mean[0];
+      sector.deltaB = Math.sin(mappedHue) * mappedChroma - src.mean[1];
+    }
+  }
   return { version: 1, strength: amount, identity: amount === 0, sourceL: [...sourceStats.Lquantiles], targetL: Lmap,
-    sourceMean: [...sourceStats.mean], targetMean: sourceStats.mean.map((v, i) => v + (refStats.mean[i] - v) * amount),
-    abScale: scale, hueSectors };
+    sourceMean: [...sourceStats.mean], targetMean: preserveColors ? [...sourceStats.mean]
+      : sourceStats.mean.map((v, i) => v + (refStats.mean[i] - v) * amount),
+    abScale: preserveColors ? [1, 1] : scale, hueSectors, preserveColors };
 }
 
 function mapL(L, transform) {
@@ -167,10 +185,11 @@ export function applyReferenceTransferLinear(r, g, b, transform, out = new Float
     out[0] = r; out[1] = g; out[2] = b; out[3] = lab[0]; out[4] = lab[1]; out[5] = lab[2];
     return out;
   }
-  const L = Math.max(0, Math.min(100, mapL(lab[0], transform)));
+  let L = Math.max(0, Math.min(100, mapL(lab[0], transform)));
   let a = transform.targetMean[0] + (lab[1] - transform.sourceMean[0]) * transform.abScale[0];
   let bb = transform.targetMean[1] + (lab[2] - transform.sourceMean[1]) * transform.abScale[1];
   const originalChroma = Math.hypot(lab[1], lab[2]);
+  let correspondence = 0;
   const chromaFade = transform.chromaFade
     ? smoothstep(transform.chromaFade[0], transform.chromaFade[1], originalChroma)
     : originalChroma >= HUE_MIN_CHROMA ? 1 : 0;
@@ -180,6 +199,7 @@ export function applyReferenceTransferLinear(r, g, b, transform, out = new Float
     for (const sector of transform.hueSectors) {
       const w = hueMembership(hue, sector.center) * sector.weight;
       if (!w) continue;
+      correspondence += w;
       da += sector.deltaA * w; db += sector.deltaB * w; total += w;
     }
     // Missing adjacent sectors must fade to zero rather than jump at the sector boundary.
@@ -191,11 +211,37 @@ export function applyReferenceTransferLinear(r, g, b, transform, out = new Float
     for (const sector of transform.bandCorrections) {
       const w = hueMembership(hue, sector.center, sector.width) * sector.weight;
       if (!w) continue;
+      correspondence += w;
       da += sector.deltaA * w; db += sector.deltaB * w; total += w;
     }
     if (total > 0) {
       const scale = 1 / Math.max(1, total);
       a += da * scale * chromaFade; bb += db * scale * chromaFade;
+    }
+  }
+  if (transform.preserveColors && originalChroma >= HUE_MIN_CHROMA) {
+    // No matching colored content means no target for this color's lightness
+    // either. A neutral reference cannot turn a dark green shirt mint/white.
+    if (correspondence === 0) { L = lab[0]; a = lab[1]; bb = lab[2]; }
+    // A white reference's lightness can itself bleach a colored object during
+    // gamut mapping. Limit automatic lightness before sacrificing its color.
+    const requestedL = L, minimumChroma = originalChroma * 0.7;
+    const candidate = new Float64Array(3), check = new Float64Array(3);
+    const retainsColor = (lightness) => {
+      gamutMap(lightness, a, bb, candidate);
+      linToLab(candidate[0], candidate[1], candidate[2], check);
+      return Math.hypot(check[1], check[2]) >= minimumChroma;
+    };
+    if (!retainsColor(requestedL)) {
+      let safe = lab[0], unsafe = requestedL;
+      // If a supported hue move is out of gamut even at the source lightness,
+      // prefer its original color over silently neutralizing the object.
+      if (!retainsColor(safe)) { a = lab[1]; bb = lab[2]; }
+      for (let step = 0; step < 20; step++) {
+        const mid = (safe + unsafe) / 2;
+        if (retainsColor(mid)) safe = mid; else unsafe = mid;
+      }
+      L = safe;
     }
   }
   gamutMap(L, a, bb, out);

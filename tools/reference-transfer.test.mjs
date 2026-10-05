@@ -81,6 +81,36 @@ test('supported corresponding hue sector moves toward its reference sector', () 
   assert.ok(Math.hypot(after[4] - 20, after[5] - 8) < Math.hypot(before[1] - 20, before[2] - 8));
 });
 
+test('preserveColors keeps a green source identifiable when a bright neutral reference has no green', () => {
+  const green = labToLin(55, -30, 25, [0, 0, 0]);
+  const white = labToLin(100, 0, 0, [0, 0, 0]);
+  const source = referenceTransferStats(ps(Array.from({ length: 40 }, () => green)));
+  const reference = referenceTransferStats(ps(Array.from({ length: 40 }, () => white)));
+  assert.equal(reference.hueSectors.length, 0);
+  const transfer = fitReferenceTransfer(source, reference, { preserveColors: true });
+  const before = lab(...green), after = applyReferenceTransferLinear(...green, transfer);
+  const beforeHue = Math.atan2(before[2], before[1]), afterHue = Math.atan2(after[5], after[4]);
+  assert.ok(Math.abs(afterHue - beforeHue) < 0.03, `green hue changed: ${beforeHue} -> ${afterHue}`);
+  assert.ok(Math.hypot(after[4], after[5]) > 15, `green became neutral: ${after.slice(3)}`);
+  assert.ok(Math.hypot(after[4], after[5]) >= Math.hypot(before[1], before[2]) * 0.69,
+    'Even a fully white reference must not bleach the green through lightness/gamut mapping');
+  close(after[3], before[0]);
+  for (let channel = 0; channel < 3; channel++) close(after[channel], green[channel]);
+});
+
+test('preserveColors bounds corresponding green adjustments in hue and chroma', () => {
+  const srcRgb = labToLin(58, -28, 24, [0, 0, 0]);
+  const refRgb = labToLin(58, -8, 35, [0, 0, 0]);
+  const source = referenceTransferStats(ps(Array.from({ length: 40 }, () => srcRgb)));
+  const reference = referenceTransferStats(ps(Array.from({ length: 40 }, () => refRgb)));
+  const transfer = fitReferenceTransfer(source, reference, { preserveColors: true });
+  const before = lab(...srcRgb), after = applyReferenceTransferLinear(...srcRgb, transfer);
+  const hueDelta = Math.abs(((Math.atan2(after[5], after[4]) - Math.atan2(before[2], before[1]) + Math.PI * 3) % (2 * Math.PI)) - Math.PI);
+  const chromaRatio = Math.hypot(after[4], after[5]) / Math.hypot(before[1], before[2]);
+  assert.ok(hueDelta <= 25 * Math.PI / 180 + 0.02, `hue moved ${hueDelta * 180 / Math.PI} degrees`);
+  assert.ok(chromaRatio >= 0.69 && chromaRatio <= 1.31, `chroma ratio ${chromaRatio}`);
+});
+
 test('partial hue residual compares partially transformed global and sector means', () => {
   const source = { ...stats(Array(257).fill(55), [10, 5], [4, 4]),
     hueSectors: [{ center: 0, n: 100, mean: [20, 10] }] };
