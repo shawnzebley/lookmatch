@@ -79,6 +79,10 @@ The **Needham workflow** button describes the reference Auto Adjust sequence bas
 
 ## LAB reference matching and TIFF CLI
 
+In Color → Point color, pick a source color and set separate hue, saturation, and lightness ranges with a soft edge. The point's Hue/Saturation/Luminance adjustments affect only source colors inside that range. Selection uses the original image, so prior edits do not change which pixels qualify. Legacy points keep their original behavior until repicked.
+
+Enable **Limit reference matching to this range** to restrict the automatic LAB lighting/palette mapping to that source range. Each reference region needs at least 20 effective matching samples and 1.5% support in its deterministic sample set; strength fades toward full at 3% support. Missing reference samples or insufficient matching color leave the mapping unchanged in that range. Re-add older uploaded references to obtain these measurements; bundled references include them. The range covers matching colors anywhere in the photo and is saved with adjustment recipes. Skin correction, finish effects, and other manual controls remain separate.
+
 Newly measured references use a per-photo LAB distribution mapping: one smooth luminance quantile curve, separate a/b mean and variance transfer, and supported circular hue-sector residuals. Subject and background get separate mappings when both masks have enough support. Local luminance detail is fitted at the analysis resolution; skin is corrected after rendering. Manual sliders adjust this baseline. Auto Adjust runs the Needham workflow over the result; Re-match restores the calculated reference fit.
 
 The browser still renders 8-bit JPEGs. LAB mappings cannot be represented by Lightroom slider sidecars, so those exports are omitted with a visible explanation. Python offers a separate high-precision path:

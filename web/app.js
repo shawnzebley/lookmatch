@@ -1,6 +1,8 @@
 import { SLIDERS, CURVE_SATURATION, defaultParams, compile, LOCAL_SLIDERS, REGIONS, CURVE_KEYS, curveLUT, isIdentityCurve } from './engine/pipeline.js';
 import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
 import { srgbToLinear, linearToSrgb } from './engine/color.js';
+import { rgbToHsl } from './engine/color-range.js';
+import { referenceRangeSupport } from './engine/reference-color-range.js';
 import { PCTS } from './engine/measure.js';
 import { hsvToRgb, wheelHueToAB, abToWheelHue, labToLin } from './engine/color.js';
 import { isIdentityGeom, maxRect, towardValid, fitAfterTurn, validRect, geomSize } from './engine/geom.js';
@@ -9,7 +11,7 @@ import { groupScenes, keeperScore } from './engine/cull.js';
 import * as db from './lib/db.js';
 import * as drive from './lib/drive.js';
 
-const APP_VERSION = '2026-10-05a';
+const APP_VERSION = '2026-10-05b';
 
 // ---------------------------------------------------------------- helpers
 const $ = (s, el = document) => el.querySelector(s);
@@ -616,9 +618,18 @@ function ensurePresetRegions(pr) {
 }
 
 // hand edits the style doesn't solve: they survive Redo and a style change
-const KEEP_KEYS = ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points'];
-const keptEdits = (params) => Object.fromEntries(KEEP_KEYS.filter((k) => params && params[k] != null)
-  .map((k) => [k, structuredClone(k === 'points' ? params[k].filter(point => !point.auto) : params[k])]));
+const KEEP_KEYS = ['skinTexture', 'skinClarity', 'skinTone', 'heals', 'points', 'referenceColorRange'];
+const keptEdits = (params) => {
+  const kept = Object.fromEntries(KEEP_KEYS.filter((k) => params && params[k] != null)
+    .map((k) => [k, structuredClone(k === 'points' ? params[k].filter(point => !point.auto) : params[k])]));
+  if (kept.referenceColorRange && Number.isInteger(kept.referenceColorRange.pointIndex)) {
+    const selected = params.points?.[kept.referenceColorRange.pointIndex];
+    const index = params.points?.filter(point => !point.auto).indexOf(selected) ?? -1;
+    if (index >= 0) kept.referenceColorRange.pointIndex = index;
+    else delete kept.referenceColorRange;
+  }
+  return kept;
+};
 
 function referenceCheckArgs(p) {
   const args = solveArgs(p);
@@ -1217,7 +1228,22 @@ const POINT_SLIDERS = [
   { key: 'lum', label: 'Luminance', ui: [-100, 100] },
   { key: 'range', label: 'Range', ui: [0, 100] },
 ];
+const RANGE_SLIDERS = [
+  { key: 'hueWidth', label: 'Hue range (±°)', ui: [1, 180] },
+  { key: 'satWidth', label: 'Saturation range (±)', ui: [1, 100] },
+  { key: 'lightWidth', label: 'Lightness range (±)', ui: [1, 100] },
+  { key: 'softness', label: 'Soft edge', ui: [0, 100], scale: 0.01 },
+];
 const labCss = (q) => { const o = labToLin(q.L, q.a, q.b, [0, 0, 0]) || [0, 0, 0]; return `rgb(${[0, 1, 2].map((i) => Math.round(255 * linearToSrgb(Math.min(1, Math.max(0, o[i]))))).join(',')})`; };
+
+function pointReferenceStatus(params, selection) {
+  const transfers = [params.referenceTransfer, ...Object.values(params.local || {}).map(r => r?.referenceTransfer)].filter(Boolean);
+  if (!transfers.length) return 'Choose a measured reference to enable range matching.';
+  const support = transfers.map(t => referenceRangeSupport(selection, t.referenceColors));
+  if (support.every(s => !s.available)) return 'Re-add this reference to measure color ranges. Until then, the range limit keeps its colors unchanged.';
+  if (support.every(s => !s.supported)) return 'No matching color in this range. With the range limit enabled, reference matching leaves these colors unchanged.';
+  return 'Matching color found in the reference. With the range limit enabled, only colors inside this range receive the reference mapping.';
+}
 
 function renderPointCard() {
   if (!D) return;
@@ -1227,20 +1253,42 @@ function renderPointCard() {
     <div class="mtools"><button id="ptPick" class="${D.tool === 'point' ? 'on' : ''}">Pick a color</button><div class="grow"></div><button id="ptDel" ${sel ? '' : 'disabled'}>Remove</button></div>
     <p class="muted small" style="margin:6px 0 0">${D.tool === 'point' ? 'Tap the color to change on the photo.' : pts.length ? 'Similar colors elsewhere in the photo move too. Keep it light.' : 'Pick a color on the photo, then move just that color.'}</p>
     ${pts.length ? `<div class="chips-row" id="ptList">${pts.map((q, i) => `<button data-i="${i}" class="${i === D.pointSel ? 'on' : ''}"><span class="sw" style="display:inline-block;width:16px;height:16px;border-radius:50%;background:${labCss(q)}"></span>${i + 1}</button>`).join('')}</div>` : ''}
-    ${sel ? `<div id="ptSl">${POINT_SLIDERS.map((s) => sliderRow(s, sel[s.key] ?? (s.key === 'range' ? 50 : 0))).join('')}</div>` : ''}`;
+    ${sel ? `<div id="ptSl">${POINT_SLIDERS.filter(s => !sel.selection || s.key !== 'range').map((s) => sliderRow(s, sel[s.key] ?? (s.key === 'range' ? 50 : 0))).join('')}
+      ${sel.selection ? `<h4>HSL selection</h4>${RANGE_SLIDERS.map((s) => sliderRow(s, s.key === 'softness' ? sel.selection.softness * 100 : sel.selection[s.key])).join('')}` : '<p class="muted small">Pick this color again to create an HSL range.</p>'}
+      <label class="chk"><input type="checkbox" id="ptReferenceRange" ${P.referenceColorRange && P.referenceColorRange.pointIndex === D.pointSel ? 'checked' : ''} ${P.referenceTransfer || Object.values(P.local || {}).some(r => r?.referenceTransfer) ? '' : 'disabled'}>Limit reference matching to this range</label>
+      <p class="muted small" id="ptReferenceStatus">${esc(pointReferenceStatus(P, sel.selection))}</p>
+      <p class="muted small">This range limits reference lighting and palette matching across the photo. Skin, finish, and manual edits remain active.</p></div>` : ''}`;
   $('#ptPick', box).onclick = () => setTool(D.tool === 'point' ? null : 'point');
-  $('#ptDel', box).onclick = () => { pts.splice(D.pointSel, 1); D.pointSel = pts.length - 1; D.userEdited = true; renderPointCard(); requestPreview(false); scheduleMeasure(); };
+  $('#ptDel', box).onclick = () => { pts.splice(D.pointSel, 1); if (P.referenceColorRange) delete P.referenceColorRange; D.pointSel = pts.length - 1; D.userEdited = true; renderPointCard(); requestPreview(false); scheduleMeasure(); };
   if ($('#ptList', box)) $('#ptList', box).onclick = (e) => { const i = e.target.closest('button')?.dataset.i; if (i == null) return; D.pointSel = +i; renderPointCard(); };
-  bindRows(box.querySelectorAll('#ptSl .sl'), (k, v) => { const q = (P.points || [])[D.pointSel]; if (!q) return; q[k] = v; D.userEdited = true; requestPreview(false); scheduleMeasure(); });
+  bindRows(box.querySelectorAll('#ptSl .sl'), (k, v) => {
+    const q = (P.points || [])[D.pointSel]; if (!q) return;
+    if (RANGE_SLIDERS.some((s) => s.key === k)) {
+      if (!q.selection) return;
+      q.selection[k] = k === 'softness' ? v / 100 : v;
+      if (P.referenceColorRange?.pointIndex === D.pointSel) P.referenceColorRange = { ...structuredClone(q.selection), pointIndex: D.pointSel, region: 'all' };
+      $('#ptReferenceStatus', box).textContent = pointReferenceStatus(P, q.selection);
+    } else q[k] = v;
+    D.userEdited = true; requestPreview(false); scheduleMeasure();
+  });
+  $('#ptReferenceRange', box)?.addEventListener('change', (e) => {
+    if (e.target.checked) {
+      const q = (P.points || [])[D.pointSel];
+      if (!q?.selection) { e.target.checked = false; toast('Pick a color to create an HSL range first.'); return; }
+      P.referenceColorRange = { ...structuredClone(q.selection), region: 'all', pointIndex: D.pointSel };
+    } else delete P.referenceColorRange;
+    D.userEdited = true; requestPreview(false); scheduleMeasure();
+  });
 }
 
 async function pointTap(x, y) {
   const p = D.p;
   try {
-    const c = await pool.call(p.worker, 'samplePoint', { id: p.id, x, y, params: { ...p.params }, side: previewSide() }, { priority: true });
+    const c = await pool.call(p.worker, 'samplePoint', { id: p.id, x, y, params: { ...p.params }, side: previewSide(), source: true }, { priority: true });
     if (!D || D.p !== p) return;
     const P = p.params;
-    (P.points ||= []).push({ L: c.L, a: c.a, b: c.b, hue: 0, sat: 0, lum: 0, range: 50 });
+    const hsl = rgbToHsl(c.rgb);
+    (P.points ||= []).push({ L: c.L, a: c.a, b: c.b, hsl, selection: { ...hsl, hueWidth: 30, satWidth: 25, lightWidth: 25, softness: 0.35, region: 'all' }, hue: 0, sat: 0, lum: 0, range: 50 });
     D.pointSel = P.points.length - 1;
     setTool(null);
   } catch (e) { toast(e.message, 3000); }
@@ -1456,6 +1504,13 @@ function validRecipeParams(params, local = false) {
         point.every(v => Number.isFinite(v) && v >= 0 && v <= 255) && (!i || point[0] > curve[i - 1][0]))) return false;
   }
   for (const key of ['points', 'heals']) if (params[key] != null && !Array.isArray(params[key])) return false;
+  const validRange = (range) => range && ['h', 's', 'l', 'hueWidth', 'satWidth', 'lightWidth', 'softness'].every(k => Number.isFinite(range[k])) &&
+    range.h >= 0 && range.h < 360 && range.s >= 0 && range.s <= 100 && range.l >= 0 && range.l <= 100 &&
+    range.hueWidth > 0 && range.hueWidth <= 180 && range.satWidth > 0 && range.satWidth <= 100 &&
+    range.lightWidth > 0 && range.lightWidth <= 100 && range.softness >= 0 && range.softness <= 1 &&
+    (range.region == null || ['all', 'subject', 'background'].includes(range.region));
+  if (params.referenceColorRange != null && !validRange(params.referenceColorRange)) return false;
+  if (params.points?.some(point => !point || typeof point !== 'object' || (point.selection != null && !validRange(point.selection)))) return false;
   if (params.local != null && (local || typeof params.local !== 'object' || Array.isArray(params.local) ||
       !Object.entries(params.local).every(([key, value]) => REGIONS.includes(key) && validRecipeParams(value, true)))) return false;
   if (params.skinMatch != null && (typeof params.skinMatch !== 'object' || Array.isArray(params.skinMatch) ||
@@ -1466,7 +1521,7 @@ function validRecipeParams(params, local = false) {
 async function recipeLoad(file, p) {
   if (!file || file.size > 25_000_000) throw new Error('Recipe file is too large');
   const recipe = JSON.parse(await file.text());
-  const allowed = new Set([...Object.keys(defaultParams()), ...CURVE_KEYS, 'points', 'heals', 'skinTexture', 'skinClarity', 'skinTone', 'skinMatch', 'curveAuto', 'referenceMethod', 'referenceTransfer', 'referenceDetail', 'local']);
+  const allowed = new Set([...Object.keys(defaultParams()), ...CURVE_KEYS, 'points', 'heals', 'skinTexture', 'skinClarity', 'skinTone', 'skinMatch', 'curveAuto', 'referenceMethod', 'referenceTransfer', 'referenceDetail', 'referenceColorRange', 'local']);
   if (recipe?.version !== 1 || !recipe.params || typeof recipe.params !== 'object' || Array.isArray(recipe.params) ||
       !Object.keys(recipe.params).every((k) => allowed.has(k)) || !validRecipeValue(recipe.params) || !validRecipeParams(recipe.params) ||
       !Number.isFinite(recipe.strength) || recipe.strength < 0 || recipe.strength > 100 ||

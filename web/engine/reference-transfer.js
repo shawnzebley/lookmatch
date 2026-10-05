@@ -1,5 +1,7 @@
 // Reference-matched Lab distribution transfer. Operates on linear RGB planes from measure.js.
-import { linToLab, labToLin } from './color.js';
+import { linToLab, labToLin, linearToSrgb } from './color.js';
+import { rgbToHsl, colorRangeWeight } from './color-range.js';
+import { referenceRangeSupport } from './reference-color-range.js';
 
 const Q = 256;
 const CORE = 191;
@@ -37,7 +39,8 @@ export function referenceTransferStats(ps, { mask = null } = {}) {
   if (!ps || !Number.isInteger(ps.n) || ps.n <= 0 || !ps.lr || !ps.lg || !ps.lb ||
       ps.lr.length < ps.n || ps.lg.length < ps.n || ps.lb.length < ps.n ||
       (mask && mask.length < ps.n)) return null;
-  const lab = [0, 0, 0], ls = [], as = [], bs = [];
+  const lab = [0, 0, 0], ls = [], as = [], bs = [], colorSamples = [];
+  let sampleState = 123456789;
   const sectors = Array.from({ length: HUE_SECTORS }, (_, i) => ({ center: i * HUE_STEP, weight: 0, a: 0, b: 0 }));
   let sa = 0, sb = 0, saa = 0, sbb = 0, n = 0;
   for (let i = 0; i < ps.n; i++) {
@@ -48,6 +51,13 @@ export function referenceTransferStats(ps, { mask = null } = {}) {
     const L = Math.max(0, Math.min(100, lab[0])), a = lab[1], bb = lab[2];
     if (![L, a, bb].every(finite)) continue;
     ls.push(L); as.push(a); bs.push(bb); sa += a; sb += bb; saa += a * a; sbb += bb * bb; n++;
+    sampleState ^= sampleState << 13; sampleState ^= sampleState >>> 17; sampleState ^= sampleState << 5;
+    const sampleIndex = n <= 2048 ? n - 1 : Math.floor((sampleState >>> 0) / 4294967296 * n);
+    if (sampleIndex < 2048) {
+      const hsl = rgbToHsl([r, g, b].map(linearToSrgb));
+      colorSamples[sampleIndex] = [Math.round(hsl.h * 10) / 10 % 360,
+        Math.round(hsl.s * 10) / 10, Math.round(hsl.l * 10) / 10];
+    }
     const chroma = Math.hypot(a, bb);
     if (chroma >= HUE_MIN_CHROMA) {
       const hue = (Math.atan2(bb, a) * 180 / Math.PI + 360) % 360;
@@ -63,7 +73,7 @@ export function referenceTransferStats(ps, { mask = null } = {}) {
   const hueSectors = sectors.filter((s) => s.weight >= HUE_MIN_SUPPORT && s.weight / n >= HUE_MIN_FRACTION)
     .map((s) => ({ center: s.center, n: s.weight, mean: [s.a / s.weight, s.b / s.weight] }));
   return { version: 1, n, Lquantiles: quantiles(ls), mean: [ma, mb],
-    std: [Math.sqrt(Math.max(0, saa / n - ma * ma)), Math.sqrt(Math.max(0, sbb / n - mb * mb))], hueSectors };
+    std: [Math.sqrt(Math.max(0, saa / n - ma * ma)), Math.sqrt(Math.max(0, sbb / n - mb * mb))], hueSectors, colorSamples };
 }
 
 function valid(s) {
@@ -131,7 +141,8 @@ export function fitReferenceTransfer(sourceStats, refStats, { strength = 1, pres
   return { version: 1, strength: amount, identity: amount === 0, sourceL: [...sourceStats.Lquantiles], targetL: Lmap,
     sourceMean: [...sourceStats.mean], targetMean: preserveColors ? [...sourceStats.mean]
       : sourceStats.mean.map((v, i) => v + (refStats.mean[i] - v) * amount),
-    abScale: preserveColors ? [1, 1] : scale, hueSectors, preserveColors };
+    abScale: preserveColors ? [1, 1] : scale, hueSectors, preserveColors,
+    referenceColors: refStats.colorSamples || null };
 }
 
 function mapL(L, transform) {
@@ -177,11 +188,13 @@ function gamutMap(L, a, b, out) {
 }
 
 /** Apply to a linear RGB pixel; writes [r,g,b,L,a,b] into out and returns it. */
-export function applyReferenceTransferLinear(r, g, b, transform, out = new Float64Array(6)) {
+export function applyReferenceTransferLinear(r, g, b, transform, out = new Float64Array(6), selection = null) {
   if (!transform || transform.version !== 1 || ![r, g, b].every(finite)) return null;
   const lab = [0, 0, 0];
   linToLab(r, g, b, lab);
-  if (transform.identity) {
+  const rangeWeight = selection ? colorRangeWeight([r, g, b].map(linearToSrgb), selection)
+    * referenceRangeSupport(selection, transform.referenceColors).weight : 1;
+  if (transform.identity || rangeWeight === 0) {
     out[0] = r; out[1] = g; out[2] = b; out[3] = lab[0]; out[4] = lab[1]; out[5] = lab[2];
     return out;
   }
@@ -245,6 +258,11 @@ export function applyReferenceTransferLinear(r, g, b, transform, out = new Float
     }
   }
   gamutMap(L, a, bb, out);
+  if (rangeWeight < 1) {
+    out[0] = r + (out[0] - r) * rangeWeight;
+    out[1] = g + (out[1] - g) * rangeWeight;
+    out[2] = b + (out[2] - b) * rangeWeight;
+  }
   const actualLab = linToLab(out[0], out[1], out[2], [0, 0, 0]);
   out[3] = actualLab[0]; out[4] = actualLab[1]; out[5] = actualLab[2];
   return out;

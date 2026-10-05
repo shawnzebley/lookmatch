@@ -10,6 +10,7 @@ import { SRGB8_TO_LIN, linearToSrgb, srgbToLinear, linToLab, labToLin, yToL, lTo
 import { BANDS, bandWeights, gradeWeights } from './measure.js';
 import { applySkinMatchLinear } from './skin-match.js';
 import { applyReferenceTransferLinear } from './reference-transfer.js';
+import { colorRangeWeight } from './color-range.js';
 
 // ---- slider definitions ---------------------------------------------------------------
 // cap = the guardrail range the solver may use; ui = the range the user may drag to.
@@ -303,7 +304,7 @@ export function compile(p) {
   const pts = (p.points || []).filter((q) => q && (q.hue || q.sat || q.lum)).map((q) => {
     const rg = q.range ?? 50, Cs = Math.hypot(q.a, q.b);
     return { L: q.L, h: Math.atan2(q.b, q.a), Cs, hw: (12 + 0.35 * rg) * Math.PI / 180, cw: 0.6 * Cs + 12 + 0.2 * rg, lw: 22 + 0.4 * rg,
-      dh: (q.hue || 0) / 100 * 30 * Math.PI / 180, ds: (q.sat || 0) / 100, dl: (q.lum || 0) / 100 * 20 };
+      dh: (q.hue || 0) / 100 * 30 * Math.PI / 180, ds: (q.sat || 0) / 100, dl: (q.lum || 0) / 100 * 20, selection: q.selection || null };
   });
 
   const cal = calibrationMatrix(p);
@@ -350,8 +351,9 @@ export function compile(p) {
 
   // process linear RGB -> writes linear RGB (in gamut) into res[0..2] and Lab into res[3..5]
   return function process(r, g, b, res) {
+    const sourceRgb = [linearToSrgb(r), linearToSrgb(g), linearToSrgb(b)];
     if (p.referenceTransfer) {
-      const mapped = applyReferenceTransferLinear(r, g, b, p.referenceTransfer, res);
+      const mapped = applyReferenceTransferLinear(r, g, b, p.referenceTransfer, res, p.referenceColorRange);
       if (mapped) { r = res[0]; g = res[1]; b = res[2]; }
     }
     if (cal) {
@@ -441,7 +443,7 @@ export function compile(p) {
         if (Cp < 1) continue;
         let dh = Math.atan2(B, A) - q.h;
         if (dh > Math.PI) dh -= 2 * Math.PI; else if (dh < -Math.PI) dh += 2 * Math.PI;
-        const w = Math.exp(-((dh / q.hw) ** 2)) * Math.exp(-(((Cp - q.Cs) / q.cw) ** 2)) * Math.exp(-(((L - q.L) / q.lw) ** 2)) * smoothstep(1, 6, Cp);
+        const w = (q.selection ? colorRangeWeight(sourceRgb, q.selection) : Math.exp(-((dh / q.hw) ** 2)) * Math.exp(-(((Cp - q.Cs) / q.cw) ** 2)) * Math.exp(-(((L - q.L) / q.lw) ** 2)) * smoothstep(1, 6, Cp));
         if (w < 1e-3) continue;
         if (q.dh) { const a = q.dh * w, cs = Math.cos(a), sn = Math.sin(a); const a2 = A * cs - B * sn; B = A * sn + B * cs; A = a2; }
         if (q.ds) { const f = Math.max(0, 1 + q.ds * w); A *= f; B *= f; }
