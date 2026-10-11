@@ -75,6 +75,8 @@ Reference acceptance checks are independent of the solver's aggregate score. A r
 
 Checks measure the actual 8-bit preview after skin correction, retouching, and finishing, rather than the solver's float prediction. Export rechecks a 512-pixel-long-side sample decoded from the encoded JPEG; this does not certify every full-resolution pixel. A failed dimension yields “needs review”; missing masks, face correspondence, target statistics, or measurement support yields “unverified.” These checks report problems without limiting the edit or blocking export. Imported Lightroom presets do not receive reference-match certification. Visual review is still required.
 
+**Dynamic looks** (`web/looks/rupp.json`, `web/looks/rupp/*.xmp`, `engine/dynamic-preset.js`) are six recipes from Austin Rupp's Instagram edit-breakdown carousels. Global sliders, HSL, colour grading, point/RGB curves and grain are the published values. Each photo first gets its own exposure and white-balance normalisation (the Lightroom preset path), then the recipe. The parametric curve and whole-image fade curves are folded into the master curve; the parametric shape is an approximation. Kelvin white balance, texture, clarity, dehaze, grade blending and local masks are listed in the app as not applied. The step list in the detail view follows the order of each carousel. Point curves were read off screenshots, about ±5 levels.
+
 The **Needham workflow** button describes the reference Auto Adjust sequence based on Gerard Needham's published written curve guidance. No video transcript or creator-specific preset has been verified or encoded.
 
 ## LAB reference matching and TIFF CLI

@@ -1,0 +1,130 @@
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+   crs:PresetType="Normal"
+   crs:Cluster=""
+   crs:UUID="769E800D4B4B50CAAE5506C26A74FC52"
+   crs:SupportsAmount2="True"
+   crs:SupportsAmount="True"
+   crs:SupportsColor="True"
+   crs:SupportsMonochrome="False"
+   crs:SupportsHighDynamicRange="True"
+   crs:SupportsNormalDynamicRange="True"
+   crs:SupportsSceneReferred="True"
+   crs:SupportsOutputReferred="True"
+   crs:CameraModelRestriction=""
+   crs:Copyright=""
+   crs:ContactInfo=""
+   crs:Version="15.0"
+   crs:ProcessVersion="11.0"
+   crs:Exposure2012="+0.13"
+   crs:Contrast2012="-24"
+   crs:Highlights2012="-22"
+   crs:Shadows2012="+32"
+   crs:Whites2012="-17"
+   crs:Blacks2012="+23"
+   crs:Vibrance="+57"
+   crs:Saturation="+14"
+   crs:Texture="0"
+   crs:Clarity2012="-5"
+   crs:Dehaze="-4"
+   crs:PostCropVignetteAmount="0"
+   crs:GrainAmount="24"
+   crs:GrainSize="22"
+   crs:GrainFrequency="64"
+   crs:ParametricShadows="0"
+   crs:ParametricDarks="0"
+   crs:ParametricLights="0"
+   crs:ParametricHighlights="0"
+   crs:ParametricShadowSplit="25"
+   crs:ParametricMidtoneSplit="50"
+   crs:ParametricHighlightSplit="75"
+   crs:SplitToningShadowHue="206"
+   crs:SplitToningShadowSaturation="5"
+   crs:ColorGradeShadowLum="-1"
+   crs:ColorGradeMidtoneHue="36"
+   crs:ColorGradeMidtoneSat="3"
+   crs:ColorGradeMidtoneLum="0"
+   crs:SplitToningHighlightHue="42"
+   crs:SplitToningHighlightSaturation="3"
+   crs:ColorGradeHighlightLum="+1"
+   crs:ColorGradeBlending="32"
+   crs:SplitToningBalance="-8"
+   crs:ColorGradeGlobalHue="0"
+   crs:ColorGradeGlobalSat="0"
+   crs:ColorGradeGlobalLum="0"
+   crs:HasSettings="True"
+   crs:WhiteBalance="Custom"
+   crs:Temperature="6220"
+   crs:Tint="+13"
+   crs:HueAdjustmentRed="+2"
+   crs:SaturationAdjustmentRed="+8"
+   crs:LuminanceAdjustmentRed="+8"
+   crs:HueAdjustmentOrange="-1"
+   crs:SaturationAdjustmentOrange="+2"
+   crs:LuminanceAdjustmentOrange="+4"
+   crs:HueAdjustmentYellow="-5"
+   crs:SaturationAdjustmentYellow="-8"
+   crs:LuminanceAdjustmentYellow="+4"
+   crs:HueAdjustmentGreen="+8"
+   crs:SaturationAdjustmentGreen="-18"
+   crs:LuminanceAdjustmentGreen="-6"
+   crs:HueAdjustmentAqua="-6"
+   crs:SaturationAdjustmentAqua="-8"
+   crs:LuminanceAdjustmentAqua="-3"
+   crs:HueAdjustmentBlue="-12"
+   crs:SaturationAdjustmentBlue="-6"
+   crs:LuminanceAdjustmentBlue="+31"
+   crs:HueAdjustmentPurple="0"
+   crs:SaturationAdjustmentPurple="-6"
+   crs:LuminanceAdjustmentPurple="0"
+   crs:HueAdjustmentMagenta="0"
+   crs:SaturationAdjustmentMagenta="-6"
+   crs:LuminanceAdjustmentMagenta="0">
+   <crs:Name>
+    <rdf:Alt>
+     <rdf:li xml:lang="x-default">Rupp 06 - Coastal Sunset</rdf:li>
+    </rdf:Alt>
+   </crs:Name>
+   <crs:Group>
+    <rdf:Alt>
+     <rdf:li xml:lang="x-default">Austin Rupp (from IG)</rdf:li>
+    </rdf:Alt>
+   </crs:Group>
+   <crs:ToneCurvePV2012>
+    <rdf:Seq>
+     <rdf:li>0, 5</rdf:li>
+     <rdf:li>64, 58</rdf:li>
+     <rdf:li>128, 130</rdf:li>
+     <rdf:li>192, 200</rdf:li>
+     <rdf:li>255, 250</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012>
+   <crs:ToneCurvePV2012Red>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>64, 55</rdf:li>
+     <rdf:li>128, 132</rdf:li>
+     <rdf:li>192, 200</rdf:li>
+     <rdf:li>255, 250</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012Red>
+   <crs:ToneCurvePV2012Green>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>64, 60</rdf:li>
+     <rdf:li>128, 128</rdf:li>
+     <rdf:li>192, 198</rdf:li>
+     <rdf:li>255, 252</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012Green>
+   <crs:ToneCurvePV2012Blue>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>255, 255</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012Blue>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
