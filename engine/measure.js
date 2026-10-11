@@ -7,10 +7,12 @@ import { SRGB8_TO_LIN, linearToSrgb, linToLab, rgbHue, abToWheelHue, labToCctDuv
 import { skinStats } from './skin-match.js';
 
 function smoothstep(a, b, x) { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
-export function gradeWeights(L, shift = 0, out = [0, 0, 0]) {
-  const x = L / 100 - shift;
-  const ws = 1 - smoothstep(0.12, 0.5, x);
-  const wh = smoothstep(0.5, 0.88, x);
+// blend = Lightroom's Blending / 100. 0.5 (Lightroom's default) keeps these weights; lower narrows each
+// transition around its middle, higher widens the overlap.
+export function gradeWeights(L, shift = 0, out = [0, 0, 0], blend = 0.5) {
+  const x = L / 100 - shift, k = blend <= 0.5 ? 0.25 + 1.5 * blend : 1 + (blend - 0.5);
+  const ws = 1 - smoothstep(0.31 - 0.19 * k, 0.31 + 0.19 * k, x);
+  const wh = smoothstep(0.69 - 0.19 * k, 0.69 + 0.19 * k, x);
   out[0] = ws; out[1] = Math.max(0, 1 - ws - wh); out[2] = wh;
   return out;
 }

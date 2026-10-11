@@ -23,7 +23,13 @@ test('six dynamic looks, each with a readable recipe', () => {
     assert.equal(steps[0].step, 'Light');
     assert.equal(steps.length, 7 + look.masks.length);
     assert.ok(!notApplied.includes('parametric curve'), 'parametric is folded into the master curve');
-    if (s.WhiteBalance === 'Custom') assert.ok(notApplied.includes('Kelvin white balance'));
+    if (s.WhiteBalance === 'Custom') assert.ok(Number.isFinite(params.temp), 'Kelvin becomes a relative Temp');
+    assert.equal(params.lookMasks.length, look.masks.length, 'every mask is placed');
+    assert.ok(steps.every((st) => st.applied), 'every step is applied');
+    assert.deepEqual(notApplied, []);
+    assert.equal(params.grainRoughness, s.GrainFrequency);
+    assert.equal(params.gradeBlending, s.ColorGradeBlending);
+    assert.equal(params.clarity, s.Clarity2012);
     // the whole recipe renders to finite colors
     const f = compile(params), out = new Float32Array(6);
     for (const v of [0, 0.02, 0.2, 0.5, 0.9, 1]) {

@@ -77,9 +77,6 @@ export function unsupported(settings) {
   const out = [];
   const nz = (k) => typeof settings[k] === 'number' && settings[k] !== 0;
   if (['ParametricShadows', 'ParametricDarks', 'ParametricLights', 'ParametricHighlights'].some(nz)) out.push('parametric curve');
-  if (nz('Clarity2012')) out.push('clarity');
-  if (nz('Dehaze')) out.push('dehaze');
-  if (nz('Texture')) out.push('texture');
   if (nz('VignetteAmount') && !nz('PostCropVignetteAmount')) out.push('lens vignette');
   if (settings.ConvertToGrayscale === true) out.push('B&W mix');
   if (settings.hasLocal) out.push('local masks');

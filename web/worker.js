@@ -10,6 +10,8 @@ import { applySkinMatchRGBA } from './engine/skin-match.js';
 import { compile, defaultParams, buildLUTs, applyLUTs, applyFinish, applyHalation, halationRadius, hasSpatialFinish, hasLocal, processPixelSet, curveLUT, fadeLevels, SLIDERS, LOCAL_SLIDERS, REGIONS, withLocal } from './engine/pipeline.js';
 import { hasSkinPass, hasHeals, applySkinPass, skinHalo, healsToOut, healBox, healBuffer, pickHealSource } from './engine/retouch.js';
 import { lossReport, culprits } from './engine/loss.js';
+import { applyLookEffects, hasLookEffects, effectsHalo, hazeColor } from './engine/effects.js';
+import { buildMaskPlane, maskSpecKey, estimateLight, detectSky } from './engine/look-masks.js';
 import { referenceAcceptance } from './engine/reference-acceptance.js';
 import { adaptiveAppearanceChecks, addAdaptiveAppearanceChecks } from './engine/adaptive-check.js';
 import { refineReference } from './engine/reference-refine.js';
@@ -206,7 +208,13 @@ async function ensureMask(e, bmp) {
   let peopleLabeled = 0; for (const id of skinPeople) if (id) peopleLabeled++;
   e.mask = { w, h, person: m ? m.data : new Uint8Array(w * h), personFrac: m ? m.frac : 0, ok: !!m, err: m ? null : why, useAuto: true, picks: [], sub: null, frac: 0, ver: 0,
     skin, skinFrac: m && m.skin ? m.skinFrac : 0, skinPeople, skinPositions, peopleMethod: people?.method || 'none',
-    peopleAmbiguous: people?.ambiguous || 0, peopleLabeled, canvases: {} };
+    peopleAmbiguous: people?.ambiguous || 0, peopleLabeled, canvases: {}, lmFrac: {}, lmKey: null };
+  // a small copy of the whole photo for placing dynamic-look masks (light side, sky) and the dehaze colour
+  const small = scaledData(bmp, 256, null);
+  const gd = scaledData(bmp, Math.max(w, h), null);
+  if (gd.width === w && gd.height === h) { e.mask.guide = new Float32Array(w * h); for (let i = 0, j = 0; i < w * h; i++, j += 4) e.mask.guide[i] = (0.299 * gd.data[j] + 0.587 * gd.data[j + 1] + 0.114 * gd.data[j + 2]) / 255; }
+  e.mask.small = small;
+  e.mask.hazeA = hazeColor(small.data, small.width * small.height);
   combineMask(e);
 }
 
@@ -277,7 +285,7 @@ function maskCanvas(M, key = 'sub') {
  */
 function maskFor(e, ow, oh, g, oy = 0, photoScale = null, key = 'sub') {
   const M = e.mask;
-  if (!M || !M[key] || (key === 'sub' ? M.frac : key === 'skin' ? M.skinFrac : M.peopleLabeled) < 0.0005) return null;
+  if (!M || !M[key] || (key === 'sub' ? M.frac : key === 'skin' ? M.skinFrac : key.startsWith('lm') ? M.lmFrac[key] : M.peopleLabeled) < 0.0005) return null;
   const W = e.fullW, H = e.fullH;
   const s = photoScale ?? ow / geomSize(W, H, g)[0];
   const k = (s * W) / M.w; // output px per mask px
@@ -292,6 +300,37 @@ function maskFor(e, ow, oh, g, oy = 0, photoScale = null, key = 'sub') {
   const out = new Uint8Array(ow * oh);
   for (let i = 0, j = 0; i < out.length; i++, j += 4) out[i] = d[j];
   return out;
+}
+
+// Dynamic-look masks: each spec becomes a plane over the whole photo (M.lm0, M.lm1, ...), placed from
+// this photo's people, skin, irises, light and sky. Rebuilt only when the masks' geometry changes.
+function ensureLookMasks(e, specs) {
+  const M = e.mask;
+  if (!M || !M.small || !specs?.length) return false;
+  const key = `${M.ver}|${maskSpecKey(specs)}`;
+  if (M.lmKey === key) return true;
+  const small = M.small, sw = small.width, sh = small.height;
+  const down = (plane) => { if (!plane) return null; const o = new Uint8Array(sw * sh); for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) o[y * sw + x] = plane[Math.min(M.h - 1, (y * M.h / sh) | 0) * M.w + Math.min(M.w - 1, (x * M.w / sw) | 0)]; return o; };
+  const personSmall = down(M.sub);
+  M.light ||= estimateLight(small, personSmall);
+  const ctx = { small, person: M.sub, skin: M.skinFrac >= 0.0005 ? M.skin : null, faces: e.faces || [], light: M.light, sky: null, guide: M.guide };
+  // a close portrait's backdrop is a wall or a backdrop, not sky: people filling over 35% of the frame turn sky off
+  if (specs.some((s) => s.kind === 'sky')) ctx.sky = M.skyPlane ||= (M.personFrac > 0.35 ? new Float32Array(sw * sh) : detectSky(small, personSmall));
+  for (const k of Object.keys(M)) if (/^lm\d+$/.test(k)) { delete M[k]; delete M.canvases[k]; }
+  M.lmFrac = {}; M.lmPlaced = [];
+  specs.forEach((spec, i) => {
+    const { plane, frac, placed } = buildMaskPlane(spec, M.w, M.h, ctx);
+    M[`lm${i}`] = plane; M.lmFrac[`lm${i}`] = frac; M.lmPlaced[i] = { kind: spec.kind, frac, placed };
+  });
+  M.lmKey = key;
+  return true;
+}
+/** The look masks at an output's size (same placement rules as maskFor), plus the dehaze colour. */
+function lookFor(e, params, ow, oh, g, oy = 0, photoScale = null) {
+  if (!hasLookEffects(params)) return null;
+  const specs = params.lookMasks || [];
+  const ok = ensureLookMasks(e, specs);
+  return { hazeA: e.mask?.hazeA, planes: specs.map((_, i) => (ok ? maskFor(e, ow, oh, g, oy, photoScale, `lm${i}`) : null)) };
 }
 
 function mapPositions(positions, W, H, g) {
@@ -357,7 +396,7 @@ async function ensureDisplay(id, side, plain) {
 
 // skin: the skin mask at src's size (for the skin pass); heals: spots in src px (healed before the LUT,
 // like Lightroom's spot removal, which works on the photo before the develop settings)
-function renderInto(src, params, mask = null, skin = null, heals = null, people = null) {
+function renderInto(src, params, mask = null, skin = null, heals = null, people = null, look = null) {
   const luts = buildLUTs(params, 33);
   let out = new Uint8ClampedArray(src.width * src.height * 4);
   let data = src.data;
@@ -366,6 +405,7 @@ function renderInto(src, params, mask = null, skin = null, heals = null, people 
   if (params.referenceDetail) out = applyReferenceDetailRGBA(out, src.width, src.height, params.referenceDetail, mask);
   if (skin && params.skinMatch) applySkinMatchRGBA(out, params.skinMatch, skin, 4, people, src.data);
   if (skin && hasSkinPass(params)) applySkinPass(out, src.width, src.height, params, skin, Math.max(src.width, src.height));
+  if (hasLookEffects(params)) applyLookEffects(out, data, src.width, src.height, params, { long: Math.max(src.width, src.height), planes: look?.planes || [], hazeA: look?.hazeA });
   if (params.halation) applyHalation(out, src.width, src.height, params.halation);
   if (hasSpatialFinish(params)) applyFinish(out, src.width, src.height, params);
   return { width: src.width, height: src.height, data: out };
@@ -376,7 +416,7 @@ function renderInto(src, params, mask = null, skin = null, heals = null, people 
 function renderedMeasurements(e, params, refStats = null, strength = 1) {
   const src = e.solveImage;
   const heals = hasHeals(params) ? healsToOut(params.heals, e.fullW, e.fullH, e.geom, dispScale(e, src.width, e.geom)) : null;
-  const out = renderInto(src, params, e.ps.subject, e.ps.skinMask, heals, e.ps.skinPeople);
+  const out = renderInto(src, params, e.ps.subject, e.ps.skinMask, heals, e.ps.skinPeople, lookFor(e, params, src.width, src.height, e.geom));
   const cur = prepare(out);
   let acceptance = refStats ? referenceAcceptance(e.ps, cur, refStats, { strength, skinMatch: params.skinMatch }) : null;
   if (acceptance && refStats.adaptiveFit) acceptance = addAdaptiveAppearanceChecks(acceptance, adaptiveAppearanceChecks(e.ps, cur, refStats, { strength }));
@@ -1000,7 +1040,13 @@ const handlers = {
       people = d.skinPeople;
     }
     if (hasHeals(params)) { const g = plain ? null : e.geom; heals = healsToOut(params.heals, e.fullW, e.fullH, g, dispScale(e, d.width, g)); }
-    const out = renderInto(d, params, mask, skin, heals, people);
+    let look = null;
+    if (hasLookEffects(params)) {
+      const g = plain ? null : e.geom, key = `${e.mask?.ver}|${maskSpecKey(params.lookMasks)}|${plain ? 'plain' : geomKey(e.geom)}`;
+      if (d.lookKey !== key) { d.look = lookFor(e, params, d.width, d.height, g); d.lookKey = key; }
+      look = d.look;
+    }
+    const out = renderInto(d, params, mask, skin, heals, people, look);
     if (overlay) paintClipping(d.data, out.data);
     if (showMask && mask) paintMask(out.data, mask, showMask);
     const edited = await createImageBitmap(new ImageData(out.data, out.width, out.height));
@@ -1030,7 +1076,9 @@ const handlers = {
     const long = Math.max(OW, OH);
     const skinOn = hasSkinPass(params) && e.mask && e.mask.skinFrac >= 0.0005;
     const glowHalo = params.halation ? halationRadius(OW, OH) : 0;
-    const halo = Math.max(skinOn ? skinHalo(long) : 0, glowHalo, params.referenceDetail ? 1 : 0);
+    const lookOn = hasLookEffects(params);
+    if (lookOn) ensureLookMasks(e, params.lookMasks);
+    const halo = Math.max(skinOn ? skinHalo(long) : 0, glowHalo, params.referenceDetail ? 1 : 0, lookOn ? effectsHalo(long) : 0);
     // tiles keep each canvas well under iOS Safari's ~16.7 MP canvas limit
     const tileH = Math.max(64, Math.min(OH, Math.floor((params.referenceDetail ? 1_000_000 : 4_000_000) / OW) - 2 * halo));
     const [c, x] = canvas(OW, Math.min(OH, tileH + 2 * halo));
@@ -1055,6 +1103,7 @@ const handlers = {
         if (params.skinMatch) applySkinMatchRGBA(tmp, params.skinMatch, maskFor(e, OW, hh, g, ya, 1, 'skin'), 4,
           maskFor(e, OW, hh, g, ya, 1, 'skinPeople'), d);
         if (skinOn) applySkinPass(tmp, OW, hh, params, maskFor(e, OW, hh, g, ya, 1, 'skin'), long, 4, y - ya, y - ya + h);
+        if (lookOn) applyLookEffects(tmp, d, OW, hh, params, { ...lookFor(e, params, OW, hh, g, ya, 1), long, core0: y - ya, core1: y - ya + h, seed: 1 + ya });
         if (params.halation) applyHalation(tmp, OW, hh, params.halation, ya, OW, OH, glowHalo);
         band.set(tmp.subarray((y - ya) * OW * 4, (y - ya + h) * OW * 4));
       }
@@ -1072,7 +1121,7 @@ const handlers = {
     if (origJpeg) { const ex = exifSegment(orig); if (ex) add.push(ex); }
     add.push(xmpSegment(`<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:CreatorTool="LookMatch"/></rdf:RDF></x:xmpmeta><?xpacket end="w"?>`));
     jpg = insertSegments(jpg, add);
-    const out = { jpeg: new Blob([jpg], { type: 'image/jpeg' }), width: OW, height: OH, ms: { render: t1 - t0, encode: t2 - t1 } };
+    const out = { jpeg: new Blob([jpg], { type: 'image/jpeg' }), width: OW, height: OH, ms: { render: t1 - t0, encode: t2 - t1 }, lookMasks: lookOn ? e.mask?.lmPlaced || null : null };
     if (acceptanceSource) {
       const exported = await createImageBitmap(out.jpeg);
       try {
