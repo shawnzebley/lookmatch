@@ -1,0 +1,130 @@
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+   crs:PresetType="Normal"
+   crs:Cluster=""
+   crs:UUID="1317A6EC72D65003ADD289CA21E419E4"
+   crs:SupportsAmount2="True"
+   crs:SupportsAmount="True"
+   crs:SupportsColor="True"
+   crs:SupportsMonochrome="False"
+   crs:SupportsHighDynamicRange="True"
+   crs:SupportsNormalDynamicRange="True"
+   crs:SupportsSceneReferred="True"
+   crs:SupportsOutputReferred="True"
+   crs:CameraModelRestriction=""
+   crs:Copyright=""
+   crs:ContactInfo=""
+   crs:Version="15.0"
+   crs:ProcessVersion="11.0"
+   crs:Exposure2012="+1.12"
+   crs:Contrast2012="-29"
+   crs:Highlights2012="-49"
+   crs:Shadows2012="-5"
+   crs:Whites2012="-45"
+   crs:Blacks2012="-10"
+   crs:Vibrance="-10"
+   crs:Saturation="-5"
+   crs:Texture="0"
+   crs:Clarity2012="-4"
+   crs:Dehaze="-7"
+   crs:PostCropVignetteAmount="0"
+   crs:GrainAmount="33"
+   crs:GrainSize="33"
+   crs:GrainFrequency="53"
+   crs:ParametricShadows="0"
+   crs:ParametricDarks="-15"
+   crs:ParametricLights="+10"
+   crs:ParametricHighlights="0"
+   crs:ParametricShadowSplit="25"
+   crs:ParametricMidtoneSplit="50"
+   crs:ParametricHighlightSplit="75"
+   crs:SplitToningShadowHue="169"
+   crs:SplitToningShadowSaturation="25"
+   crs:ColorGradeShadowLum="0"
+   crs:ColorGradeMidtoneHue="233"
+   crs:ColorGradeMidtoneSat="2"
+   crs:ColorGradeMidtoneLum="0"
+   crs:SplitToningHighlightHue="335"
+   crs:SplitToningHighlightSaturation="12"
+   crs:ColorGradeHighlightLum="0"
+   crs:ColorGradeBlending="70"
+   crs:SplitToningBalance="0"
+   crs:ColorGradeGlobalHue="0"
+   crs:ColorGradeGlobalSat="0"
+   crs:ColorGradeGlobalLum="0"
+   crs:HasSettings="True"
+   crs:WhiteBalance="Custom"
+   crs:Temperature="6269"
+   crs:Tint="+12"
+   crs:HueAdjustmentRed="0"
+   crs:SaturationAdjustmentRed="-30"
+   crs:LuminanceAdjustmentRed="+5"
+   crs:HueAdjustmentOrange="0"
+   crs:SaturationAdjustmentOrange="-8"
+   crs:LuminanceAdjustmentOrange="-4"
+   crs:HueAdjustmentYellow="0"
+   crs:SaturationAdjustmentYellow="-15"
+   crs:LuminanceAdjustmentYellow="+10"
+   crs:HueAdjustmentGreen="+10"
+   crs:SaturationAdjustmentGreen="-50"
+   crs:LuminanceAdjustmentGreen="-5"
+   crs:HueAdjustmentAqua="+10"
+   crs:SaturationAdjustmentAqua="-50"
+   crs:LuminanceAdjustmentAqua="+10"
+   crs:HueAdjustmentBlue="-5"
+   crs:SaturationAdjustmentBlue="-30"
+   crs:LuminanceAdjustmentBlue="-15"
+   crs:HueAdjustmentPurple="+20"
+   crs:SaturationAdjustmentPurple="-50"
+   crs:LuminanceAdjustmentPurple="+20"
+   crs:HueAdjustmentMagenta="+20"
+   crs:SaturationAdjustmentMagenta="-40"
+   crs:LuminanceAdjustmentMagenta="+20">
+   <crs:Name>
+    <rdf:Alt>
+     <rdf:li xml:lang="x-default">Rupp 02 - Vintage Film Window</rdf:li>
+    </rdf:Alt>
+   </crs:Name>
+   <crs:Group>
+    <rdf:Alt>
+     <rdf:li xml:lang="x-default">Austin Rupp (from IG)</rdf:li>
+    </rdf:Alt>
+   </crs:Group>
+   <crs:ToneCurvePV2012>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>255, 255</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012>
+   <crs:ToneCurvePV2012Red>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>64, 38</rdf:li>
+     <rdf:li>128, 135</rdf:li>
+     <rdf:li>192, 215</rdf:li>
+     <rdf:li>255, 250</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012Red>
+   <crs:ToneCurvePV2012Green>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>64, 36</rdf:li>
+     <rdf:li>128, 130</rdf:li>
+     <rdf:li>192, 212</rdf:li>
+     <rdf:li>255, 248</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012Green>
+   <crs:ToneCurvePV2012Blue>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>64, 34</rdf:li>
+     <rdf:li>128, 140</rdf:li>
+     <rdf:li>192, 220</rdf:li>
+     <rdf:li>255, 252</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012Blue>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>

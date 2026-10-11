@@ -1,5 +1,6 @@
 import { SLIDERS, CURVE_SATURATION, defaultParams, compile, LOCAL_SLIDERS, REGIONS, CURVE_KEYS, curveLUT, isIdentityCurve } from './engine/pipeline.js';
 import { parsePreset, toParams, unsupported } from './engine/lrpreset.js';
+import { dynamicPreset } from './engine/dynamic-preset.js';
 import { srgbToLinear, linearToSrgb } from './engine/color.js';
 import { rgbToHsl } from './engine/color-range.js';
 import { referenceRangeSupport } from './engine/reference-color-range.js';
@@ -167,9 +168,35 @@ async function loadPresets() {
         .map((profile) => ({ id: `adaptive:${profile.id}`, name: profile.name, thumb: profile.thumb, strength: 100, adaptiveLook: profile, builtin: true, created: 0 }));
     }
   } catch (e) { console.warn('built-in adaptive looks unavailable', e); }
-  S.presets = [...S.userPresets, ...adaptive.filter((x) => !S.userPresets.some((q) => q.id === x.id))];
+  const dynamic = await loadDynamicLooks('./looks/rupp.json');
+  S.presets = [...S.userPresets, ...[...dynamic, ...adaptive].filter((x) => !S.userPresets.some((q) => q.id === x.id))];
   // older installs picked a preset before looks existed: keep using it
   if (!S.look && S.presetId && S.presets.find((p) => p.id === S.presetId)) S.look = { kind: 'preset', id: S.presetId };
+}
+
+// Published Lightroom recipes from a photographer's edit breakdowns, refitted per photo (see engine/dynamic-preset.js).
+async function loadDynamicLooks(url) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return [];
+    const pack = await response.json();
+    const looks = await Promise.all((pack.looks || []).filter((x) => x && x.version === 1 && typeof x.id === 'string' && typeof x.xmp === 'string').map(async (look) => {
+      try {
+        const r = await fetch(`./${look.xmp}`);
+        if (!r.ok) return null;
+        const { settings } = parsePreset(await r.text(), look.xmp);
+        const { params, notApplied, steps } = dynamicPreset(look, settings);
+        return { id: `dynamic:${look.id}`, name: look.name, lr: true, lrParams: params, unsupported: notApplied, steps, source: look.source, credit: pack.credit, group: pack.group, dynamic: true, builtin: true, stats: null, thumb: lrThumb(params), strength: 100, created: 0 };
+      } catch (e) { console.warn('dynamic look unavailable', look.id, e); return null; }
+    }));
+    return looks.filter(Boolean);
+  } catch (e) { console.warn('built-in dynamic looks unavailable', e); return []; }
+}
+
+function dynamicSteps(pr) {
+  const rows = pr.steps.map((s, i) => `<li class="${s.applied ? '' : 'muted'}"><b>${i + 1}. ${esc(s.step)}</b>${s.applied ? '' : ' · not applied'}<br><span class="small">${esc(s.detail)}</span></li>`).join('');
+  return `<details class="dynamic-steps small" style="margin:8px 0 0"><summary>The ${pr.steps.length} steps, in order</summary><ol style="padding-left:0;list-style:none;margin:6px 0">${rows}</ol>
+    <p class="muted small">Global sliders are copied from <a href="${esc(pr.source)}" target="_blank" rel="noopener">the original post</a>. Exposure and white balance are refitted on each photo first. Masks are placed on each photo from its people, skin, irises, brightest side and sky; check the preview, since a pale wall can read as sky or light.</p></details>`;
 }
 
 function renderPresets() {
@@ -473,11 +500,13 @@ function referenceCards(current, onPick) {
     const list = h('<div class="rcards"></div>');
     for (const pr of S.presets) {
       const on = current && current.kind === 'preset' && current.id === pr.id;
-      const b = h(`<button class="rcard ${on ? 'on' : ''}"><img src="${pr.thumb}" alt=""><span>${esc(pr.name)}</span>${pr.adaptiveLook ? '<em>Adaptive</em>' : pr.lr ? '<em>Lightroom</em>' : ''}</button>`);
+      const b = h(`<button class="rcard ${on ? 'on' : ''}"><img src="${pr.thumb}" alt=""><span>${esc(pr.name)}</span>${pr.adaptiveLook ? '<em>Adaptive</em>' : pr.dynamic ? '<em>Dynamic</em>' : pr.lr ? '<em>Lightroom</em>' : ''}</button>`);
       b.onclick = () => onPick({ kind: 'preset', id: pr.id });
       list.append(b);
     }
     wrap.append(list);
+    const dyn = S.presets.find((pr) => pr.dynamic);
+    if (dyn) wrap.append(h(`<p class="muted small adaptive-credit">Dynamic looks use the slider values from ${esc(dyn.group)}'s <a href="${esc(dyn.credit)}" target="_blank" rel="noopener">Instagram edit breakdowns</a>, refitted to each photo.</p>`));
     if (S.presets.some((pr) => pr.adaptiveLook)) wrap.append(h('<p class="muted small adaptive-credit">Adaptive looks are measured from example photos on the <a href="https://www.cvatik.com/demo" target="_blank" rel="noopener">Cvatik demo</a>; they do not include its paid original preset files.</p>'));
   } else {
     wrap.append(h('<p class="muted small" style="margin:4px 0 10px">Pick a photo whose look you want. Each of your photos gets its own edit toward it.</p>'));
@@ -962,7 +991,7 @@ function gradeCard(p) {
   return `<div class="wheels">${WHEELS.map(([z, label]) => `<div class="wh" data-z="${z}" data-keys="${z}Hue ${z}Sat">
       <div class="wheel"><canvas></canvas></div><div class="wl">${label}</div><div class="wv muted small"></div></div>`).join('')}</div>
     ${local ? `<p class="muted small" style="margin:4px 0 0">Added on top of the whole-photo grade, ${D.region === 'subject' ? 'on the subject only' : 'on the background only'}. Double-tap a wheel to clear it.</p>`
-    : `${sliderRow(SLIDER_BY.gradeBalance, p.params.gradeBalance)}
+    : `${sliderRow(SLIDER_BY.gradeBalance, p.params.gradeBalance)}${sliderRow(SLIDER_BY.gradeBlending, p.params.gradeBlending ?? 50)}
     <p class="muted small" style="margin:4px 0 0">Drag a dot to grade. Double-tap a wheel to clear it.${p.style && p.style.wheels ? ' The faint dot is where the match left it; the line is what the finishing touch added.' : ''}</p>`}`;
 }
 
@@ -1567,8 +1596,8 @@ function styleCard(p) {
   if (kind === 'none') {
     body = '<p class="muted small" style="margin:8px 0 0">Use the photo as it was captured. Manual edits remain available below.</p>';
   } else {
-    body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}${q.adaptiveLook ? '<em>Adaptive</em>' : ''}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
-      <p class="muted small" style="margin:8px 0 0">${pr?.adaptiveLook ? 'Fits lighting, supported colors, and detected skin to the selected reference. Check the measured result and preview; manual controls adjust the fit.' : 'Match this photo to the selected reference. Tone and color are fitted separately, then skin is corrected. Manual controls adjust the result; check measurements and preview.'}</p>
+    body = `<div class="chips-row" id="dPick">${S.presets.map((q) => `<button data-l="preset:${q.id}" class="ref ${look?.kind === 'preset' && look.id === q.id ? 'on' : ''}"><img src="${q.thumb}" alt="">${esc(q.name)}${q.adaptiveLook ? '<em>Adaptive</em>' : q.dynamic ? '<em>Dynamic</em>' : ''}</button>`).join('')}<button data-a="ref">+ Reference</button></div>
+      <p class="muted small" style="margin:8px 0 0">${pr?.adaptiveLook ? 'Fits lighting, supported colors, and detected skin to the selected reference. Check the measured result and preview; manual controls adjust the fit.' : pr?.dynamic ? `${esc(pr.group)}'s published recipe. Exposure and white balance are refitted to this photo, and the masks are placed on it.${pr.unsupported?.length ? ` Not applied: ${esc(pr.unsupported.join(', '))}.` : ''}` : 'Match this photo to the selected reference. Tone and color are fitted separately, then skin is corrected. Manual controls adjust the result; check measurements and preview.'}</p>${pr?.dynamic ? dynamicSteps(pr) : ''}
       ${S.presets.some((q) => q.adaptiveLook) ? '<p class="muted small adaptive-credit">Adaptive looks are measured from example photos on the <a href="https://www.cvatik.com/demo" target="_blank" rel="noopener">Cvatik demo</a>; they do not include its paid original preset files.</p>' : ''}
       ${pr ? `${strengthRow('str', pr.adaptiveLook ? 'Amount' : 'Match', p.strength, 100)}${pr.adaptiveLook ? `${strengthRow('skinProtection', 'Skin match', p.skinProtection ?? 100, 100)}<div class="adaptive-status muted small">${p.adaptive ? `${fittedAppearance} · skin match ${p.adaptive.skinProtected ? 'active' : 'unavailable'} · mask ${p.adaptive.maskAvailable ? 'available' : 'unavailable'}${p.adaptive.warning ? ` · ${esc(p.adaptive.warning)}` : ''}` : 'Lighting, supported colors, and skin are fitted to the reference for this photo.'}</div>` : ''}${pr.adaptiveLook ? '' : '<button id="workflowNeedham" class="ghost small" style="margin-top:8px">How matching works</button>'}`
     : '<p class="muted small" style="margin:8px 0 0">Pick a reference to copy its look onto this photo.</p>'}`;

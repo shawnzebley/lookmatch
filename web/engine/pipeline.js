@@ -63,7 +63,15 @@ SLIDERS.push({ key: 'vignette', label: 'Vignette', group: 'Finish', ui: [-100, 1
 SLIDERS.push({ key: 'halation', label: 'Halation', group: 'Finish', ui: [0, 100], cap: [0, 60] });
 SLIDERS.push({ key: 'grain', label: 'Grain', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainAmount' });
 SLIDERS.push({ key: 'grainSize', label: 'Grain size', group: 'Finish', ui: [0, 100], cap: [0, 100], lr: 'GrainSize' });
+// Lightroom's grain Roughness (default 50): higher mixes in a finer, rougher octave; lower a smoother, coarser one.
+SLIDERS.push({ key: 'grainRoughness', label: 'Grain roughness', group: 'Finish', ui: [0, 100], cap: [0, 0], lr: 'GrainFrequency', def: 50 });
 SLIDERS.push({ key: 'gradeBalance', label: 'Balance', group: 'Color grading', ui: [-100, 100], cap: [-100, 100] });
+// Lightroom's Blending (default 50): higher overlaps the three wheels more, lower narrows each zone's edge.
+SLIDERS.push({ key: 'gradeBlending', label: 'Blending', group: 'Color grading', ui: [0, 100], cap: [0, 0], lr: 'ColorGradeBlending', def: 50 });
+// Effects that look at neighbouring pixels: they run after the LUT (engine/effects.js), not in compile().
+SLIDERS.push({ key: 'texture', label: 'Texture', group: 'Effects', ui: [-100, 100], cap: [0, 0], lr: 'Texture' });
+SLIDERS.push({ key: 'clarity', label: 'Clarity', group: 'Effects', ui: [-100, 100], cap: [0, 0], lr: 'Clarity2012' });
+SLIDERS.push({ key: 'dehaze', label: 'Dehaze', group: 'Effects', ui: [-100, 100], cap: [0, 0], lr: 'Dehaze' });
 
 // skin hues get less push from these (Lightroom's vibrance does the same)
 export const SLIDER_BY_KEY = Object.fromEntries(SLIDERS.map((s) => [s.key, s]));
@@ -138,7 +146,7 @@ export function regionParams(p) {
 
 export function defaultParams() {
   const p = {};
-  for (const s of SLIDERS) p[s.key] = 0;
+  for (const s of SLIDERS) p[s.key] = s.def ?? 0;
   p.curveSaturation = 100;
   return p;
 }
@@ -148,7 +156,7 @@ export function clampParams(p, useCap = false) {
   for (const s of SLIDERS) {
     const [lo, hi] = useCap ? s.cap : s.ui;
     if (s.hue) o[s.key] = ((o[s.key] % 360) + 360) % 360;
-    else o[s.key] = Math.min(hi, Math.max(lo, o[s.key] ?? 0));
+    else o[s.key] = Math.min(hi, Math.max(lo, o[s.key] ?? s.def ?? 0));
   }
   o.curveSaturation = Math.min(200, Math.max(0, o.curveSaturation ?? 100));
   return o;
@@ -329,6 +337,8 @@ export function compile(p) {
   });
   const anyGrade = zones.some(([a, b]) => a || b);
   const piv = 0.5 + (p.gradeBalance / 100) * 0.2;
+  const blend = Math.min(1, Math.max(0, (p.gradeBlending ?? 50) / 100));
+  const gw = [0, 0, 0];
 
   // finish: black crush (up to 30 L* at the bottom, fading out through the mids) and a highlight shoulder
   // that caps output white at 100 - 0.2*rolloff with a soft 18 L* knee. Both are monotonic.
@@ -452,7 +462,7 @@ export function compile(p) {
     }
 
     if (anyGrade) {
-      const [ws, wm, wh] = gradeWeights(L, piv - 0.5);
+      const [ws, wm, wh] = gradeWeights(L, piv - 0.5, gw, blend);
       const edge = Math.min(1, L / 8) * Math.min(1, (100 - L) / 12);
       A += (ws * zones[0][0] + wm * zones[1][0] + wh * zones[2][0]) * edge;
       B += (ws * zones[0][1] + wm * zones[1][1] + wh * zones[2][1]) * edge;
@@ -688,6 +698,14 @@ export function applyFinish(buf, width, rows, p, y0 = 0, fullW = width, fullH = 
   const cx = fullW / 2, cy = fullH / 2, rx = fullW / 2, ry = fullH / 2;
   const cell = Math.max(1, fullW / 1400 * (1 + (p.grainSize || 0) / 25)); // px per grain cell at this resolution
   const amp = gAmt * 0.09;
+  const rough = Math.max(-1, Math.min(1, ((p.grainRoughness ?? 50) - 50) / 50)) * 0.5;
+  const octave = rough > 0 ? 0.5 : 2; // finer or coarser second layer
+  const noiseAt = (x, Y) => {
+    const gx = x / cell, ix = Math.floor(gx), fx = gx - ix, sx = fx * fx * (3 - 2 * fx);
+    const gy = Y / cell, iy = Math.floor(gy), fy = gy - iy, sy = fy * fy * (3 - 2 * fy);
+    const n00 = hash2(ix, iy, seed), n10 = hash2(ix + 1, iy, seed), n01 = hash2(ix, iy + 1, seed), n11 = hash2(ix + 1, iy + 1, seed);
+    return (n00 + (n10 - n00) * sx) + ((n01 + (n11 - n01) * sx) - (n00 + (n10 - n00) * sx)) * sy;
+  };
   for (let y = 0; y < rows; y++) {
     const Y = y + y0, dy = (Y + 0.5 - cy) / ry;
     const gy = Y / cell, iy = Math.floor(gy), fy = gy - iy, sy = fy * fy * (3 - 2 * fy);
@@ -709,7 +727,8 @@ export function applyFinish(buf, width, rows, p, y0 = 0, fullW = width, fullH = 
       if (amp) {
         const gx = x / cell, ix = Math.floor(gx), fx = gx - ix, sx = fx * fx * (3 - 2 * fx);
         const n00 = hash2(ix, iy, seed), n10 = hash2(ix + 1, iy, seed), n01 = hash2(ix, iy + 1, seed), n11 = hash2(ix + 1, iy + 1, seed);
-        const n = (n00 + (n10 - n00) * sx) + ((n01 + (n11 - n01) * sx) - (n00 + (n10 - n00) * sx)) * sy;
+        let n = (n00 + (n10 - n00) * sx) + ((n01 + (n11 - n01) * sx) - (n00 + (n10 - n00) * sx)) * sy;
+        if (rough) n = n * (1 - Math.abs(rough)) + noiseAt(x / octave + 977, Y / octave + 131) * Math.abs(rough);
         const l = 0.2126 * sr + 0.7152 * sg + 0.0722 * sb;
         const dn = n * 2 * amp * (0.35 + 2.6 * l * (1 - l)); // most in the mids, like film
         sr += dn; sg += dn; sb += dn;

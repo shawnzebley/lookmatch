@@ -1,0 +1,323 @@
+{
+ "group": "Austin Rupp",
+ "credit": "https://www.instagram.com/austinjrupp/",
+ "captured": "2026-10-11",
+ "notes": [
+  "Global slider values copied from the edit-breakdown slides of each Instagram carousel.",
+  "Point curves were read off curve screenshots: about ±5 levels.",
+  "Mask shapes and sizes are estimated from the carousel screenshots; their placement is detected on each photo (light source, subject, sky, skin, irises)."
+ ],
+ "looks": [
+  {
+   "version": 1,
+   "id": "rupp-01-golden-meadow",
+   "name": "Rupp 01 - Golden Meadow",
+   "source": "https://www.instagram.com/austinjrupp/p/DeUaxqBmwuG/",
+   "xmp": "looks/rupp/rupp-01-golden-meadow.xmp",
+   "masks": [
+    {
+     "label": "radial",
+     "detail": "sun side / upper left, behind subject: exposure +1.16, highlights -45, whites -36, temp +58, saturation +36",
+     "spec": {
+      "kind": "radial",
+      "anchor": "light",
+      "rx": 0.45,
+      "ry": 0.45,
+      "feather": 0.8,
+      "adj": {
+       "exposure": 1.16,
+       "highlights": -45,
+       "whites": -36,
+       "temp": 58,
+       "saturation": 36
+      }
+     }
+    },
+    {
+     "label": "linear",
+     "detail": "from bottom edge up over foreground grass: exposure -0.44",
+     "spec": {
+      "kind": "linear",
+      "from": "bottom",
+      "extent": 0.35,
+      "adj": {
+       "exposure": -0.44
+      }
+     }
+    },
+    {
+     "label": "sky",
+     "detail": "exposure -0.25, contrast 0, highlights -22, dehaze +9",
+     "spec": {
+      "kind": "sky",
+      "adj": {
+       "exposure": -0.25,
+       "highlights": -22,
+       "dehaze": 9
+      }
+     }
+    }
+   ]
+  },
+  {
+   "version": 1,
+   "id": "rupp-02-vintage-film-window",
+   "name": "Rupp 02 - Vintage Film Window",
+   "source": "https://www.instagram.com/austinjrupp/p/DeSF_B7GYd7/",
+   "xmp": "looks/rupp/rupp-02-vintage-film-window.xmp",
+   "wholeImageCurves": [
+    [
+     [
+      0,
+      25
+     ],
+     [
+      255,
+      245
+     ]
+    ]
+   ],
+   "masks": [
+    {
+     "label": "radial",
+     "detail": "tall oval around subject and window: exposure +0.6, dehaze -10",
+     "spec": {
+      "kind": "radial",
+      "anchor": "subject",
+      "rx": 0.32,
+      "ry": 0.5,
+      "feather": 0.7,
+      "adj": {
+       "exposure": 0.6,
+       "dehaze": -10
+      }
+     }
+    },
+    {
+     "label": "linear",
+     "detail": "from top-left corner, darkens ceiling: exposure -0.72",
+     "spec": {
+      "kind": "linear",
+      "from": "topLeft",
+      "extent": 0.45,
+      "adj": {
+       "exposure": -0.72
+      }
+     }
+    },
+    {
+     "label": "soften",
+     "detail": "whole image: clarity -30, sharpness -40",
+     "spec": {
+      "kind": "all",
+      "adj": {
+       "clarity": -30,
+       "sharpness": -40
+      }
+     }
+    },
+    {
+     "label": "light leak 1",
+     "detail": "linear, right edge, narrow band: exposure +3.85, dehaze -18",
+     "spec": {
+      "kind": "linear",
+      "from": "right",
+      "extent": 0.06,
+      "adj": {
+       "exposure": 3.85,
+       "dehaze": -18
+      }
+     }
+    },
+    {
+     "label": "light leak 2",
+     "detail": "linear, right edge, slightly wider band: exposure +3.85, dehaze -18",
+     "spec": {
+      "kind": "linear",
+      "from": "right",
+      "extent": 0.1,
+      "adj": {
+       "exposure": 3.85,
+       "dehaze": -18
+      }
+     }
+    },
+    {
+     "label": "light leak 3",
+     "detail": "radial, tall thin ellipse on right edge, feather 78: exposure +0.7, dehaze -18",
+     "spec": {
+      "kind": "radial",
+      "anchor": "fixed",
+      "x": 0.98,
+      "y": 0.5,
+      "rx": 0.05,
+      "ry": 0.5,
+      "feather": 0.78,
+      "adj": {
+       "exposure": 0.7,
+       "dehaze": -18
+      }
+     }
+    },
+    {
+     "label": "light leak 4",
+     "detail": "radial, second tall thin ellipse on right edge, feather 78: exposure +0.7, dehaze -18",
+     "spec": {
+      "kind": "radial",
+      "anchor": "fixed",
+      "x": 0.95,
+      "y": 0.5,
+      "rx": 0.05,
+      "ry": 0.5,
+      "feather": 0.78,
+      "adj": {
+       "exposure": 0.7,
+       "dehaze": -18
+      }
+     }
+    }
+   ],
+   "notes": "Final post also shows a black film-scan border; not part of the slider settings."
+  },
+  {
+   "version": 1,
+   "id": "rupp-03-teal-columns",
+   "name": "Rupp 03 - Teal Columns",
+   "source": "https://www.instagram.com/austinjrupp/p/DePSa_LG5HE/",
+   "xmp": "looks/rupp/rupp-03-teal-columns.xmp",
+   "masks": [
+    {
+     "label": "linear",
+     "detail": "from right edge inward over the bushes: exposure -0.28",
+     "spec": {
+      "kind": "linear",
+      "from": "right",
+      "extent": 0.35,
+      "adj": {
+       "exposure": -0.28
+      }
+     }
+    },
+    {
+     "label": "radial",
+     "detail": "large circle centered left of subject: exposure +0.6, dehaze -9",
+     "spec": {
+      "kind": "radial",
+      "anchor": "light",
+      "rx": 0.5,
+      "ry": 0.5,
+      "feather": 0.8,
+      "adj": {
+       "exposure": 0.6,
+       "dehaze": -9
+      }
+     }
+    }
+   ],
+   "notes": "Texture/Clarity/Dehaze slide not shown; left at 0."
+  },
+  {
+   "version": 1,
+   "id": "rupp-04-warm-portrait",
+   "name": "Rupp 04 - Warm Portrait",
+   "source": "https://www.instagram.com/austinjrupp/p/DeMvxkNm11I/",
+   "xmp": "looks/rupp/rupp-04-warm-portrait.xmp",
+   "masks": [
+    {
+     "label": "eyes (iris)",
+     "detail": "exposure +0.24, shadows +14, temp -18, tint +21, saturation -7",
+     "spec": {
+      "kind": "eyes",
+      "adj": {
+       "exposure": 0.24,
+       "shadows": 14,
+       "temp": -18,
+       "tint": 21,
+       "saturation": -7
+      }
+     }
+    },
+    {
+     "label": "skin (face + body)",
+     "detail": "texture -25, clarity -24",
+     "spec": {
+      "kind": "skin",
+      "adj": {
+       "texture": -25,
+       "clarity": -24
+      }
+     }
+    }
+   ]
+  },
+  {
+   "version": 1,
+   "id": "rupp-05-window-light-glow",
+   "name": "Rupp 05 - Window Light Glow",
+   "source": "https://www.instagram.com/austinjrupp/p/DeKUwLYGi1H/",
+   "xmp": "looks/rupp/rupp-05-window-light-glow.xmp",
+   "masks": [
+    {
+     "label": "soften",
+     "detail": "whole image: clarity -30, sharpness -40",
+     "spec": {
+      "kind": "all",
+      "adj": {
+       "clarity": -30,
+       "sharpness": -40
+      }
+     }
+    }
+   ]
+  },
+  {
+   "version": 1,
+   "id": "rupp-06-coastal-sunset",
+   "name": "Rupp 06 - Coastal Sunset",
+   "source": "https://www.instagram.com/austinjrupp/p/DeHjsCRG0rn/",
+   "xmp": "looks/rupp/rupp-06-coastal-sunset.xmp",
+   "masks": [
+    {
+     "label": "linear",
+     "detail": "from bottom edge up over foreground rocks: exposure -0.48",
+     "spec": {
+      "kind": "linear",
+      "from": "bottom",
+      "extent": 0.35,
+      "adj": {
+       "exposure": -0.48
+      }
+     }
+    },
+    {
+     "label": "radial",
+     "detail": "large circle, right side toward the sun: exposure +0.6, dehaze -17",
+     "spec": {
+      "kind": "radial",
+      "anchor": "light",
+      "rx": 0.5,
+      "ry": 0.5,
+      "feather": 0.8,
+      "adj": {
+       "exposure": 0.6,
+       "dehaze": -17
+      }
+     }
+    },
+    {
+     "label": "sky",
+     "detail": "exposure -0.4, contrast 0, highlights -30, saturation +9, dehaze +15",
+     "spec": {
+      "kind": "sky",
+      "adj": {
+       "exposure": -0.4,
+       "highlights": -30,
+       "saturation": 9,
+       "dehaze": 15
+      }
+     }
+    }
+   ]
+  }
+ ]
+}

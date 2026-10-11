@@ -65,8 +65,9 @@ export function crsSettings(p, mode = 'sliders') {
     RedHue: r0(p.calRedHue || 0), RedSaturation: r0(p.calRedSat || 0), GreenHue: r0(p.calGreenHue || 0), GreenSaturation: r0(p.calGreenSat || 0),
     BlueHue: r0(p.calBlueHue || 0), BlueSaturation: r0(p.calBlueSat || 0), ShadowTint: r0(p.calShadowTint || 0),
     PostCropVignetteAmount: r0(p.vignette || 0), PostCropVignetteMidpoint: 50, PostCropVignetteFeather: 60, PostCropVignetteStyle: 1,
-    GrainAmount: r0(p.grain || 0), GrainSize: r0(p.grainSize || 25), GrainFrequency: 50,
-    ColorGradeBlending: 50, ColorGradeGlobalHue: 0, ColorGradeGlobalSat: 0, ColorGradeGlobalLum: 0,
+    GrainAmount: r0(p.grain || 0), GrainSize: r0(p.grainSize || 25), GrainFrequency: r0(p.grainRoughness ?? 50),
+    Texture: r0(p.texture || 0), Clarity2012: r0(p.clarity || 0), Dehaze: r0(p.dehaze || 0),
+    ColorGradeBlending: r0(p.gradeBlending ?? 50), ColorGradeGlobalHue: 0, ColorGradeGlobalSat: 0, ColorGradeGlobalLum: 0,
   });
   const ch = (k) => (isIdentityCurve(p[k]) ? [[0, 0], [255, 255]] : p[k]);
   return { attrs: a, curve: curvePoints(p, mode), curveR: ch('curveR'), curveG: ch('curveG'), curveB: ch('curveB') };

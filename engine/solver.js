@@ -433,8 +433,12 @@ export function solvePreset(ps, o, presetParams, opts = {}) {
   // scale the look (not the normalisation) by strength; curves blend toward identity
   const look = { ...defaultParams() };
   for (const [k, v] of Object.entries(presetParams)) {
-    if (Array.isArray(v)) look[k] = v.map(([x, y]) => [x, Math.round(x + (y - x) * s)]);
-    else if (typeof v === 'number') look[k] = SLIDER_BY_KEY[k]?.hue ? v : v * s;
+    if (k === 'lookMasks') look[k] = v.map((m) => ({ ...m, adj: Object.fromEntries(Object.entries(m.adj || {}).map(([a, b]) => [a, b * s])) }));
+    else if (Array.isArray(v)) look[k] = v.map(([x, y]) => [x, Math.round(x + (y - x) * s)]);
+    else if (typeof v === 'number') {
+      const d = SLIDER_BY_KEY[k]?.def ?? 0;
+      look[k] = SLIDER_BY_KEY[k]?.hue ? v : d + (v - d) * s;
+    }
   }
   const idx = sampleIdx(ps.n, 6000, null, 41);
   const neutralIdx = sampleIdx(ps.n, 2500, (i) => ps.masks.neutral[i], 13);

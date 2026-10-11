@@ -1,0 +1,132 @@
+<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+   crs:PresetType="Normal"
+   crs:Cluster=""
+   crs:UUID="35DA7ED3D5335EA692A53D5378302FD5"
+   crs:SupportsAmount2="True"
+   crs:SupportsAmount="True"
+   crs:SupportsColor="True"
+   crs:SupportsMonochrome="False"
+   crs:SupportsHighDynamicRange="True"
+   crs:SupportsNormalDynamicRange="True"
+   crs:SupportsSceneReferred="True"
+   crs:SupportsOutputReferred="True"
+   crs:CameraModelRestriction=""
+   crs:Copyright=""
+   crs:ContactInfo=""
+   crs:Version="15.0"
+   crs:ProcessVersion="11.0"
+   crs:Exposure2012="+0.50"
+   crs:Contrast2012="-24"
+   crs:Highlights2012="-35"
+   crs:Shadows2012="+20"
+   crs:Whites2012="-32"
+   crs:Blacks2012="+16"
+   crs:Vibrance="+45"
+   crs:Saturation="+10"
+   crs:Texture="0"
+   crs:Clarity2012="-15"
+   crs:Dehaze="-4"
+   crs:PostCropVignetteAmount="0"
+   crs:GrainAmount="23"
+   crs:GrainSize="36"
+   crs:GrainFrequency="52"
+   crs:ParametricShadows="0"
+   crs:ParametricDarks="-5"
+   crs:ParametricLights="0"
+   crs:ParametricHighlights="0"
+   crs:ParametricShadowSplit="25"
+   crs:ParametricMidtoneSplit="50"
+   crs:ParametricHighlightSplit="75"
+   crs:SplitToningShadowHue="48"
+   crs:SplitToningShadowSaturation="4"
+   crs:ColorGradeShadowLum="0"
+   crs:ColorGradeMidtoneHue="203"
+   crs:ColorGradeMidtoneSat="7"
+   crs:ColorGradeMidtoneLum="0"
+   crs:SplitToningHighlightHue="48"
+   crs:SplitToningHighlightSaturation="4"
+   crs:ColorGradeHighlightLum="0"
+   crs:ColorGradeBlending="75"
+   crs:SplitToningBalance="-30"
+   crs:ColorGradeGlobalHue="0"
+   crs:ColorGradeGlobalSat="0"
+   crs:ColorGradeGlobalLum="0"
+   crs:HasSettings="True"
+   crs:WhiteBalance="Custom"
+   crs:Temperature="6456"
+   crs:Tint="+12"
+   crs:HueAdjustmentRed="+14"
+   crs:SaturationAdjustmentRed="-36"
+   crs:LuminanceAdjustmentRed="-5"
+   crs:HueAdjustmentOrange="-3"
+   crs:SaturationAdjustmentOrange="-26"
+   crs:LuminanceAdjustmentOrange="-4"
+   crs:HueAdjustmentYellow="+11"
+   crs:SaturationAdjustmentYellow="-24"
+   crs:LuminanceAdjustmentYellow="0"
+   crs:HueAdjustmentGreen="+15"
+   crs:SaturationAdjustmentGreen="-34"
+   crs:LuminanceAdjustmentGreen="-9"
+   crs:HueAdjustmentAqua="+10"
+   crs:SaturationAdjustmentAqua="-20"
+   crs:LuminanceAdjustmentAqua="-12"
+   crs:HueAdjustmentBlue="-6"
+   crs:SaturationAdjustmentBlue="-39"
+   crs:LuminanceAdjustmentBlue="+45"
+   crs:HueAdjustmentPurple="+19"
+   crs:SaturationAdjustmentPurple="-29"
+   crs:LuminanceAdjustmentPurple="+17"
+   crs:HueAdjustmentMagenta="0"
+   crs:SaturationAdjustmentMagenta="-33"
+   crs:LuminanceAdjustmentMagenta="+10">
+   <crs:Name>
+    <rdf:Alt>
+     <rdf:li xml:lang="x-default">Rupp 04 - Warm Portrait</rdf:li>
+    </rdf:Alt>
+   </crs:Name>
+   <crs:Group>
+    <rdf:Alt>
+     <rdf:li xml:lang="x-default">Austin Rupp (from IG)</rdf:li>
+    </rdf:Alt>
+   </crs:Group>
+   <crs:ToneCurvePV2012>
+    <rdf:Seq>
+     <rdf:li>0, 22</rdf:li>
+     <rdf:li>64, 62</rdf:li>
+     <rdf:li>128, 128</rdf:li>
+     <rdf:li>255, 255</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012>
+   <crs:ToneCurvePV2012Red>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>64, 30</rdf:li>
+     <rdf:li>128, 140</rdf:li>
+     <rdf:li>192, 220</rdf:li>
+     <rdf:li>255, 250</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012Red>
+   <crs:ToneCurvePV2012Green>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>64, 35</rdf:li>
+     <rdf:li>128, 135</rdf:li>
+     <rdf:li>192, 215</rdf:li>
+     <rdf:li>255, 245</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012Green>
+   <crs:ToneCurvePV2012Blue>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>64, 30</rdf:li>
+     <rdf:li>128, 140</rdf:li>
+     <rdf:li>192, 218</rdf:li>
+     <rdf:li>255, 250</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012Blue>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>

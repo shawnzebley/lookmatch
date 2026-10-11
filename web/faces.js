@@ -25,6 +25,8 @@ function run(lm, imgData) {
   const r = lm.detect(imgData);
   return (r.faceLandmarks || []).map((pts, f) => {
     const poly = OVAL.map((i) => [pts[i].x, pts[i].y]);
+    // irises (indices 468-477, present in the 478-point model): centre and radius, in 0..1 of the input
+    if (pts.length >= 478) poly.eyes = [[468, 469, 471], [473, 474, 476]].map(([c, a, b]) => [pts[c].x, pts[c].y, Math.hypot(pts[a].x - pts[b].x, pts[a].y - pts[b].y) / 2]);
     const cats = r.faceBlendshapes && r.faceBlendshapes[f] && r.faceBlendshapes[f].categories;
     if (cats) {
       const get = (n) => { const c = cats.find((q) => q.categoryName === n); return c ? c.score : null; };
@@ -55,6 +57,7 @@ export async function detectFaces(src) {
       for (const poly of found) {
         const g = poly.map(([x, y]) => [(x0 + x * tw) / W, (y0 + y * th) / H]);
         g.blink = poly.blink;
+        if (poly.eyes) g.eyes = poly.eyes.map(([x, y, r]) => [(x0 + x * tw) / W, (y0 + y * th) / H, r * tw / W]);
         const [cx, cy] = center(g), wd = width(g);
         if (!faces.some((f) => { const [fx, fy] = center(f); return Math.hypot(fx - cx, fy - cy) < 0.6 * Math.max(wd, width(f)); })) faces.push(g);
       }
